@@ -674,6 +674,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$SHELL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             artifacts/shell-tauri-android/Phase-Android-ARM64.apk \
             artifacts/shell-tauri-android/Phase-Android-ARMv7.apk \
             --clobber
