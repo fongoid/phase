@@ -161,7 +161,7 @@ use self::subject::{
 };
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::{
-    ParseContext, TokenPtFollowup, TriggerConditionScope,
+    ChosenColorQualifierScope, ParseContext, TokenPtFollowup, TriggerConditionScope,
 };
 use crate::parser::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
@@ -29420,34 +29420,83 @@ fn collapse_ephemeral_color_choice_mana(def: &mut AbilityDefinition) {
 /// nested under a color choice (`parent_is_color_choice`) — e.g. an explicit
 /// "Choose a color. Target creature gains protection from that color" already
 /// supplies the choice, so re-wrapping would double-prompt.
+///
+/// CR 105.4 + CR 608.2c: SINGLE AUTHORITY for the colour-choice wrap. Both
+/// injectors — the keyword-grant one (`inject_chosen_color_choice_grant`) and
+/// the printed object-filter one (`inject_printed_color_choice_filter`) — call
+/// this rather than each spelling the `Effect::Choose` literal, so the two can
+/// never drift on the load-bearing `persist: true`.
+///
+/// Moves `def`'s current effect under a freshly injected colour choice. Any
+/// existing `sub_ability` chain rides along beneath the displaced effect so
+/// downstream effects still resolve after it.
+fn wrap_in_color_choice(def: &mut AbilityDefinition) {
+    let displaced_effect = std::mem::replace(
+        &mut def.effect,
+        Box::new(Effect::Choose {
+            choice_type: ChoiceType::color(),
+            // CR 607.2d + CR 613.1: `persist: true` so the choice resolver
+            // carries exact source authority into `WaitingFor::NamedChoice`;
+            // answering it then routes through `bind_named_choice`, which writes
+            // `ChosenAttribute::Color` onto the granting source and re-runs
+            // layers. The layer applier reads that color off the source
+            // (`game/layers.rs` `chosen_color` pre-read) to bake the grant's
+            // `Protection`/`HexproofFrom(ChosenColor)` into a concrete color.
+            // With `persist: false` no exact object persistence is granted, the source
+            // never gets a chosen color, and the grant resolves to a no-op
+            // (issue #4371). Matches `try_parse_become_choice`'s persisted
+            // `AddChosenColor` choice. The same `persist: true` is what makes
+            // `FilterProp::IsChosenColor` — a fail-closed read of the source's
+            // `ChosenAttribute::Color` — able to match anything at all.
+            persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
+        }),
+    );
+    let prior_sub = def.sub_ability.take();
+    let mut displaced_ability = AbilityDefinition::new(AbilityKind::Spell, *displaced_effect);
+    displaced_ability.sub_ability = prior_sub;
+    def.sub_ability = Some(Box::new(displaced_ability));
+}
+
+/// CR 105.4 + CR 608.2c: supply the colour choice a clause PRINTED for its own
+/// object filter ("Return all permanents of the color of your choice …" —
+/// Wash Out; "Destroy all enchantments of the color of your choice." — Root
+/// Greevil). Gated on DECLARED per-clause provenance
+/// (`ClauseIr.printed_color_choice`), never on a scan of the lowered tree.
+///
+/// CR 608.2c LIMITATION, stated rather than hidden: the wrap is applied to the
+/// CHAIN HEAD. Both cards in this class are single-clause chains, so head ==
+/// clause for both; for a hypothetical later-clause case the prompt would be
+/// raised earlier than printed. Pinned by the `V-ORDER` test; follow-up F6.
+///
+/// Skipped when the head effect is `Effect::Unimplemented`: a clause the
+/// parser refused must not raise a prompt for semantics it did not model.
+///
+/// That justification holds only while head == carrier, which is the case for
+/// both cards in this class. On a head != carrier chain (head refused, a LATER
+/// clause carried the printed qualifier) the guard suppresses the chooser for a
+/// clause that DID stamp `FilterProp::IsChosenColor` — trading a spurious
+/// prompt for a match-nothing filter. Deliberate and bounded: no printed-form
+/// card has that shape (the printed slice is 4 faces, and the two in scope are
+/// single-clause). Pinned by `V-UNIMPL`, and resolved by follow-up F6, which
+/// moves the wrap to the carrying clause's own node so the guard's subject and
+/// the provenance's subject are the same clause.
+pub(crate) fn inject_printed_color_choice_filter(
+    def: &mut AbilityDefinition,
+    printed: Option<ChoiceType>,
+) {
+    // Both guards are explicit and independent: the DECLARED provenance must be
+    // a colour choice, and the head must not be a clause the parser refused.
+    if matches!(printed, Some(ChoiceType::Color { .. }))
+        && !matches!(&*def.effect, Effect::Unimplemented { .. })
+    {
+        wrap_in_color_choice(def);
+    }
+}
+
 fn inject_chosen_color_choice_grant(def: &mut AbilityDefinition, parent_is_color_choice: bool) {
     if !parent_is_color_choice && effect_grants_chosen_color_keyword(&def.effect) {
-        // Move the grant under a freshly injected color choice. Any existing
-        // sub_ability chain rides along beneath the grant so downstream effects
-        // still resolve after it.
-        let grant_effect = std::mem::replace(
-            &mut def.effect,
-            Box::new(Effect::Choose {
-                choice_type: ChoiceType::color(),
-                // CR 607.2d + CR 613.1: `persist: true` so the choice resolver
-                // carries exact source authority into `WaitingFor::NamedChoice`;
-                // answering it then routes through `bind_named_choice`, which writes
-                // `ChosenAttribute::Color` onto the granting source and re-runs
-                // layers. The layer applier reads that color off the source
-                // (`game/layers.rs` `chosen_color` pre-read) to bake the grant's
-                // `Protection`/`HexproofFrom(ChosenColor)` into a concrete color.
-                // With `persist: false` no exact object persistence is granted, the source
-                // never gets a chosen color, and the grant resolves to a no-op
-                // (issue #4371). Matches `try_parse_become_choice`'s persisted
-                // `AddChosenColor` choice.
-                persist: true,
-                selection: crate::types::ability::TargetSelectionMode::Chosen,
-            }),
-        );
-        let prior_sub = def.sub_ability.take();
-        let mut grant_ability = AbilityDefinition::new(AbilityKind::Spell, *grant_effect);
-        grant_ability.sub_ability = prior_sub;
-        def.sub_ability = Some(Box::new(grant_ability));
+        wrap_in_color_choice(def);
         // The grant is now a leaf beneath the choice; recurse into it with the
         // parent flag set so it is not re-wrapped, while any prior downstream
         // chain it carries is still visited.
@@ -33530,6 +33579,12 @@ pub(crate) fn parse_effect_chain_ir(
             chosen_player_count: chain_chosen_player_count,
             // CR 608.2c: propagate the committed `ChoiceType` to the guess clause.
             pending_choice_type: chain_pending_choice_type.clone(),
+            // CR 105.4: this is the ONE context that WRITES this gate, because it is the
+            // one that reads `pending_printed_color_choice` back (below) and injects the
+            // choice. NOTE: `ParseContext` is `Clone` — a context derived from this one
+            // inherits `ChainBound`. That is correct for derived contexts merged back with
+            // `*ctx = ..`; a throwaway derived context must reset the field to `Unbound`.
+            chosen_color_qualifier: ChosenColorQualifierScope::ChainBound,
             // CR 303.4 + CR 702.103: propagate the enclosing card's typed host
             // self-reference so a `"that creature"` copy-token anaphor in any
             // chunk of an Aura/bestow card remaps to the enchanted host.
@@ -33762,6 +33817,7 @@ pub(crate) fn parse_effect_chain_ir(
                 .where_x_expression(where_x_expression.clone())
                 .target_selection_mode(chunk_ctx.target_selection_mode)
                 .target_chooser(chunk_ctx.target_chooser.clone())
+                .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                 .push();
             continue;
         }
@@ -34935,6 +34991,7 @@ pub(crate) fn parse_effect_chain_ir(
                     .where_x_expression(where_x_expression)
                     .target_selection_mode(chunk_ctx.target_selection_mode)
                     .target_chooser(chunk_ctx.target_chooser.clone())
+                    .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                     .push();
             }
             continue;
@@ -35029,6 +35086,7 @@ pub(crate) fn parse_effect_chain_ir(
             .unless_pay(unless_pay)
             .target_selection_mode(chunk_ctx.target_selection_mode)
             .target_chooser(chunk_ctx.target_chooser.clone())
+            .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
             .push();
 
         // Drain chunk-ctx diagnostics into the accumulator (the outer `ctx` is

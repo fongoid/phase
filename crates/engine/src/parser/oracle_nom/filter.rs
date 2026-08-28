@@ -503,6 +503,31 @@ pub fn parse_color_property(input: &str) -> OracleResult<'_, FilterProp> {
     .parse(input)
 }
 
+/// CR 105.4: the trailing "of the color of your choice" object-filter
+/// qualifier — the clause PRINTS its own colour choice (Wash Out,
+/// Root Greevil).
+///
+/// The tag is SPACE-FREE: the caller trims and tracks the separating
+/// whitespace itself, exactly as the sibling chosen-TYPE arm in
+/// `oracle_target.rs` does, so an upstream suffix arm that already consumed
+/// the space cannot silently defeat this one.
+///
+/// The ANAPHOR forms ("of the chosen color", "of that color") are
+/// deliberately NOT recognized here. Their referent is a colour chosen by an
+/// EARLIER clause, and no in-chain "Choose a color." currently persists that
+/// colour onto its source (`ChoiceType::Color` is absent from the `persist:`
+/// match in `oracle_effect/imperative.rs`), so `FilterProp::IsChosenColor`
+/// would be a fail-closed match-NOTHING filter. They stay with the existing
+/// count-phrase recognizer `parse_pre_controller_chosen_filter_suffix`
+/// (`oracle_nom/quantity.rs`), unchanged, until that gap is fixed.
+pub(crate) fn parse_printed_color_choice_qualifier(input: &str) -> OracleResult<'_, FilterProp> {
+    value(
+        FilterProp::IsChosenColor,
+        tag("of the color of your choice"),
+    )
+    .parse(input)
+}
+
 /// CR 614.1a + CR 109.1: the parsed "\[other\] `<plural-type>` you control" tail
 /// of a compound damage recipient. A named struct rather than a tuple so both
 /// axes are explicit at every call site.
@@ -1110,5 +1135,44 @@ mod tests {
             }
         );
         assert_eq!(rest3, "");
+    }
+
+    /// V-FORMS (SHAPE) — CR 105.4. The printed chosen-colour qualifier must
+    /// CHOMP (not peek) its text and must reject every adjacent form.
+    ///
+    /// The anaphor rejections are load-bearing, not incidental: the anaphor
+    /// referent is a colour chosen by an EARLIER clause, and no in-chain
+    /// "Choose a color." persists that colour onto its source today, so
+    /// stamping `IsChosenColor` for them would produce a fail-closed
+    /// match-NOTHING filter.
+    #[test]
+    fn printed_color_choice_qualifier_chomps_and_rejects_adjacent_forms() {
+        // Positive reach-guards, in this same test, so the negatives below
+        // cannot pass vacuously on a combinator that matches nothing at all.
+        let (rest, prop) =
+            parse_printed_color_choice_qualifier("of the color of your choice").unwrap();
+        assert_eq!(prop, FilterProp::IsChosenColor);
+        assert_eq!(rest, "", "the bare form must be fully consumed, not peeked");
+
+        let (rest, prop) = parse_printed_color_choice_qualifier(
+            "of the color of your choice to their owners' hands",
+        )
+        .unwrap();
+        assert_eq!(prop, FilterProp::IsChosenColor);
+        assert_eq!(rest, " to their owners' hands");
+
+        for adjacent in [
+            "of the chosen color",
+            "of that color",
+            "of the same color",
+            "of your choice",
+            "of the chosen type",
+            "of the colors of your choice",
+        ] {
+            assert!(
+                parse_printed_color_choice_qualifier(adjacent).is_err(),
+                "{adjacent:?} must NOT be recognized as the printed chosen-colour qualifier"
+            );
+        }
     }
 }

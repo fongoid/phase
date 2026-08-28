@@ -75,7 +75,8 @@ use super::{
     def_is_damage_dealer, def_is_dig_look, def_is_dig_or_mill, def_is_generic_effect_head,
     def_is_keyword_counter_placement, def_is_perpetual_keyword_grant,
     demote_unbindable_batch_aggregate, draw_object_count_filter, fold_cast_copy_of_card_defs,
-    has_explicit_player_target, inject_chosen_color_choice_grant, mark_uses_tracked_set,
+    has_explicit_player_target, inject_chosen_color_choice_grant,
+    inject_printed_color_choice_filter, mark_uses_tracked_set,
     parse_spell_graveyard_replacement_rider,
     parse_spells_cast_this_way_graveyard_replacement_rider,
     publishes_aggregate_set_from_resolution, publishes_exiled_cause_at_resolution,
@@ -3204,6 +3205,17 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // (max(N − X, 0)). Must run after where-X binding has populated the
     // prevention node's `amount_dynamic`, which happens during IR lowering above.
     fold_deal_damage_then_prevent_into_computed_amount(&mut result);
+    // CR 105.4 + CR 608.2c: supply a colour choice for a clause that printed its
+    // own ("of the color of your choice") on an object filter. Gated on DECLARED
+    // per-clause provenance, never on a shape scan. Runs BEFORE the keyword-grant
+    // injector so that injector's `Effect::Choose{Color}` recursion guard
+    // (`child_under_color_choice`) sees this wrap and cannot double-prompt.
+    inject_printed_color_choice_filter(
+        &mut result,
+        ir.clauses
+            .iter()
+            .find_map(|clause| clause.printed_color_choice.clone()),
+    );
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains
     // protection/hexproof from the color of your choice" grant so the source
     // carries a chosen color for the layer applier to bake in.

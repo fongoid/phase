@@ -36,6 +36,45 @@ pub(crate) enum TriggerConditionScope {
     Delayed,
 }
 
+/// CR 105.4: whether THIS parse can supply the `Effect::Choose(Color)` that a
+/// printed "of the color of your choice" object-filter qualifier needs.
+///
+/// CONTAINMENT, stated honestly: `ChainBound` is WRITTEN at exactly one
+/// struct-literal line (the effect-chain chunk context in
+/// `oracle_effect/mod.rs`), but `ParseContext` derives `Clone`, so the value is
+/// INHERITED by every context cloned from that one. A clone-derived context
+/// whose result is merged back with `*ctx = ..` propagates its
+/// `pending_printed_color_choice` correctly; a throwaway clone DISCARDS it,
+/// which would stamp `FilterProp::IsChosenColor` with no injected chooser — a
+/// fail-closed, match-NOTHING filter with no `Effect::Unimplemented` and
+/// therefore no coverage signal.
+///
+/// RULE, both halves — the same two hazards `pending_damage_multi_target`
+/// documents below:
+///   1. A clone-derived `ParseContext` that is NOT merged back with `*ctx = ..`
+///      must reset this field to `Unbound` at construction.
+///   2. A speculative sub-parse that runs against the REAL `&mut ctx` and can
+///      abandon its result must clear `pending_printed_color_choice` on the
+///      abandonment path — otherwise the surviving context carries a pending
+///      choice for a clause that was never emitted, and the chain gets a
+///      spurious colour prompt with no `IsChosenColor` anywhere. The
+///      alternative, and the shape already used elsewhere in this file's
+///      neighbourhood, is to run against a clone and commit with
+///      `*ctx = tentative_ctx` only on success.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ChosenColorQualifierScope {
+    /// Default, and the value every `ParseContext::default()` carries — which
+    /// is every `parse_type_phrase` call site, by construction of the wrapper
+    /// in `oracle_target.rs`. The printed form must NOT be consumed here.
+    #[default]
+    Unbound,
+    /// An effect-chain chunk parse. This is the SINGLE context that both opens
+    /// this channel and reads `pending_printed_color_choice` back
+    /// (`oracle_effect/mod.rs`: the chunk-ctx literal and the three `.push()`
+    /// sites), so "consumed" and "supplied" are one decision made in one place.
+    ChainBound,
+}
+
 /// Unified parsing context — threaded through all parser branches for
 /// pronoun/reference resolution ("it", "that creature", "that many").
 ///
@@ -164,6 +203,17 @@ pub(crate) struct ParseContext {
     /// printed abilities (CR 607.2d). Mirrors `chosen_player_count` as a
     /// parse-time accumulator (not serialized).
     pub pending_choice_type: Option<crate::types::ability::ChoiceType>,
+    /// CR 105.4: gate for the printed chosen-colour object-filter qualifier.
+    /// See `ChosenColorQualifierScope`, including its clone-inheritance rule.
+    pub chosen_color_qualifier: ChosenColorQualifierScope,
+    /// CR 105.4 + CR 608.2c: this chunk's type-phrase parse consumed a printed
+    /// "of the color of your choice" qualifier, so the chunk's clause must be
+    /// wrapped in an injected `Effect::Choose(Color)`. Carries the `ChoiceType`
+    /// the injector needs rather than a yes/no. Lifted into
+    /// `ClauseIr.printed_color_choice` by the chain chunk loop. Set and consumed
+    /// within a single chunk parse; never serialized. A speculative sub-parse that
+    /// discards its cloned context also discards this — see the scope enum's rule.
+    pub pending_printed_color_choice: Option<crate::types::ability::ChoiceType>,
     /// CR 115.1 + CR 701.9b: Target selection mode for the most recent target
     /// phrase parsed via `parse_target_with_ctx`. The chunk loop in
     /// `parse_effect_chain_ir` snapshots this into the produced `ClauseIr` and

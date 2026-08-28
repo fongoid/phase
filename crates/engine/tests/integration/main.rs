@@ -98,6 +98,7 @@ mod chains_of_mephistopheles_discard_draw_or_mill;
 mod chandra_revolution_doesnt_untap_slot;
 mod charging_cinderhorn_issue_2868;
 mod chatterstorm_storm;
+mod chosen_color_object_filter;
 mod chosen_number_opponent_restriction;
 mod claim_jumper_repeat;
 mod cleanup_discard_trigger_pipeline;

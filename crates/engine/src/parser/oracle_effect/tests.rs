@@ -56829,3 +56829,300 @@ fn replacement_shield_between_installer_and_continuation_stays_a_sibling() {
         "an emitted replacement shield breaks the relocation run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Printed chosen-colour object-filter qualifier (CR 105.4) — SHAPE tests.
+// ---------------------------------------------------------------------------
+
+/// Collect a whole definition tree (head + sub chain + else branch + modes).
+fn collect_defs<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a AbilityDefinition>) {
+    out.push(def);
+    if let Some(sub) = def.sub_ability.as_deref() {
+        collect_defs(sub, out);
+    }
+    if let Some(alt) = def.else_ability.as_deref() {
+        collect_defs(alt, out);
+    }
+    for mode in &def.mode_abilities {
+        collect_defs(mode, out);
+    }
+}
+
+/// Every definition node a card produces, across ALL parse-output surfaces —
+/// `abilities`, `triggers`, `replacements`. Walking only `abilities` is the
+/// blind spot that would make this suite vacuous for Dromar, whose `abilities`
+/// is empty and whose whole chain lives in `triggers`.
+fn all_card_defs(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<&AbilityDefinition> {
+    let mut out: Vec<&AbilityDefinition> = Vec::new();
+    for a in &parsed.abilities {
+        collect_defs(a, &mut out);
+    }
+    for t in &parsed.triggers {
+        if let Some(e) = t.execute.as_deref() {
+            collect_defs(e, &mut out);
+        }
+    }
+    for r in &parsed.replacements {
+        if let Some(e) = r.execute.as_deref() {
+            collect_defs(e, &mut out);
+        }
+    }
+    out
+}
+
+fn is_color_choice(def: &AbilityDefinition) -> bool {
+    matches!(
+        &*def.effect,
+        Effect::Choose {
+            choice_type: ChoiceType::Color { .. },
+            ..
+        }
+    )
+}
+
+fn is_unimplemented_def(def: &AbilityDefinition) -> bool {
+    matches!(&*def.effect, Effect::Unimplemented { .. })
+}
+
+/// Structural (never string-scanning) check for `FilterProp::IsChosenColor`.
+fn filter_has_chosen_color(f: &TargetFilter) -> bool {
+    match f {
+        TargetFilter::Typed(tf) => tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::IsChosenColor)),
+        TargetFilter::Not { filter } => filter_has_chosen_color(filter),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(filter_has_chosen_color)
+        }
+        _ => false,
+    }
+}
+
+/// The mass-effect object filters this class can produce.
+fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
+    let target = match effect {
+        Effect::BounceAll { target, .. }
+        | Effect::DestroyAll { target, .. }
+        | Effect::DamageAll { target, .. } => Some(target),
+        _ => None,
+    };
+    target.is_some_and(filter_has_chosen_color)
+}
+
+fn tree_has_is_chosen_color(def: &AbilityDefinition) -> bool {
+    let mut nodes = Vec::new();
+    collect_defs(def, &mut nodes);
+    nodes
+        .into_iter()
+        .any(|d| effect_filter_has_chosen_color(&d.effect))
+}
+
+/// V-ANAPHOR (SHAPE) — CR 105.4 + CR 607.2d. The three anaphor cards
+/// (`of the chosen color` / `of that color`) parse exactly as they do today:
+/// the printed-form arm must NOT widen to the anaphor forms.
+///
+/// The negatives (zero `IsChosenColor`, zero `Unimplemented`) are each paired
+/// with a positive reach-guard on the surface that ACTUALLY carries the chain —
+/// for Dromar that is `triggers`, not `abilities` (its `abilities` is empty, so
+/// an `abilities`-only assertion would pass vacuously).
+#[test]
+fn anaphor_color_cards_are_unchanged_by_the_printed_qualifier_arm() {
+    // Sudden Demise {X}{R} — verbatim.
+    let sudden_demise = parse_oracle_text(
+        "Choose a color. Sudden Demise deals X damage to each creature of the chosen color.",
+        "Sudden Demise",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    // Persecute {2}{B}{B} — verbatim.
+    let persecute = parse_oracle_text(
+        "Choose a color. Target player reveals their hand and discards all cards of that color.",
+        "Persecute",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    // Dromar, the Banisher {3}{W}{U}{B} — verbatim, INCLUDING the "Flying" line.
+    let dromar = parse_oracle_text(
+        "Flying\nWhenever Dromar deals combat damage to a player, you may pay {2}{U}. If you do, \
+         choose a color, then return all creatures of that color to their owners' hands.",
+        "Dromar, the Banisher",
+        &["Flying".to_string()],
+        &["Creature".to_string()],
+        &["Dragon".to_string()],
+    );
+
+    // SURFACE NOTE, load-bearing: Dromar's `abilities` is EMPTY — its whole
+    // chain lives in `triggers`. An assertion walking only `abilities` would
+    // pass vacuously here, which is exactly the blind spot `all_card_defs`
+    // exists to close.
+    assert!(
+        dromar.abilities.is_empty() && dromar.triggers.len() == 1,
+        "Dromar's chain must live in `triggers`, not `abilities`: {} / {}",
+        dromar.abilities.len(),
+        dromar.triggers.len()
+    );
+
+    for (name, parsed) in [
+        ("Sudden Demise", &sudden_demise),
+        ("Persecute", &persecute),
+        ("Dromar, the Banisher", &dromar),
+    ] {
+        let nodes = all_card_defs(parsed);
+        // POSITIVE REACH-GUARD: the card's own `Choose a color.` is present on
+        // whichever surface carries it, so the negatives below are not vacuous
+        // on a parse failure or a wrong-surface walk.
+        let color_choices: Vec<bool> = nodes
+            .iter()
+            .filter_map(|d| match &*d.effect {
+                Effect::Choose {
+                    choice_type: ChoiceType::Color { .. },
+                    persist,
+                    ..
+                } => Some(*persist),
+                _ => None,
+            })
+            .collect();
+        // The anaphor cards keep `persist: false` — this change does not touch
+        // the `persist:` match (Named follow-up F1).
+        assert_eq!(
+            color_choices,
+            vec![false],
+            "{name}: exactly one printed colour choice, still `persist: false` (F1)"
+        );
+        // NEGATIVE 1: no anaphor filter gained `IsChosenColor`.
+        assert!(
+            !nodes
+                .iter()
+                .any(|d| effect_filter_has_chosen_color(&d.effect)),
+            "{name}: the anaphor form must NOT be consumed by the printed-qualifier arm"
+        );
+        // NEGATIVE 2: no new coverage regression.
+        assert_eq!(
+            nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+            0,
+            "{name}: no clause may lower to Unimplemented"
+        );
+    }
+}
+
+/// V-UNIMPL (SHAPE) — the head-node `Effect::Unimplemented` guard fires on the
+/// branch it claims to.
+///
+/// The fixture must be MULTI-CLAUSE: a single-clause refusal cannot reach the
+/// guard, because if the head clause lowered to `Unimplemented` then
+/// `parse_type_phrase_with_ctx` generally never ran on it, so
+/// `printed_color_choice` is `None` and the injector's `Some(_) | None` arm is
+/// taken instead — indistinguishable from the guard firing.
+#[test]
+fn head_unimplemented_suppresses_the_printed_color_choice_injection() {
+    const TEXT: &str = "Lose life equal to the total mana value of those cards. Return all \
+                        permanents of the color of your choice to their owners' hands.";
+
+    let ir = parse_effect_chain_ir(TEXT, AbilityKind::Spell, &mut ParseContext::default());
+
+    // RG (b): the IR proves the guard branch is the one taken — a LATER clause
+    // declared the printed provenance, so `printed` reached the injector as
+    // `Some(Color)`.
+    let carrier_index = ir
+        .clauses
+        .iter()
+        .position(|c| matches!(c.printed_color_choice, Some(ChoiceType::Color { .. })))
+        .expect("a later clause must carry the printed colour provenance");
+    assert!(
+        carrier_index > 0,
+        "the carrier must be a LATER clause than the refused head, got index 0"
+    );
+    let carrier = &ir.clauses[carrier_index];
+    // RG (c): that clause's own filter really does carry IsChosenColor.
+    assert!(
+        effect_filter_has_chosen_color(&carrier.parsed.effect),
+        "the carrying clause's filter must stamp IsChosenColor: {:?}",
+        carrier.parsed.effect
+    );
+
+    let def = parse_effect_chain(TEXT, AbilityKind::Spell);
+    let mut nodes = Vec::new();
+    collect_defs(&def, &mut nodes);
+    // RG (a): exactly one honest refusal, and it is the HEAD.
+    assert_eq!(
+        nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+        1,
+        "the head clause must stay an honest single Unimplemented: {def:#?}"
+    );
+    assert!(
+        is_unimplemented_def(&def),
+        "the HEAD is the refused clause: {:?}",
+        def.effect
+    );
+    // THE NEGATIVE: no prompt is raised for semantics the parser refused.
+    assert_eq!(
+        nodes.iter().filter(|d| is_color_choice(d)).count(),
+        0,
+        "a refused head must not raise a colour prompt: {def:#?}"
+    );
+
+    // POSITIVE TWIN, same test: the single-clause card DOES get its chooser.
+    let wash_out = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    let mut wash_nodes = Vec::new();
+    collect_defs(&wash_out, &mut wash_nodes);
+    assert_eq!(
+        wash_nodes.iter().filter(|d| is_color_choice(d)).count(),
+        1,
+        "Wash Out gets exactly one chooser"
+    );
+    assert_eq!(
+        wash_nodes
+            .iter()
+            .filter(|d| is_unimplemented_def(d))
+            .count(),
+        0,
+        "Wash Out has no refusal"
+    );
+}
+
+/// V-ORDER (SHAPE, LIMITATION PIN) — CR 608.2c. The injection is applied at the
+/// CHAIN HEAD, so on a multi-clause chain whose printed qualifier sits in a
+/// LATER clause the prompt is raised earlier than printed.
+///
+/// This is deliberate and bounded (both cards in this class are single-clause
+/// chains), and it is pinned rather than left silent. Named follow-up **F6**
+/// moves the wrap to the carrying clause's own arena node; when it lands, this
+/// test flips DELIBERATELY.
+#[test]
+fn printed_color_choice_is_injected_at_the_chain_head_limitation_pin() {
+    let def = parse_effect_chain(
+        "Draw a card. Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    let mut nodes = Vec::new();
+    collect_defs(&def, &mut nodes);
+
+    assert_eq!(
+        nodes.iter().filter(|d| is_color_choice(d)).count(),
+        1,
+        "exactly one injected colour choice: {def:#?}"
+    );
+    assert!(
+        is_color_choice(&def),
+        "TODAY the wrap is at the chain HEAD — F6 will move it to the carrying \
+         clause and deliberately flip this assertion: {:?}",
+        def.effect
+    );
+    // REACH-GUARDS: the bounce filter really carries the colour prop, and
+    // nothing was refused.
+    assert!(
+        tree_has_is_chosen_color(&def),
+        "the mass bounce filter must stamp IsChosenColor: {def:#?}"
+    );
+    assert_eq!(
+        nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+        0,
+        "no clause may lower to Unimplemented: {def:#?}"
+    );
+}

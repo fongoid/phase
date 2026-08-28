@@ -12,9 +12,10 @@ use super::ast::{ClauseBoundary, ContinuationAst, ParsedEffectClause};
 use super::doc::{OracleDocBuilder, OracleSourceSpan, OracleUnitSource};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
-    ActivationManaPaymentRestriction, ActivationRestriction, ControllerRef, CostReduction,
-    DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
-    RoundingMode, SubAbilityLink, TargetFilter, TargetSelectionMode, UnlessPayModifier,
+    ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ControllerRef,
+    CostReduction, DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter,
+    QuantityExpr, RoundingMode, SubAbilityLink, TargetFilter, TargetSelectionMode,
+    UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -847,6 +848,18 @@ pub(crate) struct ClauseIr {
     /// targeted "of their choice" controlled by the phase-trigger active player.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_chooser: Option<TargetFilter>,
+    /// CR 105.4 + CR 608.2c: this clause's text printed its own colour choice
+    /// ("of the color of your choice"), captured from `ParseContext` after this
+    /// chunk was parsed. Declared per-clause provenance — assembly gates the
+    /// injected `Effect::Choose(Color)` on THIS, never on a shape scan of the
+    /// lowered tree ("antecedents are named, never searched").
+    ///
+    /// Propagated by `absorb_clause` like every other intrinsic field: dropping it
+    /// there is compile-silent (the `ClauseDraft` default supplies `None`) and
+    /// would leave a nested-chain clause with `IsChosenColor` stamped and no
+    /// chooser injected — a fail-closed, match-NOTHING filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) printed_color_choice: Option<ChoiceType>,
     /// CR 608.2c + CR 603.7a: where this clause's lowered definition attaches.
     /// `Sibling` (default) is promoted only when this clause continues an open
     /// delayed payload and is consumed by `assemble_effect_chain`'s relocation step.
@@ -1009,6 +1022,7 @@ impl ClauseIrBuilder {
             unless_pay: None,
             target_selection_mode: TargetSelectionMode::Chosen,
             target_chooser: None,
+            printed_color_choice: None,
             placement: ClausePlacement::Sibling,
         }
     }
@@ -1069,6 +1083,7 @@ impl ClauseIrBuilder {
         .unless_pay(c.unless_pay)
         .target_selection_mode(c.target_selection_mode)
         .target_chooser(c.target_chooser)
+        .printed_color_choice(c.printed_color_choice)
         .push();
     }
 
@@ -1101,6 +1116,7 @@ pub(crate) struct ClauseDraft<'a> {
     unless_pay: Option<UnlessPayModifier>,
     target_selection_mode: TargetSelectionMode,
     target_chooser: Option<TargetFilter>,
+    printed_color_choice: Option<ChoiceType>,
     placement: ClausePlacement,
 }
 
@@ -1160,6 +1176,10 @@ impl ClauseDraft<'_> {
         self.target_chooser = v;
         self
     }
+    pub(crate) fn printed_color_choice(mut self, v: Option<ChoiceType>) -> Self {
+        self.printed_color_choice = v;
+        self
+    }
 
     /// Mint the `ClauseId` + `ChainRelative` `OracleUnitSource` and commit the
     /// clause into the builder's source-ordered list.
@@ -1195,6 +1215,7 @@ impl ClauseDraft<'_> {
             unless_pay: self.unless_pay,
             target_selection_mode: self.target_selection_mode,
             target_chooser: self.target_chooser,
+            printed_color_choice: self.printed_color_choice,
             placement: self.placement,
             _sealed: (),
         });
