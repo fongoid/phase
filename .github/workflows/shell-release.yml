@@ -631,6 +631,13 @@ jobs:
           test "$(jq -r '.platforms | keys | sort | join(",")' artifacts/update.json)" = 'darwin-aarch64,linux-x86_64,windows-x86_64'
           ! grep -qi 'android' artifacts/update.json
 
+      - name: Download signed Android APKs
+        if: needs.build-android.outputs.apk_available == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shell-tauri-android
+          path: artifacts/shell-tauri-android
+
       - name: Create shell release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -653,28 +660,4 @@ jobs:
             `update.json` is used by automatic updates; it is not a manual download.
           fail_on_unmatched_files: true
           files: |
-            artifacts/shell-tauri-linux/Phase-Desktop-Linux-x86_64.deb
-            artifacts/shell-tauri-linux/Phase-Desktop-Linux-x86_64.AppImage
-            artifacts/shell-tauri-macos/Phase-Desktop-macOS-Apple-Silicon.dmg
-            artifacts/shell-tauri-macos/Phase-Desktop-macOS-Apple-Silicon.app.tar.gz
-            artifacts/shell-tauri-windows/Phase-Desktop-Windows-x64-Setup.exe
-            artifacts/update.json
-
-      - name: Download signed Android APKs
-        if: needs.build-android.outputs.apk_available == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: shell-tauri-android
-          path: artifacts/shell-tauri-android
-
-      - name: Attach signed Android APKs
-        if: needs.build-android.outputs.apk_available == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "$SHELL_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            artifacts/shell-tauri-android/Phase-Android-ARM64.apk \
-            artifacts/shell-tauri-android/Phase-Android-ARMv7.apk \
-            --clobber
+            artifacts/**/*
