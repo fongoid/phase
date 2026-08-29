@@ -84,7 +84,7 @@ use super::{
     resolve_difference_anaphor_in_ability, retarget_counter_additional_cost_to_target,
     rewrite_grant_parent_to_filter, rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode,
     rewrite_that_type_mana_instead, stamp_delayed_returns, try_fold_token_repeat_into_count,
-    wire_optional_cast_decline_fallback,
+    wire_optional_cast_decline_fallback, PrintedColorCarrier, PrintedColorCarrierScope,
 };
 
 /// CR 601.2c: True when the assembled head chose one or more players at
@@ -3252,31 +3252,72 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     //
     // The full census, including why Avacyn's two printed occurrences do not
     // violate "twice in one chain", is on `inject_printed_color_choice_filter`.
-    let printed_color_carriers: Vec<(ChoiceType, &str)> = ir
+    // CR 608.2c SCOPE: the wrap can only ever land on the chain HEAD, so the
+    // injector also needs to know whether the head IS the carrier's own node.
+    // That is decided here, where the clause list is still visible, and it is
+    // deliberately NOT derived from the carrier's clause INDEX: an index rule
+    // would assume "index 0 ⇒ the head node is clause 0's node", which the
+    // assembly folds falsify — `collapse_ephemeral_color_choice_mana` OVERWRITES
+    // `def.effect` with its sub-ability's effect, and
+    // `fold_deal_damage_then_prevent_into_computed_amount` splices a node out and
+    // renumbers everything behind it, so a head node whose ORIGIN clause is not
+    // clause 0 is constructible. `SoleClause` needs neither assumption: with
+    // exactly one surviving clause, every node in the assembled tree is that
+    // clause's own subtree, so no fold can move the wrap outside the carrying
+    // clause. The property is one-directional and that is what makes it safe —
+    // a non-sole carrier always REFUSES, and a sole carrier always has
+    // head == carrier.
+    //
+    // The clause count is taken over the SAME filtered set the carriers come
+    // from, so the `Unimplemented` guard's subject and the provenance's subject
+    // stay the same clause: a chain whose head the parser refused and whose only
+    // surviving clause printed the qualifier is a sole-clause carrier, not a
+    // later-clause one (pinned by `V-UNIMPL`).
+    let surviving: Vec<_> = ir
         .clauses
         .iter()
         .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
-        .filter_map(|clause| {
-            clause
-                .printed_color_choice
-                .clone()
-                .map(|choice| (choice, clause.source.fragment().unwrap_or_default()))
+        .collect();
+    let sole_surviving_clause = surviving.len() == 1;
+    let printed_color_carriers: Vec<(PrintedColorCarrier, &str)> = surviving
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clause)| {
+            clause.printed_color_choice.clone().map(|choice| {
+                let scope = if sole_surviving_clause {
+                    PrintedColorCarrierScope::SoleClause
+                } else if index == 0 {
+                    PrintedColorCarrierScope::ChainHeadOfMany
+                } else {
+                    PrintedColorCarrierScope::LaterClause
+                };
+                (
+                    PrintedColorCarrier { choice, scope },
+                    clause.source.fragment().unwrap_or_default(),
+                )
+            })
         })
         .collect();
-    let printed: Vec<ChoiceType> = printed_color_carriers
+    let carriers: Vec<PrintedColorCarrier> = printed_color_carriers
         .iter()
-        .map(|(choice, _)| choice.clone())
+        .map(|(carrier, _)| carrier.clone())
         .collect();
     let fragment = printed_color_carriers
         .iter()
         .map(|(_, source)| *source)
         .collect::<Vec<_>>()
         .join(" ");
-    inject_printed_color_choice_filter(&mut result, &printed, &fragment);
+    inject_printed_color_choice_filter(&mut result, &carriers, &fragment);
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains
     // protection/hexproof from the color of your choice" grant so the source
     // carries a chosen color for the layer applier to bake in.
-    inject_chosen_color_choice_grant(&mut result, false);
+    //
+    // CR 607.2d: unless a LINKED ability elsewhere on this object already makes
+    // that choice, in which case the grant reads the linked answer and must not
+    // make a second one. That fact is cross-item, so it cannot be seen from
+    // inside one chain — it arrives as `ir.injected_color_choice`, stamped before
+    // lowering from `LinkedChoiceKind::LinkedColorChoice`.
+    inject_chosen_color_choice_grant(&mut result, false, ir.injected_color_choice);
     rewrite_that_type_mana_instead(&mut result);
 
     fold_token_it_has_grants_into_token_statics(&mut result);
@@ -3558,7 +3599,7 @@ mod arena_tests {
     use super::*;
     use crate::parser::oracle_effect::parse_effect_chain_ir;
     use crate::parser::oracle_ir::ast::parsed_clause;
-    use crate::parser::oracle_ir::effect_chain::{ClauseIr, ClauseIrBuilder};
+    use crate::parser::oracle_ir::effect_chain::{ClauseIr, ClauseIrBuilder, InjectedColorChoice};
     use crate::parser::oracle_nom::context::ParseContext;
     use crate::types::ability::{DelayedTriggerCondition, ReplacementDefinition};
     use crate::types::phase::Phase;
@@ -3769,6 +3810,7 @@ mod arena_tests {
             actor: None,
             in_trigger: false,
             repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
         }
     }
 

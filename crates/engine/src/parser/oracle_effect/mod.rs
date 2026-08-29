@@ -166,9 +166,9 @@ pub(crate) use crate::parser::oracle_ir::context::{
 };
 use crate::parser::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
-    ClauseIrBuilder, ClausePlacement, DieResultBranchIr, EffectChainIr, OtherwiseKind,
-    PlayerScopeRewrite, PriorModifier, ReplaceMeaningKind, ReplicateKind, ResidualConditionPolicy,
-    ShellStage,
+    ClauseIrBuilder, ClausePlacement, DieResultBranchIr, EffectChainIr, InjectedColorChoice,
+    OtherwiseKind, PlayerScopeRewrite, PriorModifier, ReplaceMeaningKind, ReplicateKind,
+    ResidualConditionPolicy, ShellStage,
 };
 use crate::types::mana::ManaExpiry;
 
@@ -14858,6 +14858,7 @@ fn parse_choose_survivors_destroy_rest_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -14951,6 +14952,7 @@ fn parse_balance_equalization_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -15153,6 +15155,7 @@ fn parse_threshold_land_balance_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -15330,6 +15333,7 @@ fn parse_uneven_land_search_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -29564,6 +29568,43 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
     def.sub_ability = Some(Box::new(displaced_ability));
 }
 
+/// CR 608.2c: how the clause that PRINTED "of the color of your choice" sits
+/// relative to its chain, which decides whether the chain HEAD — the only node
+/// `inject_printed_color_choice_filter` can wrap — is that clause's own node.
+///
+/// Derived from the DECLARED per-clause provenance in `assembly.rs`, never from a
+/// scan of the lowered tree, and deliberately NOT from the clause's index. An
+/// index rule would assume "index 0 ⇒ the head node is clause 0's node", which
+/// the assembly folds falsify: `collapse_ephemeral_color_choice_mana` OVERWRITES
+/// `def.effect` with its sub-ability's effect, and
+/// `fold_deal_damage_then_prevent_into_computed_amount` splices a node out and
+/// renumbers everything behind it. `SoleClause` needs neither assumption: with
+/// exactly one surviving clause, every node in the chain is that clause's own
+/// subtree, so no fold can move the wrap outside the carrying clause. Follow-up
+/// **F6** wraps at the carrying clause's own node, at which point the other two
+/// variants become wrappable rather than refusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintedColorCarrierScope {
+    /// The carrier is the chain's ONLY surviving clause, so head == carrier by
+    /// construction. Every card in the printed slice today (Wash Out, Root
+    /// Greevil, Prismatic Strands) lands here.
+    SoleClause,
+    /// The carrier is the FIRST of several surviving clauses. Head-node identity
+    /// is not established under the folds above, so this refuses rather than
+    /// wrapping a node that may not be the carrier's.
+    ChainHeadOfMany,
+    /// A LATER clause printed the qualifier. Wrapping at the head would raise the
+    /// prompt earlier than printed (CR 608.2c).
+    LaterClause,
+}
+
+/// One clause that printed the colour qualifier, with its chain scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrintedColorCarrier {
+    pub(crate) choice: ChoiceType,
+    pub(crate) scope: PrintedColorCarrierScope,
+}
+
 /// CR 105.4 + CR 608.2c: supply the colour choice a clause PRINTED for its own
 /// object filter ("Return all permanents of the color of your choice …" —
 /// Wash Out; "Destroy all enchantments of the color of your choice." — Root
@@ -29616,22 +29657,42 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// `scripts/check-test-card-data-load.sh` forbids for newly added test code.
 /// Hence the census is documented with a date rather than pinned by a test.
 ///
-/// ARITY CONTRACT — `printed` is EVERY surviving carrier in the chain, in
-/// printed order, never just the first one found. This function is the SINGLE
-/// authority on that arity: callers pass what the chain declared and never
-/// pre-filter, so the empty case is decided here too.
+/// ARITY-AND-SCOPE CONTRACT — `carriers` is EVERY surviving carrier in the
+/// chain, in printed order, never just the first one found, and each carries the
+/// scope its clause occupied. This function is the SINGLE authority on both
+/// axes: callers pass what the chain declared and never pre-filter, so the empty
+/// case is decided here too.
 ///
 /// The arity is counted over COLOUR carriers, not over carriers in general. A
 /// declared provenance that is not a `ChoiceType::Color` is not this injector's
 /// job (the body's opening comment says why it cannot arise today), and must
 /// therefore neither trigger a wrap nor — this is the asymmetry the count
 /// closes — push a chain into the refusal arm when no colour chooser is needed
-/// at all:
+/// at all. The six arms, exhaustively:
 ///
 ///   * **no colour carrier** — nothing declared a colour provenance (an empty
 ///     slice, or a slice of non-colour provenances only): no-op.
-///   * **exactly one** — the live case (Wash Out, Root Greevil): wrap, subject
-///     to the already-a-colour-choice guard below.
+///   * **exactly one, `SoleClause`, head is not already a colour chooser** — the
+///     live case (Wash Out, Root Greevil): wrap.
+///   * **exactly one, `SoleClause`, head IS already an `Effect::Choose(Color)`**
+///     — CR 105.4 + CR 607.2d. Wrapping would raise TWO prompts and the
+///     FIRST-match read would discard the player's second answer; SKIPPING would
+///     leave the stamped `FilterProp::IsChosenColor` bound to a chooser that —
+///     with `ChoiceType::Color` still absent from the `persist:` match in
+///     `oracle_effect/imperative.rs` (follow-up **F1**) — writes no
+///     `ChosenAttribute::Color` at all, so the filter's fail-closed `is_some_and`
+///     read matches NOTHING with no `Effect::Unimplemented` and no parse warning.
+///     Refuse instead of either: `printed_color_choice_over_existing_color_chooser`.
+///   * **exactly one, `ChainHeadOfMany`** — the carrier is clause 0 of several,
+///     so the head node's ORIGIN clause is not established (see
+///     `PrintedColorCarrierScope`'s doc for the folds that falsify an index
+///     rule). Refuse rather than wrap a node a fold may have re-sourced:
+///     `printed_color_choice_not_sole_clause`.
+///   * **exactly one, `LaterClause`** — CR 608.2c: the wrap can only land on the
+///     chain head, so the prompt would be raised before clauses printed ahead of
+///     it. Refuse rather than silently reorder: `later_clause_printed_color_choice`.
+///     Follow-up **F6** makes both non-sole scopes wrappable by moving the wrap
+///     onto the carrying clause's own node.
 ///   * **two or more** — CR 607.1c + CR 607.2d: linkage is per printed
 ///     occurrence, and CR 607.1c is the half that covers TWO occurrences inside
 ///     ONE ability (an ability fulfilling both criteria of CR 607.1 is linked to
@@ -29641,8 +29702,11 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 ///     injected chooser writes ONE `ChosenAttribute::Color`, and both
 ///     `game/filter.rs` readers take the FIRST one, so a single wrap would bind
 ///     BOTH stamped filters to the FIRST answer and silently discard the second
-///     — with no `Effect::Unimplemented` and no parse warning. Follow-up **F7**
-///     (backlog root cause 3) is the runtime half of that same first-wins read.
+///     — with no `Effect::Unimplemented` and no parse warning. (The runtime half
+///     of that first-wins read — a source ACCUMULATING colours across two
+///     resolutions — is closed: `apply_choice_attributes` in
+///     `game/effects/choose.rs` now replaces `ChosenAttribute::Color` on
+///     re-choose, so a source holds at most one.)
 ///     The parser cannot model that shape until follow-up
 ///     **F6** gives each carrying clause its own wrap at its own node, so the
 ///     chain is REFUSED here: the definition becomes
@@ -29658,10 +29722,10 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// is what says so — so it is pinned synthetically by
 /// `two_printed_color_choices_in_one_chain_are_refused_not_collapsed`.
 ///
-/// CR 608.2c LIMITATION, stated rather than hidden: the wrap is applied to the
-/// CHAIN HEAD. Both cards at THIS seam are single-clause chains, so head ==
-/// clause for both; for a hypothetical later-clause case the prompt would be
-/// raised earlier than printed. Pinned by the `V-ORDER` test; follow-up F6.
+/// CR 608.2c: the wrap is applied to the CHAIN HEAD, which is why non-sole
+/// carriers are REFUSED rather than silently reordered — see the scope arms
+/// above and `PrintedColorCarrierScope`. Every card at THIS seam is a
+/// single-clause carrier, so head == carrier for all of them.
 /// The same head-vs-clause seam has a second consequence at the node level:
 /// `wrap_in_color_choice` moves only `effect` and the prior `sub_ability`, so a
 /// DECORATED head would strand `condition` / `optional` / `optional_for` /
@@ -29681,27 +29745,14 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// (`game/filter.rs` reads it with `is_some_and`) carrying no
 /// `Effect::Unimplemented` and no parse warning. Pinned by `V-UNIMPL`.
 ///
-/// Skipped when the head effect is ALREADY an `Effect::Choose(Color)` — the
-/// same recursion guard `inject_chosen_color_choice_grant` spells as
-/// `parent_is_color_choice` / `child_under_color_choice`, so the two injectors
-/// agree on what "a colour choice already stands here" means. A chain that
-/// prints both ("Choose a color. Return all permanents of the color of your
-/// choice …") would otherwise raise TWO prompts, and the `find_map` over
-/// `chosen_attributes` reads the FIRST-written (outer) colour, silently
-/// discarding the player's second answer.
-///
-/// Honest consequence, since `ChoiceType::Color` is absent from the `persist:`
-/// match in `oracle_effect/imperative.rs`: the surviving printed choice is
-/// `persist: false`, so it writes no `ChosenAttribute::Color` and the
-/// `IsChosenColor` filter matches nothing until follow-up **F1** adds `Color`
-/// to that match. That is exactly the state the sibling injector's guard
-/// already produces for "Choose a color. Target creature gains protection from
-/// that color" — one gap at one seam, closed once by F1, rather than two
-/// injectors disagreeing about the same shape. No card in the pool prints both
-/// forms in one chain, so this is unreachable today; pinned by `V-DOUBLE`.
+/// Refused when the head effect is ALREADY an `Effect::Choose(Color)` — the same
+/// concept `inject_chosen_color_choice_grant` spells as `parent_is_color_choice`
+/// / `child_under_color_choice`, so the two injectors agree on what "a colour
+/// choice already stands here" means, but here it is a REFUSAL rather than a
+/// skip, for the reason on that arm above.
 pub(crate) fn inject_printed_color_choice_filter(
     def: &mut AbilityDefinition,
-    printed: &[ChoiceType],
+    carriers: &[PrintedColorCarrier],
     fragment: &str,
 ) {
     // Arity is over COLOUR carriers only. A declared provenance that is not a
@@ -29713,52 +29764,104 @@ pub(crate) fn inject_printed_color_choice_filter(
     //
     // Two carriers is all the arity that has to be distinguished, so the count
     // is taken lazily off the iterator rather than materialized.
-    let mut color_carriers = printed
+    let mut color_carriers = carriers
         .iter()
-        .filter(|choice| matches!(choice, ChoiceType::Color { .. }));
+        .filter(|carrier| matches!(carrier.choice, ChoiceType::Color { .. }));
     match (color_carriers.next(), color_carriers.next()) {
         // No clause declared a COLOUR provenance. Covers the empty slice (no
         // clause declared any provenance at all — this function, not its caller,
         // owns that decision) and a slice of non-colour provenances alike.
         (None, _) => {}
-        // THE LIVE CASE. Both guards here are explicit and independent: the
-        // DECLARED provenance must be a colour choice, and the head must not
-        // already BE a colour choice. The third — "the parser refused this
-        // clause" — is deliberately NOT here: it is applied to the carrying
-        // clause at the provenance selection in `assembly.rs`, per this
-        // function's doc.
-        (Some(_), None) => {
-            if !matches!(
-                &*def.effect,
-                Effect::Choose {
-                    choice_type: ChoiceType::Color { .. },
-                    ..
-                }
-            ) {
-                wrap_in_color_choice(def);
-            }
-        }
         // CR 607.1c + CR 607.2d: two or more printed colour choices in one
         // chain. Refuse honestly instead of collapsing them onto one chooser —
-        // see the ARITY CONTRACT on this function.
+        // see the ARITY-AND-SCOPE CONTRACT on this function.
         (Some(_), Some(_)) => {
-            let kind = def.kind;
-            *def = AbilityDefinition::new(
-                kind,
-                Effect::unimplemented("multiple_printed_color_choices", fragment),
-            );
+            refuse_printed_color_choice(def, "multiple_printed_color_choices", fragment)
         }
+        // Exactly one colour carrier: the scope decides, exhaustively, so a
+        // future scope variant is a compile error rather than a silent
+        // fall-through.
+        (Some(carrier), None) => match carrier.scope {
+            // CR 608.2c: the prompt would be raised before clauses printed ahead
+            // of it.
+            PrintedColorCarrierScope::LaterClause => {
+                refuse_printed_color_choice(def, "later_clause_printed_color_choice", fragment)
+            }
+            // The carrier is clause 0 of many, so the head node's ORIGIN clause
+            // is not established (see `PrintedColorCarrierScope`). Refuse rather
+            // than wrap a node a fold may have re-sourced.
+            PrintedColorCarrierScope::ChainHeadOfMany => {
+                refuse_printed_color_choice(def, "printed_color_choice_not_sole_clause", fragment)
+            }
+            // CR 105.4 + CR 607.2d: a colour chooser already stands at the head.
+            PrintedColorCarrierScope::SoleClause
+                if matches!(
+                    &*def.effect,
+                    Effect::Choose {
+                        choice_type: ChoiceType::Color { .. },
+                        ..
+                    }
+                ) =>
+            {
+                refuse_printed_color_choice(
+                    def,
+                    "printed_color_choice_over_existing_color_chooser",
+                    fragment,
+                )
+            }
+            // THE LIVE CASE: Wash Out, Root Greevil, Prismatic Strands.
+            PrintedColorCarrierScope::SoleClause => wrap_in_color_choice(def),
+        },
     }
 }
 
-fn inject_chosen_color_choice_grant(def: &mut AbilityDefinition, parent_is_color_choice: bool) {
+/// Replace a chain with the single "the parser could not handle this" authority,
+/// preserving the ability kind. Runs inside `assemble_effect_chain`, i.e. before
+/// `oracle_cost.rs` attaches the activation cost, so a refused activated ability
+/// keeps its printed cost.
+fn refuse_printed_color_choice(def: &mut AbilityDefinition, name: &str, fragment: &str) {
+    let kind = def.kind;
+    *def = AbilityDefinition::new(kind, Effect::unimplemented(name, fragment));
+}
+
+/// CR 105.4 + CR 702.16 + CR 702.11d: supply the colour choice a
+/// `Protection`/`HexproofFrom(ChosenColor)` grant needs, so the source carries a
+/// chosen colour for the layer applier to bake in.
+///
+/// CR 607.2d: linkage is OBJECT-scoped, not chain-scoped. `parent_is_color_choice`
+/// answers "a colour choice already stands in THIS chain"; `injected` answers the
+/// half this function cannot see — "a colour choice already stands on this
+/// OBJECT, made by a LINKED ability" (Floating Shield's as-enters choice, read
+/// back by its "Sacrifice this Aura:" grant; Faith's Shield's CR 614.15 override
+/// reading its base's choice). Injecting there raises a SECOND prompt for a value
+/// the rules say is already fixed, and the source's `ChosenAttribute::Color` then
+/// carries two answers for one printed choice.
+///
+/// The suppression is decided from the DECLARED document relation
+/// (`LinkedChoiceKind::LinkedColorChoice`), never from a scan of the lowered tree:
+/// the printed/anaphoric distinction is erased by `types/keywords.rs`
+/// `parse_protection_target`, which maps BOTH "the chosen color" and "the color of
+/// your choice" onto `ProtectionTarget::ChosenColor`. Follow-up **F8** gives the
+/// keyword-grant route its own per-clause provenance channel, as
+/// `ClauseIr.printed_color_choice` already does for the object-filter route.
+fn inject_chosen_color_choice_grant(
+    def: &mut AbilityDefinition,
+    parent_is_color_choice: bool,
+    injected: InjectedColorChoice,
+) {
+    // CR 607.2d: a linked ability elsewhere on this object already made the
+    // choice this chain reads back. Withholding the injection is the whole fix —
+    // there is nothing to unwrap later.
+    if matches!(injected, InjectedColorChoice::SuppressedByLinkedAbility) {
+        return;
+    }
     if !parent_is_color_choice && effect_grants_chosen_color_keyword(&def.effect) {
         wrap_in_color_choice(def);
         // The grant is now a leaf beneath the choice; recurse into it with the
         // parent flag set so it is not re-wrapped, while any prior downstream
         // chain it carries is still visited.
         if let Some(sub) = def.sub_ability.as_mut() {
-            inject_chosen_color_choice_grant(sub, true);
+            inject_chosen_color_choice_grant(sub, true, injected);
         }
         return;
     }
@@ -29772,7 +29875,7 @@ fn inject_chosen_color_choice_grant(def: &mut AbilityDefinition, parent_is_color
     // not instead of — the sub_ability recursion below.
     if let Effect::ChooseOneOf { branches, .. } = &mut *def.effect {
         for branch in branches.iter_mut() {
-            inject_chosen_color_choice_grant(branch, false);
+            inject_chosen_color_choice_grant(branch, false, injected);
         }
     }
 
@@ -29784,8 +29887,32 @@ fn inject_chosen_color_choice_grant(def: &mut AbilityDefinition, parent_is_color
         }
     );
     if let Some(sub) = def.sub_ability.as_mut() {
-        inject_chosen_color_choice_grant(sub, child_under_color_choice);
+        inject_chosen_color_choice_grant(sub, child_under_color_choice, injected);
     }
+}
+
+/// CR 607.2d: whether anywhere in this already-lowered chain a
+/// `Protection`/`HexproofFrom(ChosenColor)` grant reads back a chosen colour.
+///
+/// This is the injector's own domain predicate, exposed so document-relation
+/// discovery (`parser/oracle.rs`) names the same consumer set the injector would
+/// visit instead of re-spelling it. Walks the `sub_ability` chain and every
+/// `ChooseOneOf` branch, mirroring `inject_chosen_color_choice_grant`'s recursion.
+pub(crate) fn ability_chain_grants_chosen_color_keyword(def: &AbilityDefinition) -> bool {
+    if effect_grants_chosen_color_keyword(&def.effect) {
+        return true;
+    }
+    if let Effect::ChooseOneOf { branches, .. } = &*def.effect {
+        if branches
+            .iter()
+            .any(ability_chain_grants_chosen_color_keyword)
+        {
+            return true;
+        }
+    }
+    def.sub_ability
+        .as_deref()
+        .is_some_and(ability_chain_grants_chosen_color_keyword)
 }
 
 /// True when `effect` is a `GenericEffect` granting `Protection`/`Hexproof` from
@@ -31123,6 +31250,7 @@ fn parse_exile_pile_shuffle_cloak_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -31177,6 +31305,7 @@ fn parse_exile_object_and_top_face_down_pile_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -31386,6 +31515,7 @@ fn parse_for_each_attacker_copy_blocker_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -31486,6 +31616,7 @@ fn parse_return_target_and_same_name_from_your_graveyard_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
@@ -31829,6 +31960,7 @@ pub(crate) fn parse_effect_chain_ir(
                 actor: ctx.actor.clone(),
                 in_trigger: ctx.in_trigger,
                 repeat_until: None,
+                injected_color_choice: InjectedColorChoice::Permitted,
             };
         }
     }
@@ -35457,6 +35589,7 @@ pub(crate) fn parse_effect_chain_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: pending_repeat_until,
+        injected_color_choice: InjectedColorChoice::Permitted,
     }
 }
 

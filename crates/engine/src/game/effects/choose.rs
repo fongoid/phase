@@ -300,9 +300,12 @@ pub(crate) fn bind_named_choice(
                 // turn") must REPLACE its prior keyword answer, otherwise the
                 // `AddChosenKeyword` plural read would grant every historical
                 // choice. Clear only `ChosenAttribute::Keyword` (Greymond's single
-                // as-enters bind clears nothing, so its behavior is unchanged);
-                // every other chosen-attribute kind (Color, Subtype, CardName,
-                // Label, …) is untouched so RemoveChosenKeyword/Urborg and the
+                // as-enters bind clears nothing, so its behavior is unchanged).
+                // `Color` is replaced by its own arm in `apply_choice_attributes`
+                // for the same CR 607.2d reason — a source holds ONE current
+                // chosen colour and every reader of it is first-match. Every
+                // remaining chosen-attribute kind (Subtype, CardName, Label, …) is
+                // untouched so RemoveChosenKeyword/Urborg and the
                 // anchor-word/Morophon cards keep accumulating per their own rules.
                 apply_choice_attributes(&mut obj.chosen_attributes, choice_type, choice);
                 // CR 607.2d + CR 613.1: Persisted ETB/modal choices (card name,
@@ -504,6 +507,39 @@ fn apply_choice_attributes(
     }
     if matches!(choice_type, ChoiceType::CounterKind { .. }) {
         destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Counter(_)));
+    }
+    // CR 607.2d + CR 400.7 + CR 608.2d: A source holds ONE current chosen colour,
+    // not a history. CR 607.2d links "choose a [value]" to "the chosen [value]" /
+    // "the last chosen [value]", so a source that chooses again (Mother of Runes
+    // or Knight of Dawn re-activating, Sanctuary Blade re-equipping) must REPLACE
+    // its prior answer. CR 400.7 covers the other half: a spell recast after
+    // returning from the graveyard (Wash Out via Regrowth, Prismatic Strands via
+    // flashback) is a NEW object, and `chosen_attributes` is cleared only by
+    // `reset_for_battlefield_entry` (game/game_object.rs), which a spell never
+    // reaches. Every reader of `ChosenAttribute::Color` is FIRST-match
+    // (`GameObject::chosen_color`, both `FilterProp::IsChosenColor` arms in
+    // game/filter.rs, `DevotionColors::ChosenColor` in game/quantity.rs), so
+    // accumulating binds the OLDEST answer. This is the same rule the
+    // produced-colour write in `game/mana_abilities.rs` already applies to this
+    // attribute.
+    //
+    // Deliberately Color-only: CardName / CreatureType are LAST-match (`.rev()`)
+    // reads that keep their history, `chosen_keywords()` is a plural read, and a
+    // `NumberDistinctness::DistinctFromSourceHistory` number MUST accumulate so
+    // prior picks stay illegal options (CR 608.2d).
+    //
+    // KNOWN RESIDUAL (CR 611.2c + CR 613.7b), the same trade the `Keyword` arm
+    // above made and the same one `game/layers.rs`'s `RemoveChosenKeyword`
+    // pre-read already documents ("Same limitation applies to `chosen_color`"):
+    // two SIMULTANEOUSLY-LIVE grants from one source (Cartel Aristocrat, Jareth,
+    // Resilient Wanderer, Knight of Dawn activated twice in one turn) both bake
+    // from the source's CURRENT colour at layer-apply time — the oldest before
+    // this change, the newest after. Both grants agree with each other either
+    // way, so there is no net regression; locking each continuous effect to its
+    // own answer at creation needs the colour baked into the `AddKeyword`
+    // payload. Follow-up F10.
+    if matches!(choice_type, ChoiceType::Color { .. }) {
+        destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Color(_)));
     }
     if attrs
         .iter()
@@ -866,6 +902,111 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// T4 (BUILDING BLOCK) — CR 607.2d + CR 400.7 + CR 608.2d. `Color` REPLACES
+    /// on re-choose; the kinds whose readers depend on history still accumulate.
+    ///
+    /// This is the invariant the four first-match readers of
+    /// `ChosenAttribute::Color` (`GameObject::chosen_color`, both
+    /// `FilterProp::IsChosenColor` arms in `game/filter.rs`, and
+    /// `DevotionColors::ChosenColor` in `game/quantity.rs`) rest on: a source
+    /// holds AT MOST ONE `Color`, so "the chosen color" is unambiguous. The
+    /// accumulating rows are the paired positives — without them a `retain` that
+    /// cleared everything would pass the first row alone.
+    #[test]
+    fn apply_choice_attributes_replaces_color_and_preserves_the_accumulating_kinds() {
+        // THE ROW THAT FLIPS if the `Color` arm is reverted: the second answer
+        // supersedes the first, rather than being appended behind it.
+        let mut colors = Vec::new();
+        apply_choice_attributes(&mut colors, &ChoiceType::color(), "Blue");
+        assert_eq!(colors, vec![ChosenAttribute::Color(ManaColor::Blue)]);
+        apply_choice_attributes(&mut colors, &ChoiceType::color(), "Red");
+        assert_eq!(
+            colors,
+            vec![ChosenAttribute::Color(ManaColor::Red)],
+            "a second colour choice must REPLACE the first, not accumulate"
+        );
+
+        // POSITIVE: a `Color` write leaves a DIFFERENT chosen-attribute kind on
+        // the same object alone — the retain is discriminant-scoped, which is
+        // what keeps the multi-attribute as-enters cards (Call to Arms,
+        // Riptide Replicator) correct.
+        let mut mixed = vec![ChosenAttribute::CreatureType("Goblin".to_string())];
+        apply_choice_attributes(&mut mixed, &ChoiceType::color(), "Green");
+        assert_eq!(
+            mixed,
+            vec![
+                ChosenAttribute::CreatureType("Goblin".to_string()),
+                ChosenAttribute::Color(ManaColor::Green),
+            ],
+            "the Color retain must not disturb another attribute kind"
+        );
+
+        // POSITIVE: `CardName` is a LAST-match (`.rev()`) read, so its history
+        // must survive.
+        let name_choice = ChoiceType::CardName;
+        let mut names = Vec::new();
+        apply_choice_attributes(&mut names, &name_choice, "Shock");
+        apply_choice_attributes(&mut names, &name_choice, "Bolt");
+        assert_eq!(
+            names.len(),
+            2,
+            "CardName still accumulates — its reader takes the LAST: {names:?}"
+        );
+
+        // POSITIVE: CR 608.2d — a distinct-from-history number MUST accumulate,
+        // because the source's prior picks are what make those options illegal
+        // for the next choice ("a number that hasn't been chosen").
+        let distinct = ChoiceType::NumberRange {
+            min: 0,
+            max: Some(9),
+            distinctness: crate::types::ability::NumberDistinctness::DistinctFromSourceHistory,
+        };
+        let mut numbers = Vec::new();
+        apply_choice_attributes(&mut numbers, &distinct, "3");
+        apply_choice_attributes(&mut numbers, &distinct, "7");
+        assert_eq!(
+            numbers.len(),
+            2,
+            "a distinct-from-history number must keep its history: {numbers:?}"
+        );
+
+        // POSITIVE: the pre-existing `Keyword` arm is unchanged.
+        let keyword_choice = ChoiceType::Keyword {
+            options: vec![
+                crate::types::keywords::Keyword::FirstStrike,
+                crate::types::keywords::Keyword::Vigilance,
+            ],
+            count: 1,
+        };
+        let mut keywords = Vec::new();
+        apply_choice_attributes(
+            &mut keywords,
+            &keyword_choice,
+            &crate::types::keywords::Keyword::FirstStrike.to_string(),
+        );
+        apply_choice_attributes(
+            &mut keywords,
+            &keyword_choice,
+            &crate::types::keywords::Keyword::Vigilance.to_string(),
+        );
+        assert_eq!(
+            keywords.len(),
+            1,
+            "the Keyword arm still replaces: {keywords:?}"
+        );
+
+        // NEGATIVE: an unparseable answer produces no attributes, so the
+        // destination is left exactly as it was — the early return must not
+        // clear a prior colour.
+        let mut kept = vec![ChosenAttribute::Color(ManaColor::White)];
+        apply_choice_attributes(&mut kept, &ChoiceType::color(), "Chartreuse");
+        assert_eq!(
+            kept,
+            vec![ChosenAttribute::Color(ManaColor::White)],
+            "an empty answer set must leave the destination untouched"
+        );
     }
 
     fn exact_choice_source(state: &GameState, object_id: ObjectId) -> NamedChoiceSource {

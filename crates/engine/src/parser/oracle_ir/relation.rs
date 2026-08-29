@@ -160,4 +160,29 @@ pub(crate) enum LinkedChoiceKind {
         filter: TargetFilter,
         description: String,
     },
+    /// CR 607.2d + CR 614.15: A colour choice made on ONE ability of an object,
+    /// read back by a `Protection(ChosenColor)` / `HexproofFrom(ChosenColor)`
+    /// grant on ANOTHER ability of the same object. CR 607.2d: "If an object has
+    /// an ability printed on it that causes a player to 'choose a [value]' and an
+    /// ability printed on it that refers to 'the chosen [value]' … those
+    /// abilities are linked. The second ability refers only to a choice made as
+    /// the result of the first ability." A linked reader therefore must NOT make
+    /// a second choice of its own, and `inject_chosen_color_choice_grant` must
+    /// not supply one.
+    ///
+    /// Two producers of this relation, both "the choice is made elsewhere on this
+    /// object", which is why they are one value and not two:
+    ///   * a PRINTED `Effect::Choose { Color }` on a different item (Floating
+    ///     Shield's "As this Aura enters, choose a color." replacement, read back
+    ///     by its "Sacrifice this Aura:" grant); and
+    ///   * CR 614.15 self-replacement: an override item folded into its base
+    ///     (Faith's Shield's "Fateful hour —" paragraph) reads the base's choice,
+    ///     because only one of the two effects ever applies.
+    ///
+    /// `consumers` names every item whose chain would otherwise receive an
+    /// injected chooser. Emitted only when a supplier exists and at least one
+    /// consumer is a DIFFERENT item — a chain that makes its own choice ahead of
+    /// its own grant (Akroma's Blessing, Brave the Elements) is one item and is
+    /// already handled by the injector's `child_under_color_choice` guard.
+    LinkedColorChoice { consumers: Vec<OracleItemId> },
 }

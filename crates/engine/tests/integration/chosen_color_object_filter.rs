@@ -361,31 +361,18 @@ fn wash_out_raises_one_five_option_color_prompt_before_the_bounce() {
 /// V2 multi-authority (c) — CR 105.4. Wash Out cast twice in one turn raises
 /// two independent prompts, and each choice governs only its own resolution.
 ///
-/// SCOPE, stated because it is the limit of what this file proves: the two casts
-/// are two DISTINCT spell objects, so this covers the two-objects case only. The
-/// SOURCE-REUSE case — the SAME storage id resolving a colour choice twice, as a
-/// recursion effect (Regrowth) or flashback (Prismatic Strands) produces — is
-/// NOT covered, and is not coverable here: `ChosenAttribute::Color` accumulates
-/// on the source (`apply_choice_attributes` in `game/effects/choose.rs` replaces
-/// only `Keyword` / `Counter` / `Direction`, and nothing clears the slot on a
-/// zone change off the battlefield — only `reset_for_battlefield_entry` does),
-/// while both `FilterProp::IsChosenColor` readers in `game/filter.rs` take the
-/// FIRST match. A second resolution on the same object therefore binds the
-/// FIRST answer. That is a PRE-EXISTING seam, untouched by this change — it
-/// already reaches Prismatic Strands' flashback via that card's own parser
-/// route — and its fix lives in `game/effects/choose.rs`, outside this change's
-/// scope.
+/// SCOPE: the two casts here are two DISTINCT spell objects, so this test covers
+/// the two-objects case. The SOURCE-REUSE case — the SAME storage id resolving a
+/// colour choice twice, as a recursion effect (Regrowth) or flashback (Prismatic
+/// Strands) produces — is covered by
+/// `chosen_color_rechoose_same_source::wash_out_recast_on_the_same_object_uses_its_own_color`,
+/// which moves the resolved sorcery back to hand and recasts the same object.
 ///
-/// FILED as follow-up **F7**, not left as a comment: this change gives Wash Out
-/// a `persist: true` colour choice, so a Wash Out recast from the graveyard
-/// (Yawgmoth's Will / Mizzix's Mastery class) newly reaches the same seam and
-/// would silently bind the FIRST cast's colour. The backlog row a maintainer
-/// will actually find it from is `docs/parser-misparse-backlog.md` root cause 3
-/// ("Anaphor bound to wrong referent"), whose fix hint names this seam and
-/// carries Prismatic Strands — the card that reaches it from its OWN printed
-/// text today, with no recursion enabler required. F7 is a `game/**` fix
-/// (CR 607.1c + CR 607.2d linkage is per resolution), so it is deliberately
-/// outside this parser change.
+/// That seam was the former follow-up **F7** and is now closed:
+/// `apply_choice_attributes` (`game/effects/choose.rs`) replaces
+/// `ChosenAttribute::Color` on re-choose (CR 607.2d + CR 400.7 + CR 608.2d), so a
+/// source holds AT MOST ONE chosen colour and the first-match readers in
+/// `game/filter.rs` are unambiguous.
 #[test]
 fn two_wash_outs_bind_their_own_choices_independently() {
     let mut scenario = GameScenario::new();

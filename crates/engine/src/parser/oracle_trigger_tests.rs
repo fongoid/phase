@@ -20888,7 +20888,7 @@ fn trigger_copy_token_suffix_condition_attaches_otherwise() {
 fn lower_effect_chain_ir_advances_boundary_past_special_clause() {
     use crate::parser::oracle_ir::ast::{parsed_clause, ClauseBoundary};
     use crate::parser::oracle_ir::effect_chain::{
-        ClauseDisposition, ClauseIrBuilder, EffectChainIr, OtherwiseKind,
+        ClauseDisposition, ClauseIrBuilder, EffectChainIr, InjectedColorChoice, OtherwiseKind,
     };
     use crate::types::ability::SubAbilityLink;
 
@@ -20948,6 +20948,7 @@ fn lower_effect_chain_ir_advances_boundary_past_special_clause() {
         actor: None,
         in_trigger: true,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     };
 
     let root = lower_effect_chain_ir(&ir);
@@ -20979,7 +20980,7 @@ fn lower_effect_chain_ir_advances_boundary_past_special_clause() {
 fn branch_otherwise_fallback_self_emits_unimplemented_marker_and_else() {
     use crate::parser::oracle_ir::ast::{parsed_clause, ClauseBoundary};
     use crate::parser::oracle_ir::effect_chain::{
-        ClauseDisposition, ClauseIrBuilder, EffectChainIr, OtherwiseKind,
+        ClauseDisposition, ClauseIrBuilder, EffectChainIr, InjectedColorChoice, OtherwiseKind,
     };
 
     let draw_one = || Effect::Draw {
@@ -21029,6 +21030,7 @@ fn branch_otherwise_fallback_self_emits_unimplemented_marker_and_else() {
         actor: None,
         in_trigger: true,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     };
 
     // Walk the lowered sub_ability chain and collect every effect.
@@ -21067,7 +21069,7 @@ fn modify_prior_enters_tapped_attacking_patches_prior_token_with_condition_else(
     use crate::parser::oracle_effect::parse_effect_chain;
     use crate::parser::oracle_ir::ast::{parsed_clause, ClauseBoundary};
     use crate::parser::oracle_ir::effect_chain::{
-        ClauseDisposition, ClauseIrBuilder, EffectChainIr, PriorModifier,
+        ClauseDisposition, ClauseIrBuilder, EffectChainIr, InjectedColorChoice, PriorModifier,
     };
 
     let token_def = parse_effect_chain(
@@ -21124,6 +21126,7 @@ fn modify_prior_enters_tapped_attacking_patches_prior_token_with_condition_else(
         actor: None,
         in_trigger: true,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     };
 
     let root = lower_effect_chain_ir(&ir);

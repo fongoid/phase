@@ -14,7 +14,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 |---|------------|--------:|----------------------------------|
 | 1 | Relative-clause / filter restriction on target dropped | 745 | oracle_target.rs / game/filter.rs — extend TargetFilter property extraction for trailing relative clauses |
 | 2 | Dropped intervening-if / gating condition (condition: null) | 585 | oracle_nom/condition.rs parse_inner_condition — trigger/static parsers must delegate condition extraction here |
-| 3 | Anaphor bound to wrong referent | 405 | oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring; **F7** (runtime half): `ChosenAttribute::Color` ACCUMULATES instead of replacing — `apply_choice_attributes` (game/effects/choose.rs) retains only Keyword/CounterKind/Direction, both `FilterProp::IsChosenColor` readers (game/filter.rs) `find_map` the FIRST match, and the only clearing site is `reset_for_battlefield_entry` (game/game_object.rs). A source reused across two resolutions (flashback, Regrowth/Yawgmoth's Will recursion) therefore binds its EARLIER colour, breaking CR 607.1c + CR 607.2d per-resolution linkage |
+| 3 | Anaphor bound to wrong referent | 405 | oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring |
 | 4 | Conjoined / chained second effect clause dropped | 387 | oracle.rs effect-chain composition — split on 'and'/'then'/sentence boundaries and build sub_ability chain |
 | 5 | Dropped 'for each' / dynamic count collapsed to Fixed | 329 | oracle_quantity.rs parse_for_each_clause / parse_quantity_ref — thread ForEach/ObjectCount into the effect count field |
 | 6 | Disjunctive (or-list) collapsed to first branch | 237 | oracle_nom/filter.rs + oracle_target.rs — build TargetFilter::Or across all alt() branches |
@@ -1407,8 +1407,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 **Signature.** A pronoun/demonstrative ('it', 'that creature/player', 'them', 'they') resolves to the wrong slot (Self/Source/Controller/Any/ParentTarget) instead of the bound parent target, forwarded result, or triggering player (CR 608.2k). Includes the runtime half of the same defect class, where the referent slot is bound correctly but resolves to a STALE prior answer.
 
 **Fix hint.** oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring
-
-**F7 — chosen-colour anaphor binds the earlier choice on a reused source.** `ChosenAttribute::Color` accumulates rather than replacing: `apply_choice_attributes` (`crates/engine/src/game/effects/choose.rs`) retains only `Keyword` / `CounterKind` / `Direction` before extending, both `FilterProp::IsChosenColor` readers (`crates/engine/src/game/filter.rs`) `find_map` the FIRST match, and the only clearing site is `reset_for_battlefield_entry` (`crates/engine/src/game/game_object.rs`). So a source object that resolves a colour choice twice binds its EARLIER colour on the second resolution — CR 607.1c + CR 607.2d make the linkage per printed occurrence per resolution, not per object lifetime. Reachable today from a card's own text via Prismatic Strands' flashback; also reached by any `persist: true` colour chooser recast from the graveyard (Yawgmoth's Will / Mizzix's Mastery class), which now includes Wash Out. Fix lives in `game/effects/choose.rs` (replace-on-rechoose for `Color`, as `Keyword` already does), not in the parser.
 
 <details><summary>Cards</summary>
 
@@ -5091,3 +5089,74 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - The Great Mound
 
 </details>
+
+## Named follow-ups — the chosen-colour class
+
+Filed by the Wash Out / chosen-colour work. F7 (chosen-colour anaphor bound the
+earlier choice on a reused source) was closed by the replace-on-rechoose arm in
+`crates/engine/src/game/effects/choose.rs::apply_choice_attributes`, regressed by
+`crates/engine/tests/integration/chosen_color_rechoose_same_source.rs`.
+
+**F1 — `persist: false` colour choosers write nothing.** `ChoiceType::Color` is
+absent from the `persist:` match in
+`crates/engine/src/parser/oracle_effect/imperative.rs` (and from
+`needs_choice_source_context` in `crates/engine/src/types/ability.rs`), so a
+printed `Choose a color.` writes no `ChosenAttribute::Color`. Every downstream
+`FilterProp::IsChosenColor` / `HexproofFrom(ChosenColor)` read is fail-closed
+(`is_some_and`), so it matches NOTHING — with no `Effect::Unimplemented` and no
+parse warning. Observably wrong on **Skrelv, Defector Mite** and **Sungold
+Sentinel** ("can't be blocked by creatures of that color"). Measured blast
+radius: 51 cards carry a `persist: false` colour chooser. The natural hazard —
+flipping 51 choosers to persisted makes them WRITE to their source, and eight of
+them (Akroma's Blessing, Brave the Elements, Bathe in Light, Reverent Mantra,
+Prismatic Boon, Glory, Aven Warcraft, Kabira Evangel) can choose repeatedly — is
+already removed: replace-on-rechoose means a source holds one current colour, so
+F1's writes are unambiguous by construction.
+
+**F6 — wrap the printed colour choice at the CARRYING clause's own node.**
+`inject_printed_color_choice_filter`
+(`crates/engine/src/parser/oracle_effect/mod.rs`) can only wrap the chain HEAD,
+so `PrintedColorCarrierScope::LaterClause` and
+`PrintedColorCarrierScope::ChainHeadOfMany` are REFUSED (CR 608.2c) rather than
+silently reordered. Wrapping at the carrying clause's own arena node makes both
+wrappable and also removes the decorated-head field-moving limitation on
+`wrap_in_color_choice`.
+
+**F8 — declared per-clause provenance for keyword grants.**
+`crates/engine/src/types/keywords.rs::parse_protection_target` /
+`parse_hexproof_filter` map BOTH the printed qualifier ("of the color of your
+choice") and the anaphor ("the chosen color") onto
+`ProtectionTarget::ChosenColor` / `HexproofFilter::ChosenColor`, so the
+keyword-grant injector cannot tell them apart from the lowered shape. The
+document relation `LinkedChoiceKind::LinkedColorChoice` recovers the distinction
+for the cross-item case (CR 607.2d); the general fix is a per-clause provenance
+channel for keyword grants, mirroring `ClauseIr.printed_color_choice`. Blocked
+behind `parse_granted_keyword_fragment` being a pure, context-free function with
+ten call sites including `crates/engine/src/database/synthesis.rs`. Residual it
+would close: a hypothetical card printing BOTH its own `choose a color` and a
+genuinely independent `of the color of your choice` grant on another ability
+would have its second chooser suppressed. Measured: zero such cards exist today.
+
+**F9 — "the last chosen color" falls through to `ProtectionTarget::CardType`.**
+`parse_protection_target` has no arm for the CR 607.2d "the last chosen [value]"
+phrasing, so **Sanctuary Blade** lowers to
+`Protection(CardType("the last chosen color"))` and its equipped creature's
+protection reads no colour at all — silently, with no `Effect::Unimplemented`.
+
+**F10 — CR 611.2c + CR 613.7b per-grant colour latching.** Two continuous grants
+created by two activations of the SAME source that are simultaneously live both
+bake from the source's CURRENT chosen colour at layer-apply time
+(`crates/engine/src/game/layers.rs`'s `chosen_color` pre-read), rather than each
+locking the answer its own resolution produced. Common by design: Cartel
+Aristocrat, Jareth, Leonine Titan, Resilient Wanderer and Knight of Dawn all
+grant to themselves and are built for repeated activation in one turn. Both
+grants agree with each other either way, so there is no net wrong answer today;
+strict correctness needs the colour baked into the `AddKeyword` payload at
+creation. `game/layers.rs` already documents the same limitation for
+`RemoveChosenKeyword`.
+
+**Avacyn, Guardian Angel — `by sources of the color of your choice` is dropped.**
+Both activated abilities export `Effect::PreventDamage` with NO
+`damage_source_filter`, so they prevent all damage from every source — with no
+`Effect::Unimplemented` and no parse warning. Same seam as root cause 11
+(replacement / prevention effect mis-modeled), not the object-filter seam.

@@ -54136,7 +54136,9 @@ fn sylvan_library_reaches_drawn_this_turn_followup() {
 #[test]
 fn drawn_this_turn_followup_overwrites_prior_life_payment() {
     use crate::parser::oracle_ir::ast::{parsed_clause, ClauseBoundary};
-    use crate::parser::oracle_ir::effect_chain::{ClauseIrBuilder, EffectChainIr};
+    use crate::parser::oracle_ir::effect_chain::{
+        ClauseIrBuilder, EffectChainIr, InjectedColorChoice,
+    };
 
     let choose = || Effect::ChooseDrawnThisTurnPayOrTopdeck {
         count: QuantityExpr::Fixed { value: 2 },
@@ -54177,6 +54179,7 @@ fn drawn_this_turn_followup_overwrites_prior_life_payment() {
         actor: None,
         in_trigger: false,
         repeat_until: None,
+        injected_color_choice: InjectedColorChoice::Permitted,
     };
 
     let root = lower_effect_chain_ir(&ir);
@@ -57945,44 +57948,145 @@ fn a_refused_head_still_gets_the_carrying_clauses_printed_color_choice() {
     );
 }
 
-/// V-ORDER (SHAPE, LIMITATION PIN) — CR 608.2c. The injection is applied at the
-/// CHAIN HEAD, so on a multi-clause chain whose printed qualifier sits in a
-/// LATER clause the prompt is raised earlier than printed.
+/// The `name` of an honest refusal node, or `None` for any other effect. The
+/// scope arms below are distinguished by name, so a test that only counted
+/// `Unimplemented` nodes could not tell one refusal branch from another.
+fn unimplemented_name(def: &AbilityDefinition) -> Option<&str> {
+    match &*def.effect {
+        Effect::Unimplemented { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// V-ORDER (SHAPE) — CR 608.2c. A chain whose printed qualifier sits in a LATER
+/// clause is REFUSED, not silently reordered.
 ///
-/// This is deliberate and bounded (both cards in this class are single-clause
-/// chains), and it is pinned rather than left silent. Named follow-up **F6**
-/// moves the wrap to the carrying clause's own arena node; when it lands, this
-/// test flips DELIBERATELY.
+/// The wrap can only land on the chain HEAD, so wrapping a later clause's
+/// declared choice would raise the prompt earlier than printed. Follow-up **F6**
+/// moves the wrap to the carrying clause's own arena node; when it lands, both
+/// non-sole scopes become wrappable and this test flips DELIBERATELY.
 #[test]
-fn printed_color_choice_is_injected_at_the_chain_head_limitation_pin() {
-    let def = parse_effect_chain(
-        "Draw a card. Return all permanents of the color of your choice to their owners' hands.",
-        AbilityKind::Spell,
+fn later_clause_printed_color_choice_is_refused_not_reordered() {
+    const TEXT: &str =
+        "Draw a card. Return all permanents of the color of your choice to their owners' hands.";
+
+    let ir = parse_effect_chain_ir(TEXT, AbilityKind::Spell, &mut ParseContext::default());
+    // REACH-GUARD (a): the refusal below is driven by SCOPE, not by a parse
+    // failure — exactly one surviving carrier, and it is a LATER clause.
+    let surviving: Vec<_> = ir
+        .clauses
+        .iter()
+        .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
+        .collect();
+    let carrier_index = surviving
+        .iter()
+        .position(|c| matches!(c.printed_color_choice, Some(ChoiceType::Color { .. })))
+        .expect("a surviving clause must carry the printed colour provenance");
+    assert_eq!(
+        carrier_index, 1,
+        "the carrier must be a LATER surviving clause: {ir:#?}"
     );
+    assert_eq!(
+        surviving
+            .iter()
+            .filter(|c| matches!(c.printed_color_choice, Some(ChoiceType::Color { .. })))
+            .count(),
+        1,
+        "exactly one carrier, so the multi-carrier arm is not the one under test: {ir:#?}"
+    );
+    // REACH-GUARD (b): that clause really does stamp the prop, so the refusal is
+    // removing a filter that WOULD have needed a chooser.
+    assert!(
+        effect_filter_has_chosen_color(&surviving[carrier_index].parsed.effect),
+        "the carrying clause must stamp IsChosenColor: {:?}",
+        surviving[carrier_index].parsed.effect
+    );
+
+    let def = parse_effect_chain(TEXT, AbilityKind::Spell);
     let mut nodes = Vec::new();
     collect_defs(&def, &mut nodes);
-
+    // THE ASSERTIONS THAT FLIP if the scope axis is reverted.
+    assert_eq!(
+        unimplemented_name(&def),
+        Some("later_clause_printed_color_choice"),
+        "a later-clause carrier must be refused by its own named arm: {def:#?}"
+    );
     assert_eq!(
         nodes.iter().filter(|d| is_color_choice(d)).count(),
-        1,
-        "exactly one injected colour choice: {def:#?}"
+        0,
+        "no chooser may be injected for a shape the parser refused: {def:#?}"
     );
     assert!(
-        is_color_choice(&def),
-        "TODAY the wrap is at the chain HEAD — F6 will move it to the carrying \
-         clause and deliberately flip this assertion: {:?}",
-        def.effect
+        !tree_has_is_chosen_color(&def),
+        "a refused chain must carry no orphaned IsChosenColor: {def:#?}"
     );
-    // REACH-GUARDS: the bounce filter really carries the colour prop, and
-    // nothing was refused.
-    assert!(
-        tree_has_is_chosen_color(&def),
-        "the mass bounce filter must stamp IsChosenColor: {def:#?}"
+
+    // SECOND SIBLING: a head-carrier-of-many refuses through a DISTINCT arm, so
+    // the two non-sole scopes are real separate branches rather than one.
+    let head_of_many = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands. Draw a card.",
+        AbilityKind::Spell,
     );
     assert_eq!(
-        nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+        unimplemented_name(&head_of_many),
+        Some("printed_color_choice_not_sole_clause"),
+        "clause 0 of many must refuse under its OWN name: {head_of_many:#?}"
+    );
+
+    // SIBLING: the activated form of the MEDIUM item's chain shape — a printed
+    // `Choose a color.` ahead of a later carrier — is caught by the same rule.
+    let activated = parse_effect_chain(
+        "Choose a color. Return all permanents of the color of your choice to their owners' \
+         hands.",
+        AbilityKind::Activated,
+    );
+    assert_eq!(
+        unimplemented_name(&activated),
+        Some("later_clause_printed_color_choice"),
+        "the `Choose a color.` + later-carrier chain refuses too: {activated:#?}"
+    );
+
+    // POSITIVE TWIN, same test: the sole-clause form still wraps, so the
+    // refusals above are driven by SCOPE and are not the injector silently
+    // refusing everything.
+    let sole = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    let mut sole_nodes = Vec::new();
+    collect_defs(&sole, &mut sole_nodes);
+    assert!(
+        is_color_choice(&sole),
+        "the sole-clause carrier still gets its chooser at the head: {sole:#?}"
+    );
+    assert!(
+        tree_has_is_chosen_color(&sole),
+        "the sole-clause carrier still stamps its filter: {sole:#?}"
+    );
+    assert_eq!(
+        sole_nodes
+            .iter()
+            .filter(|d| is_unimplemented_def(d))
+            .count(),
         0,
-        "no clause may lower to Unimplemented: {def:#?}"
+        "the sole-clause carrier has no refusal: {sole:#?}"
+    );
+
+    // NEGATIVE CONTROL: a multi-clause chain with NO printed qualifier is
+    // untouched — the scope arms only ever fire on a declared colour carrier.
+    let no_qualifier = parse_effect_chain(
+        "Draw a card. Return all creatures to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    let mut no_qual_nodes = Vec::new();
+    collect_defs(&no_qualifier, &mut no_qual_nodes);
+    assert_eq!(
+        no_qual_nodes
+            .iter()
+            .filter(|d| is_unimplemented_def(d))
+            .count(),
+        0,
+        "a chain with no printed qualifier must not be refused: {no_qualifier:#?}"
     );
 }
 
@@ -58162,89 +58266,108 @@ fn chosen_color_filter_is_always_paired_with_a_color_chooser() {
     );
 }
 
-/// V-DOUBLE (SHAPE) — CR 105.4 + CR 608.2c. `inject_printed_color_choice_filter`
-/// must not wrap a head that is ALREADY an `Effect::Choose(Color)`, matching the
-/// sibling injector's `parent_is_color_choice` / `child_under_color_choice`
-/// guard.
+/// V-DOUBLE (SHAPE) — CR 105.4 + CR 607.2d. A sole-clause carrier whose chain
+/// head is ALREADY an `Effect::Choose(Color)` is REFUSED, not silently skipped.
 ///
-/// Without the guard this chain raises TWO colour prompts, and the `find_map`
-/// over `chosen_attributes` reads the FIRST-written (outer, injected) colour —
-/// so the player's answer to the printed prompt is silently discarded.
+/// Wrapping would raise TWO colour prompts and the `find_map` over
+/// `chosen_attributes` reads the FIRST one, silently discarding the player's
+/// answer to the printed prompt. Skipping is no better: it leaves the stamped
+/// `FilterProp::IsChosenColor` bound to a `persist: false` chooser that writes no
+/// `ChosenAttribute::Color` at all (follow-up **F1**), so the filter's fail-closed
+/// read matches NOTHING with no `Effect::Unimplemented` and no parse warning.
 ///
-/// Unreachable on today's card pool (no card prints both forms in one chain);
-/// pinned here because the guard is otherwise untestable from card text.
+/// Driven by a DIRECT call rather than card text: every text form that reaches
+/// this shape is a multi-clause chain and is now caught one arm earlier by the
+/// scope axis (see `later_clause_printed_color_choice_is_refused_not_reordered`),
+/// so the arm is otherwise untestable — the same synthetic-pin technique the
+/// multi-carrier arm uses.
 #[test]
-fn printed_color_choice_is_not_double_wrapped_over_an_existing_color_choice() {
-    let def = parse_effect_chain(
-        "Choose a color. Return all permanents of the color of your choice to their owners' \
-         hands.",
-        AbilityKind::Spell,
-    );
-    let mut nodes = Vec::new();
-    collect_defs(&def, &mut nodes);
+fn printed_color_choice_over_an_existing_color_chooser_is_refused() {
+    fn sole_color_carrier() -> Vec<PrintedColorCarrier> {
+        vec![PrintedColorCarrier {
+            choice: ChoiceType::color(),
+            scope: PrintedColorCarrierScope::SoleClause,
+        }]
+    }
+    fn chooser_head(choice_type: ChoiceType) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Choose {
+                choice_type,
+                persist: false,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
+            },
+        )
+    }
 
-    // REACH-GUARD (a): the printed qualifier really was consumed, so the
-    // provenance DID reach the injector. Together with the count below this is
-    // what proves the guard — not a missing provenance — suppressed the wrap.
+    // THE NEGATIVE: a colour chooser already at the head refuses under its own
+    // named arm.
+    let mut over_chooser = chooser_head(ChoiceType::color());
+    inject_printed_color_choice_filter(
+        &mut over_chooser,
+        &sole_color_carrier(),
+        "of the color of your choice",
+    );
+    assert_eq!(
+        unimplemented_name(&over_chooser),
+        Some("printed_color_choice_over_existing_color_chooser"),
+        "a chooser already at the head must be refused: {over_chooser:#?}"
+    );
     assert!(
-        tree_has_is_chosen_color(&def),
-        "the bounce filter must stamp IsChosenColor: {def:#?}"
-    );
-    // REACH-GUARD (b): nothing was refused, so the `Unimplemented` guard is not
-    // the one doing the work here.
-    assert_eq!(
-        nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
-        0,
-        "no clause may lower to Unimplemented: {def:#?}"
+        over_chooser.sub_ability.is_none(),
+        "the refusal replaces the chain rather than wrapping it: {over_chooser:#?}"
     );
 
-    // THE NEGATIVE: exactly one prompt, and it is the card's OWN printed
-    // "Choose a color." — `persist: false`, because `ChoiceType::Color` is still
-    // absent from the `persist:` match in `oracle_effect/imperative.rs`
-    // (follow-up F1). The sibling injector's guard produces the identical state
-    // for "Choose a color. Target creature gains protection from that color",
-    // so F1 closes both at once.
-    let persists: Vec<bool> = nodes
-        .iter()
-        .filter_map(|d| match &*d.effect {
-            Effect::Choose {
-                choice_type: ChoiceType::Color { .. },
-                persist,
-                ..
-            } => Some(*persist),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        persists,
-        vec![false],
-        "exactly one colour choice — the printed one — must survive: {def:#?}"
-    );
-
-    // POSITIVE TWIN, same test: with no printed head the injector still fires
-    // and its wrap IS the persisting one, so the guard above is a real branch
-    // and not the injector silently doing nothing.
-    let injected = parse_effect_chain(
-        "Return all permanents of the color of your choice to their owners' hands.",
+    // POSITIVE TWIN, same test: an identical call with a NON-chooser head still
+    // wraps, so the arm above is a real branch and not the injector doing
+    // nothing on a hand-built def.
+    let mut plain = AbilityDefinition::new(
         AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
     );
-    let mut injected_nodes = Vec::new();
-    collect_defs(&injected, &mut injected_nodes);
-    let injected_persists: Vec<bool> = injected_nodes
-        .iter()
-        .filter_map(|d| match &*d.effect {
-            Effect::Choose {
-                choice_type: ChoiceType::Color { .. },
-                persist,
-                ..
-            } => Some(*persist),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        injected_persists,
-        vec![true],
-        "the injected chooser must persist: {injected:#?}"
+    inject_printed_color_choice_filter(
+        &mut plain,
+        &sole_color_carrier(),
+        "of the color of your choice",
+    );
+    assert!(
+        is_color_choice(&plain),
+        "a non-chooser head must still be wrapped: {plain:#?}"
+    );
+    assert!(
+        plain
+            .sub_ability
+            .as_deref()
+            .is_some_and(|sub| matches!(&*sub.effect, Effect::Draw { .. })),
+        "the displaced effect must ride beneath the injected chooser: {plain:#?}"
+    );
+
+    // SIBLING: the guard is COLOUR-scoped. A head that is a chooser of some
+    // other value is wrapped normally.
+    let mut over_creature_type = chooser_head(ChoiceType::CreatureType {
+        options: Vec::new(),
+    });
+    inject_printed_color_choice_filter(
+        &mut over_creature_type,
+        &sole_color_carrier(),
+        "of the color of your choice",
+    );
+    assert!(
+        is_color_choice(&over_creature_type),
+        "a non-COLOUR chooser head must still be wrapped: {over_creature_type:#?}"
+    );
+
+    // NEGATIVE CONTROL: with no declared colour carrier the call is a no-op even
+    // over the same chooser head — the refusal is driven by the carrier, not by
+    // the head alone.
+    let mut untouched = chooser_head(ChoiceType::color());
+    inject_printed_color_choice_filter(&mut untouched, &[], "");
+    assert!(
+        is_color_choice(&untouched) && untouched.sub_ability.is_none(),
+        "an empty carrier slice must leave the def untouched: {untouched:#?}"
     );
 }
 
@@ -58333,6 +58456,229 @@ fn two_printed_color_choices_in_one_chain_are_refused_not_collapsed() {
         tree_has_is_chosen_color(&single),
         "one carrier still stamps its filter: {single:#?}"
     );
+}
+
+/// Every `Effect::Choose { Color }` a card lowers to, with its `persist` flag, in
+/// document order across all parse-output surfaces.
+fn card_color_choice_persists(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<bool> {
+    all_card_defs(parsed)
+        .iter()
+        .filter_map(|d| match &*d.effect {
+            Effect::Choose {
+                choice_type: ChoiceType::Color { .. },
+                persist,
+                ..
+            } => Some(*persist),
+            _ => None,
+        })
+        .collect()
+}
+
+/// T0a (SHAPE) — CR 607.2d + CR 614.15. A `Protection(ChosenColor)` grant that
+/// reads a colour choice made by a LINKED ability elsewhere on the same object
+/// gets NO injected chooser of its own.
+///
+/// CR 607.2d: "If an object has an ability printed on it that causes a player to
+/// 'choose a [value]' and an ability printed on it that refers to 'the chosen
+/// [value]' … those abilities are linked. The second ability refers only to a
+/// choice made as the result of the first ability." Floating Shield prints the
+/// choice on its as-enters replacement and reads it back on its
+/// "Sacrifice this Aura:" ability; before this relation the injector raised a
+/// SECOND prompt there, so the Aura carried two answers for one printed choice
+/// and every first-match reader of `ChosenAttribute::Color` bound the older one.
+///
+/// The runtime half — that the sacrifice grant really is the as-enters colour —
+/// is `floating_shield_sacrifice_grant_reads_the_as_enters_color` in
+/// `tests/integration/chosen_color_rechoose_same_source.rs`.
+#[test]
+fn linked_color_choice_suppresses_the_injected_chooser() {
+    const FLOATING_SHIELD: &str = "Enchant creature\nAs this Aura enters, choose a color.\n\
+                                   Enchanted creature has protection from the chosen color. This \
+                                   effect doesn't remove this Aura.\nSacrifice this Aura: Target \
+                                   creature gains protection from the chosen color until end of \
+                                   turn.";
+
+    // REACH-GUARD (a), on the document IR: the relation really is emitted, it is
+    // the LINKED-COLOUR one, and it names exactly one consumer item — so the
+    // negative below is driven by the relation and not by a parse failure.
+    let doc = crate::parser::oracle::parse_oracle_ir(
+        FLOATING_SHIELD,
+        "Floating Shield",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let linked: Vec<&Vec<crate::parser::oracle_ir::doc::OracleItemId>> = doc
+        .relations
+        .iter()
+        .filter_map(|relation| match relation {
+            crate::parser::oracle_ir::relation::DocumentRelationIr::LinkedChoice(
+                crate::parser::oracle_ir::relation::LinkedChoiceKind::LinkedColorChoice {
+                    consumers,
+                },
+            ) => Some(consumers),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        linked.len(),
+        1,
+        "exactly one LinkedColorChoice relation must be recovered: {:#?}",
+        doc.relations
+    );
+    assert_eq!(
+        linked[0].len(),
+        1,
+        "the relation must name exactly the sacrifice ability item: {:#?}",
+        doc.relations
+    );
+
+    let floating_shield = parse_oracle_text(
+        FLOATING_SHIELD,
+        "Floating Shield",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+
+    // REACH-GUARD (b): the consumer ability survived intact — it still carries
+    // its `ChosenColor` grant and its sacrifice cost, so the negative below is
+    // "no second chooser", not "the ability vanished".
+    assert_eq!(
+        floating_shield.abilities.len(),
+        1,
+        "the sacrifice ability must still be published: {floating_shield:#?}"
+    );
+    let sacrifice_ability = &floating_shield.abilities[0];
+    assert!(
+        ability_chain_grants_chosen_color_keyword(sacrifice_ability),
+        "the sacrifice ability must still grant Protection(ChosenColor): {sacrifice_ability:#?}"
+    );
+    assert!(
+        matches!(
+            sacrifice_ability.cost,
+            Some(crate::types::ability::AbilityCost::Sacrifice(_))
+        ),
+        "the sacrifice cost must survive the relation: {sacrifice_ability:#?}"
+    );
+    // REACH-GUARD (c): the static that reads the same choice is untouched, so the
+    // suppression did not strand the enchanted creature's protection.
+    assert_eq!(
+        floating_shield.statics.len(),
+        1,
+        "the `Enchanted creature has protection from the chosen color` static must \
+         survive: {floating_shield:#?}"
+    );
+
+    // THE ASSERTION THAT FLIPS if the relation is reverted: exactly ONE colour
+    // chooser on the whole card, and it is the persisted as-enters one on the
+    // replacement surface. Before this change the card lowered TWO.
+    assert_eq!(
+        card_color_choice_persists(&floating_shield),
+        vec![true],
+        "Floating Shield must carry exactly one persisted colour chooser: {floating_shield:#?}"
+    );
+    let replacement_choosers: usize = floating_shield
+        .replacements
+        .iter()
+        .filter_map(|r| r.execute.as_deref())
+        .map(|execute| {
+            let mut nodes = Vec::new();
+            collect_defs(execute, &mut nodes);
+            nodes.iter().filter(|d| is_color_choice(d)).count()
+        })
+        .sum();
+    assert_eq!(
+        replacement_choosers, 1,
+        "the surviving chooser must be the as-enters replacement's: {floating_shield:#?}"
+    );
+
+    // POSITIVE TWIN: Mother of Runes still gets her injected chooser. The guard
+    // is linkage-scoped, not a blanket off-switch.
+    let mother_of_runes = parse_oracle_text(
+        "{T}: Target creature you control gains protection from the color of your choice until \
+         end of turn.",
+        "Mother of Runes",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Cleric".to_string()],
+    );
+    assert_eq!(
+        card_color_choice_persists(&mother_of_runes),
+        vec![true],
+        "Mother of Runes must keep her injected chooser: {mother_of_runes:#?}"
+    );
+
+    // SIBLING (CR 614.15): Faith's Shield's "Fateful hour —" paragraph is a
+    // self-replacement override of the base ability, so only one of the two ever
+    // applies and the override reads the base's choice. One chooser, not two.
+    let faiths_shield = parse_oracle_text(
+        "Target permanent you control gains protection from the color of your choice until end \
+         of turn.\nFateful hour — If you have 5 or less life, instead you and each permanent you \
+         control gain protection from the color of your choice until end of turn.",
+        "Faith's Shield",
+        &["Fateful hour".to_string()],
+        &["Instant".to_string()],
+        &[],
+    );
+    assert_eq!(
+        card_color_choice_persists(&faiths_shield),
+        vec![true],
+        "Faith's Shield must lower to exactly one colour chooser: {faiths_shield:#?}"
+    );
+
+    // HOSTILE: Akroma's Blessing prints its chooser and its grant in ONE item.
+    // The relation requires two DISTINCT items, so this card must be untouched —
+    // it is still handled by the injector's own `child_under_color_choice` guard,
+    // and its printed choice is still `persist: false` (follow-up F1).
+    let akromas_blessing = parse_oracle_text(
+        "Choose a color. Creatures you control gain protection from the chosen color until end \
+         of turn.\nCycling {W} ({W}, Discard this card: Draw a card.)",
+        "Akroma's Blessing",
+        &["Cycling".to_string()],
+        &["Instant".to_string()],
+        &[],
+    );
+    assert_eq!(
+        card_color_choice_persists(&akromas_blessing),
+        vec![false],
+        "Akroma's Blessing keeps its single printed, non-persisted chooser: {akromas_blessing:#?}"
+    );
+
+    // HOSTILE: Voice of All pairs an as-enters chooser with a STATIC grant, which
+    // the injector never visits, so it must be untouched — one chooser before and
+    // one after.
+    let voice_of_all = parse_oracle_text(
+        "Flying\nAs this creature enters, choose a color.\nThis creature has protection from the \
+         chosen color.",
+        "Voice of All",
+        &["Flying".to_string()],
+        &["Creature".to_string()],
+        &["Angel".to_string()],
+    );
+    assert_eq!(
+        card_color_choice_persists(&voice_of_all),
+        vec![true],
+        "Voice of All keeps its single as-enters chooser: {voice_of_all:#?}"
+    );
+
+    // NEGATIVE CONTROL, across every fixture: no card gained a refusal.
+    for (name, parsed) in [
+        ("Floating Shield", &floating_shield),
+        ("Mother of Runes", &mother_of_runes),
+        ("Faith's Shield", &faiths_shield),
+        ("Akroma's Blessing", &akromas_blessing),
+        ("Voice of All", &voice_of_all),
+    ] {
+        assert_eq!(
+            all_card_defs(parsed)
+                .iter()
+                .filter(|d| is_unimplemented_def(d))
+                .count(),
+            0,
+            "{name}: no clause may lower to Unimplemented: {parsed:#?}"
+        );
+    }
 }
 
 /// CR 700.4 + CR 701.20a + CR 202.3 + CR 608.2c + CR 603.3b: Part in

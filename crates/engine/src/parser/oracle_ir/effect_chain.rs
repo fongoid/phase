@@ -64,6 +64,44 @@ pub(crate) struct EffectChainIr {
     /// this process" directive is recognized. Lowering applies it to the root
     /// `AbilityDefinition` so the resolver re-follows the whole chain.
     pub(crate) repeat_until: Option<crate::types::ability::RepeatContinuation>,
+    /// CR 607.2d: whether this chain's `Protection`/`HexproofFrom(ChosenColor)`
+    /// grant may have a colour choice injected ahead of it, or reads a choice
+    /// made by a LINKED ability elsewhere on the same object.
+    ///
+    /// Stamped from
+    /// `DocumentRelationIr::LinkedChoice(LinkedChoiceKind::LinkedColorChoice)`
+    /// before lowering, so the injector simply never fires and there is nothing
+    /// to undo. `Permitted` is the default, so a chain that no relation names is
+    /// byte-identical to before this axis existed.
+    #[serde(default, skip_serializing_if = "InjectedColorChoice::is_permitted")]
+    pub(crate) injected_color_choice: InjectedColorChoice,
+}
+
+/// CR 607.2d: whether an effect chain may receive an injected colour chooser
+/// ahead of a `ChosenColor` keyword grant.
+///
+/// A `bool` is prohibited by the project's data-modelling rule and would not say
+/// WHY the injection is withheld; this names the reason, which is what the
+/// injector's guard cites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub(crate) enum InjectedColorChoice {
+    /// No linked ability supplies a colour for this chain's grant, so the
+    /// injector supplies one (Mother of Runes, Knight of Dawn).
+    #[default]
+    Permitted,
+    /// CR 607.2d: a linked ability elsewhere on this object already makes the
+    /// choice this chain's grant reads back (Floating Shield's as-enters
+    /// replacement; a CR 614.15 override reading its base's choice), so the
+    /// grant must NOT make a second choice of its own.
+    SuppressedByLinkedAbility,
+}
+
+impl InjectedColorChoice {
+    /// Serialization guard: the default carries no information, so an untouched
+    /// chain serializes exactly as it did before this field existed.
+    pub(crate) fn is_permitted(&self) -> bool {
+        matches!(self, InjectedColorChoice::Permitted)
+    }
 }
 
 /// Whether `lower_effect_chain_ir` rewrites player-scoped references after
@@ -114,6 +152,7 @@ impl EffectChainIr {
             actor,
             in_trigger,
             repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
         }
     }
 }
@@ -1251,6 +1290,7 @@ mod tests {
             actor: None,
             in_trigger: false,
             repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
         };
         assert!(ir.clauses.is_empty());
     }
@@ -1368,6 +1408,7 @@ mod tests {
             actor: None,
             in_trigger: false,
             repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
         };
         assert_eq!(ir.clauses.len(), 1);
         assert_eq!(ir.kind, AbilityKind::Spell);
