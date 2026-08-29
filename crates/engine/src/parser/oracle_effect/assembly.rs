@@ -3219,14 +3219,19 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // fail-closed match-NOTHING filter with no `Effect::Unimplemented` and no
     // parse warning.
     //
-    // CR 607.2d: EVERY surviving carrier is collected, in printed order — never
-    // just the first. Each printed "of the color of your choice" is its own
-    // choice linked to its own filter, so a first-wins `find_map` over a chain
-    // that printed the qualifier TWICE would bind both stamped filters to one
-    // `ChosenAttribute::Color` and silently discard the second answer. The
-    // arity contract — and the honest `Effect::unimplemented` refusal the
-    // multi-carrier case now produces instead — is the single authority on
-    // `inject_printed_color_choice_filter`.
+    // CR 607.1c + CR 607.2d: EVERY surviving carrier is collected, in printed
+    // order — never just the first. Each printed "of the color of your choice"
+    // is its own choice linked to its own filter (CR 607.2d is the "choose a
+    // [value]" / "the chosen [value]" linkage; CR 607.1c is the half that covers
+    // two such occurrences inside ONE ability, which is the chain shape here),
+    // so a first-wins `find_map` over a chain that printed the qualifier TWICE
+    // would bind both stamped filters to one `ChosenAttribute::Color` and
+    // silently discard the second answer. The arity contract — and the honest
+    // `Effect::unimplemented` refusal the multi-carrier case now produces
+    // instead — is the single authority on
+    // `inject_printed_color_choice_filter`, so this call site deliberately does
+    // NOT pre-filter: the empty and non-colour cases are decided there too,
+    // never twice.
     //
     // The fragment is built from the SAME filtered clause set as the choices,
     // so a refusal's description names exactly the clauses whose printed choices
@@ -3258,18 +3263,16 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 .map(|choice| (choice, clause.source.fragment().unwrap_or_default()))
         })
         .collect();
-    if !printed_color_carriers.is_empty() {
-        let printed: Vec<ChoiceType> = printed_color_carriers
-            .iter()
-            .map(|(choice, _)| choice.clone())
-            .collect();
-        let fragment = printed_color_carriers
-            .iter()
-            .map(|(_, source)| *source)
-            .collect::<Vec<_>>()
-            .join(" ");
-        inject_printed_color_choice_filter(&mut result, &printed, &fragment);
-    }
+    let printed: Vec<ChoiceType> = printed_color_carriers
+        .iter()
+        .map(|(choice, _)| choice.clone())
+        .collect();
+    let fragment = printed_color_carriers
+        .iter()
+        .map(|(_, source)| *source)
+        .collect::<Vec<_>>()
+        .join(" ");
+    inject_printed_color_choice_filter(&mut result, &printed, &fragment);
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains
     // protection/hexproof from the color of your choice" grant so the source
     // carries a chosen color for the layer applier to bake in.

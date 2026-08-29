@@ -375,6 +375,17 @@ fn wash_out_raises_one_five_option_color_prompt_before_the_bounce() {
 /// already reaches Prismatic Strands' flashback via that card's own parser
 /// route — and its fix lives in `game/effects/choose.rs`, outside this change's
 /// scope.
+///
+/// FILED as follow-up **F7**, not left as a comment: this change gives Wash Out
+/// a `persist: true` colour choice, so a Wash Out recast from the graveyard
+/// (Yawgmoth's Will / Mizzix's Mastery class) newly reaches the same seam and
+/// would silently bind the FIRST cast's colour. The backlog row a maintainer
+/// will actually find it from is `docs/parser-misparse-backlog.md` root cause 3
+/// ("Anaphor bound to wrong referent"), whose fix hint names this seam and
+/// carries Prismatic Strands — the card that reaches it from its OWN printed
+/// text today, with no recursion enabler required. F7 is a `game/**` fix
+/// (CR 607.1c + CR 607.2d linkage is per resolution), so it is deliberately
+/// outside this parser change.
 #[test]
 fn two_wash_outs_bind_their_own_choices_independently() {
     let mut scenario = GameScenario::new();

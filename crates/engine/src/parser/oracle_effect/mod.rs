@@ -29617,17 +29617,33 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// Hence the census is documented with a date rather than pinned by a test.
 ///
 /// ARITY CONTRACT — `printed` is EVERY surviving carrier in the chain, in
-/// printed order, never just the first one found:
+/// printed order, never just the first one found. This function is the SINGLE
+/// authority on that arity: callers pass what the chain declared and never
+/// pre-filter, so the empty case is decided here too.
 ///
-///   * **none** — no clause declared the provenance: no-op.
-///   * **one** — the live case (Wash Out, Root Greevil): wrap, subject to the
-///     already-a-colour-choice guard below.
-///   * **two or more** — CR 607.2d: each printed "of the color of your choice"
-///     is its OWN choice, linked to its own filter. One injected chooser writes
-///     ONE `ChosenAttribute::Color`, and both `game/filter.rs` readers take the
-///     FIRST one, so a single wrap would bind BOTH stamped filters to the FIRST
-///     answer and silently discard the second — with no `Effect::Unimplemented`
-///     and no parse warning. The parser cannot model that shape until follow-up
+/// The arity is counted over COLOUR carriers, not over carriers in general. A
+/// declared provenance that is not a `ChoiceType::Color` is not this injector's
+/// job (the body's opening comment says why it cannot arise today), and must
+/// therefore neither trigger a wrap nor — this is the asymmetry the count
+/// closes — push a chain into the refusal arm when no colour chooser is needed
+/// at all:
+///
+///   * **no colour carrier** — nothing declared a colour provenance (an empty
+///     slice, or a slice of non-colour provenances only): no-op.
+///   * **exactly one** — the live case (Wash Out, Root Greevil): wrap, subject
+///     to the already-a-colour-choice guard below.
+///   * **two or more** — CR 607.1c + CR 607.2d: linkage is per printed
+///     occurrence, and CR 607.1c is the half that covers TWO occurrences inside
+///     ONE ability (an ability fulfilling both criteria of CR 607.1 is linked to
+///     itself), which is the shape this arm sees; CR 607.2d is the "choose a
+///     [value]" / "the chosen [value]" linkage itself. Each printed "of the
+///     color of your choice" is its OWN choice, linked to its own filter. One
+///     injected chooser writes ONE `ChosenAttribute::Color`, and both
+///     `game/filter.rs` readers take the FIRST one, so a single wrap would bind
+///     BOTH stamped filters to the FIRST answer and silently discard the second
+///     — with no `Effect::Unimplemented` and no parse warning. Follow-up **F7**
+///     (backlog root cause 3) is the runtime half of that same first-wins read.
+///     The parser cannot model that shape until follow-up
 ///     **F6** gives each carrying clause its own wrap at its own node, so the
 ///     chain is REFUSED here: the definition becomes
 ///     `Effect::unimplemented("multiple_printed_color_choices", …)`, the single
@@ -29688,16 +29704,30 @@ pub(crate) fn inject_printed_color_choice_filter(
     printed: &[ChoiceType],
     fragment: &str,
 ) {
-    match printed {
-        // No clause declared the provenance.
-        [] => {}
+    // Arity is over COLOUR carriers only. A declared provenance that is not a
+    // `ChoiceType::Color` cannot arise today — `oracle_target.rs` stamps
+    // `ChoiceType::color()` and nothing else — and modelling some other printed
+    // choice is not this injector's job. Counting it would make two non-colour
+    // qualifiers refuse a chain that needs no chooser at all, so it is filtered
+    // out here rather than being allowed to reach the refusal arm below.
+    //
+    // Two carriers is all the arity that has to be distinguished, so the count
+    // is taken lazily off the iterator rather than materialized.
+    let mut color_carriers = printed
+        .iter()
+        .filter(|choice| matches!(choice, ChoiceType::Color { .. }));
+    match (color_carriers.next(), color_carriers.next()) {
+        // No clause declared a COLOUR provenance. Covers the empty slice (no
+        // clause declared any provenance at all — this function, not its caller,
+        // owns that decision) and a slice of non-colour provenances alike.
+        (None, _) => {}
         // THE LIVE CASE. Both guards here are explicit and independent: the
         // DECLARED provenance must be a colour choice, and the head must not
         // already BE a colour choice. The third — "the parser refused this
         // clause" — is deliberately NOT here: it is applied to the carrying
         // clause at the provenance selection in `assembly.rs`, per this
         // function's doc.
-        [ChoiceType::Color { .. }] => {
+        (Some(_), None) => {
             if !matches!(
                 &*def.effect,
                 Effect::Choose {
@@ -29708,16 +29738,10 @@ pub(crate) fn inject_printed_color_choice_filter(
                 wrap_in_color_choice(def);
             }
         }
-        // A lone declared provenance that is not a COLOUR choice cannot arise
-        // today — `oracle_target.rs` stamps `ChoiceType::color()` and nothing
-        // else — and modelling some other printed choice is not this injector's
-        // job. Left explicit rather than folded into the wrap arm so the two
-        // cases stay distinguishable if a sibling qualifier is ever added.
-        [_] => {}
-        // CR 607.2d: two or more printed colour choices in one chain. Refuse
-        // honestly instead of collapsing them onto one chooser — see the ARITY
-        // CONTRACT on this function.
-        _ => {
+        // CR 607.1c + CR 607.2d: two or more printed colour choices in one
+        // chain. Refuse honestly instead of collapsing them onto one chooser —
+        // see the ARITY CONTRACT on this function.
+        (Some(_), Some(_)) => {
             let kind = def.kind;
             *def = AbilityDefinition::new(
                 kind,

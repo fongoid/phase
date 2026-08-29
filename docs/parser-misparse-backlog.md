@@ -3,8 +3,8 @@
 Consolidated from 50 per-batch clustering passes over the whole card database. Synonymous per-batch clusters were merged into canonical root causes, their card lists unioned and deduped, and ranked by total card appearances (largest first).
 
 - **Canonical root causes:** 30
-- **Distinct cards implicated:** 4709
-- **Total card appearances across root causes:** 4742 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
+- **Distinct cards implicated:** 4710
+- **Total card appearances across root causes:** 4743 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
 
 This is the prioritized "fix N root causes → unlock M cards" backlog: the top handful of root causes account for the majority of broken cards.
 
@@ -14,7 +14,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 |---|------------|--------:|----------------------------------|
 | 1 | Relative-clause / filter restriction on target dropped | 745 | oracle_target.rs / game/filter.rs — extend TargetFilter property extraction for trailing relative clauses |
 | 2 | Dropped intervening-if / gating condition (condition: null) | 585 | oracle_nom/condition.rs parse_inner_condition — trigger/static parsers must delegate condition extraction here |
-| 3 | Anaphor bound to wrong referent | 404 | oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring |
+| 3 | Anaphor bound to wrong referent | 405 | oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring; **F7** (runtime half): `ChosenAttribute::Color` ACCUMULATES instead of replacing — `apply_choice_attributes` (game/effects/choose.rs) retains only Keyword/CounterKind/Direction, both `FilterProp::IsChosenColor` readers (game/filter.rs) `find_map` the FIRST match, and the only clearing site is `reset_for_battlefield_entry` (game/game_object.rs). A source reused across two resolutions (flashback, Regrowth/Yawgmoth's Will recursion) therefore binds its EARLIER colour, breaking CR 607.1c + CR 607.2d per-resolution linkage |
 | 4 | Conjoined / chained second effect clause dropped | 387 | oracle.rs effect-chain composition — split on 'and'/'then'/sentence boundaries and build sub_ability chain |
 | 5 | Dropped 'for each' / dynamic count collapsed to Fixed | 329 | oracle_quantity.rs parse_for_each_clause / parse_quantity_ref — thread ForEach/ObjectCount into the effect count field |
 | 6 | Disjunctive (or-list) collapsed to first branch | 237 | oracle_nom/filter.rs + oracle_target.rs — build TargetFilter::Or across all alt() branches |
@@ -1402,11 +1402,13 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 </details>
 
-### 3. Anaphor bound to wrong referent  (404 cards)
+### 3. Anaphor bound to wrong referent  (405 cards)
 
-**Signature.** A pronoun/demonstrative ('it', 'that creature/player', 'them', 'they') resolves to the wrong slot (Self/Source/Controller/Any/ParentTarget) instead of the bound parent target, forwarded result, or triggering player (CR 608.2k).
+**Signature.** A pronoun/demonstrative ('it', 'that creature/player', 'them', 'they') resolves to the wrong slot (Self/Source/Controller/Any/ParentTarget) instead of the bound parent target, forwarded result, or triggering player (CR 608.2k). Includes the runtime half of the same defect class, where the referent slot is bound correctly but resolves to a STALE prior answer.
 
 **Fix hint.** oracle_quantity.rs context-ref resolution + game/ability_utils.rs forward_result wiring
+
+**F7 — chosen-colour anaphor binds the earlier choice on a reused source.** `ChosenAttribute::Color` accumulates rather than replacing: `apply_choice_attributes` (`crates/engine/src/game/effects/choose.rs`) retains only `Keyword` / `CounterKind` / `Direction` before extending, both `FilterProp::IsChosenColor` readers (`crates/engine/src/game/filter.rs`) `find_map` the FIRST match, and the only clearing site is `reset_for_battlefield_entry` (`crates/engine/src/game/game_object.rs`). So a source object that resolves a colour choice twice binds its EARLIER colour on the second resolution — CR 607.1c + CR 607.2d make the linkage per printed occurrence per resolution, not per object lifetime. Reachable today from a card's own text via Prismatic Strands' flashback; also reached by any `persist: true` colour chooser recast from the graveyard (Yawgmoth's Will / Mizzix's Mastery class), which now includes Wash Out. Fix lives in `game/effects/choose.rs` (replace-on-rechoose for `Color`, as `Keyword` already does), not in the parser.
 
 <details><summary>Cards</summary>
 
@@ -1680,6 +1682,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Pollen Lullaby
 - Precipitous Drop
 - Price of Progress
+- Prismatic Strands
 - Prison Sentence
 - Prison Term
 - Promise of Loyalty

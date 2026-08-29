@@ -57058,19 +57058,35 @@ fn is_unimplemented_def(def: &AbilityDefinition) -> bool {
 
 /// Structural (never string-scanning) check for `FilterProp::IsChosenColor`.
 ///
-/// EXHAUSTIVE by construction: no `_ => false` fallback, so a new `TargetFilter`
-/// variant that nests another filter is a COMPILE ERROR here rather than a
-/// silent hole in the `V-PAIR` pairing invariant below. That is not
-/// hypothetical — writing it out is what surfaced `TrackedSetFiltered` and
-/// `ChosenDamageSource`, two nesting variants the previous wildcard skipped.
-/// The 50 leaf variants in the final arm carry no nested filter at all, so
-/// `false` is their answer, not a default.
+/// EXHAUSTIVE by construction over the whole OBJECT-FILTER type closure.
+/// `TargetFilter`, `FilterProp` and `PlayerFilter` are mutually recursive —
+/// `TargetFilter::Typed` carries `FilterProp`s, `FilterProp::ControllerMatches`
+/// carries a `PlayerFilter`, `PlayerFilter::ControlsCount` carries a
+/// `TargetFilter` — and all three are matched with NO `_ => false` fallback (see
+/// [`prop_has_chosen_color`] and [`player_filter_has_chosen_color`]). A new
+/// variant that nests another filter in ANY of the three is therefore a COMPILE
+/// ERROR rather than a silent hole in the `V-PAIR` pairing invariant below. That
+/// is not hypothetical — writing it out is what surfaced `TrackedSetFiltered`
+/// and `ChosenDamageSource`, two nesting variants the previous wildcard skipped,
+/// and then `PlayerMatching` and the seven boxed-filter `FilterProp`s, which a
+/// `TargetFilter`-only net still answered `false` for.
+///
+/// STATED BOUNDARY, because the closure is not the whole reachability graph.
+/// The walk descends every nested FILTER field, and deliberately does NOT
+/// descend the QUANTITY sub-expressions two of these variants also carry
+/// (`PlayerFilter::ControlsCount.count`, `PlayerFilter::PlayerAttribute.attr` /
+/// `.value`), even though a `QuantityExpr` / `QuantityRef` can itself embed a
+/// `TargetFilter` (`QuantityRef::ObjectCount { filter }`). Those are COUNT
+/// expressions — "how many permanents does this player control" — not the
+/// filter of the objects an effect AFFECTS, and the affected-object filter is
+/// `V-PAIR`'s whole subject. So the compile-error net is total over the variant
+/// dimension of all three enums and over their filter-field dimension; it is
+/// NOT total over that quantity-field dimension, which is written down here
+/// rather than claimed away. The 49 leaf variants in this function's final arm
+/// carry no nested filter at all, so `false` is their answer, not a default.
 fn filter_has_chosen_color(f: &TargetFilter) -> bool {
     match f {
-        TargetFilter::Typed(tf) => tf
-            .properties
-            .iter()
-            .any(|p| matches!(p, FilterProp::IsChosenColor)),
+        TargetFilter::Typed(tf) => tf.properties.iter().any(prop_has_chosen_color),
         TargetFilter::Not { filter } => filter_has_chosen_color(filter),
         TargetFilter::Or { filters } | TargetFilter::And { filters } => {
             filters.iter().any(filter_has_chosen_color)
@@ -57079,6 +57095,7 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         TargetFilter::ChosenDamageSource { filter } => {
             filter.as_deref().is_some_and(filter_has_chosen_color)
         }
+        TargetFilter::PlayerMatching { player } => player_filter_has_chosen_color(player),
         TargetFilter::None
         | TargetFilter::Any
         | TargetFilter::Player
@@ -57094,7 +57111,6 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
-        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::AttachedTo
@@ -57132,6 +57148,311 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
     }
 }
 
+/// Structural check for `FilterProp::IsChosenColor` at the PROPERTY level —
+/// both the base case (the prop itself) and every filter a prop can box.
+///
+/// EXHAUSTIVE for the same reason as [`filter_has_chosen_color`]: reading only a
+/// `TypedFilter`'s top-level `properties` was the hole this closes. `Targets`,
+/// `TargetsOnly`, `DistinctFrom`, `DifferentNameFrom`, `SharesQuality` and
+/// `CanEnchant` each box a whole `TargetFilter`, `ControllerMatches` boxes a
+/// `PlayerFilter`, and `AnyOf` / `Not` recurse into `FilterProp` itself — so a
+/// stamped prop can sit arbitrarily deep, and a `_ => false` here would answer
+/// "no" at every one of those depths. The 89 leaf variants in the final arm
+/// carry no nested filter at all.
+fn prop_has_chosen_color(p: &FilterProp) -> bool {
+    match p {
+        // THE BASE CASE.
+        FilterProp::IsChosenColor => true,
+        // Nested `FilterProp` — the property-level combinators.
+        FilterProp::AnyOf { props } => props.iter().any(prop_has_chosen_color),
+        FilterProp::Not { prop } => prop_has_chosen_color(prop),
+        // Nested `TargetFilter`.
+        FilterProp::CanEnchant { target } => filter_has_chosen_color(target),
+        FilterProp::DifferentNameFrom { filter } => filter_has_chosen_color(filter),
+        FilterProp::DistinctFrom { reference } => filter_has_chosen_color(reference),
+        FilterProp::SharesQuality { reference, .. } => {
+            reference.as_deref().is_some_and(filter_has_chosen_color)
+        }
+        FilterProp::TargetsOnly { filter } => filter_has_chosen_color(filter),
+        FilterProp::Targets { filter } => filter_has_chosen_color(filter),
+        // Nested `PlayerFilter`.
+        FilterProp::ControllerMatches { player } => player_filter_has_chosen_color(player),
+        FilterProp::Token
+        | FilterProp::NonToken
+        | FilterProp::RepresentedByCard
+        | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::WasPlayed
+        | FilterProp::Attacking { .. }
+        | FilterProp::Blocking
+        | FilterProp::BlockingSource
+        | FilterProp::CombatRelation { .. }
+        | FilterProp::Unblocked
+        | FilterProp::AttackingAlone
+        | FilterProp::BlockingAlone
+        | FilterProp::Tapped
+        | FilterProp::Untapped
+        | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
+        | FilterProp::ConvokedSource
+        | FilterProp::ProtectorMatches { .. }
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
+        | FilterProp::WithKeyword { .. }
+        | FilterProp::HasKeywordKind { .. }
+        | FilterProp::WithoutKeyword { .. }
+        | FilterProp::WithoutKeywordKind { .. }
+        | FilterProp::Counters { .. }
+        | FilterProp::Cmc { .. }
+        | FilterProp::ManaValueParity { .. }
+        | FilterProp::ManaCostIn { .. }
+        | FilterProp::InZone { .. }
+        | FilterProp::Owned { .. }
+        | FilterProp::Foretold
+        | FilterProp::HasAdventure
+        | FilterProp::EnchantedBy
+        | FilterProp::EquippedBy
+        | FilterProp::AttachedToSource
+        | FilterProp::AttachedToRecipient
+        | FilterProp::HasAttachment { .. }
+        | FilterProp::HasAnyAttachmentOf { .. }
+        | FilterProp::Another
+        | FilterProp::Unpaired
+        | FilterProp::OtherThanTriggerObject
+        | FilterProp::HasColor { .. }
+        | FilterProp::PtComparison { .. }
+        | FilterProp::PowerGTSource
+        | FilterProp::ColorCount { .. }
+        | FilterProp::ManaSymbolCount { .. }
+        | FilterProp::HasSupertype { .. }
+        | FilterProp::IsChosenCreatureType
+        | FilterProp::MostPrevalentCreatureTypeIn { .. }
+        | FilterProp::IsChosenCardType
+        | FilterProp::MatchesLastChosenCardPredicate
+        | FilterProp::HasSingleTarget
+        | FilterProp::Modal
+        | FilterProp::NotColor { .. }
+        | FilterProp::NotSupertype { .. }
+        | FilterProp::Suspected
+        | FilterProp::Renowned
+        | FilterProp::Goaded
+        | FilterProp::ToughnessGTPower
+        | FilterProp::PowerExceedsBase
+        | FilterProp::InTrackedSet { .. }
+        | FilterProp::Modified
+        | FilterProp::Historic
+        | FilterProp::NotHistoric
+        | FilterProp::InAnyZone { .. }
+        | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn
+        | FilterProp::EnteredThisTurn
+        | FilterProp::ControlledContinuouslySinceTurnBegan
+        | FilterProp::ZoneChangedThisTurn { .. }
+        | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::BlockedThisTurn
+        | FilterProp::AttackedOrBlockedThisTurn
+        | FilterProp::CountersPutOnThisTurn { .. }
+        | FilterProp::FaceDown
+        | FilterProp::Transformed
+        | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::HasXInManaCost
+        | FilterProp::HasXInActivationCost
+        | FilterProp::WasKicked
+        | FilterProp::HasManaAbility
+        | FilterProp::HasNoAbilities
+        | FilterProp::Named { .. }
+        | FilterProp::SameName
+        | FilterProp::SameNameAsParentTarget
+        | FilterProp::SameNameAsExiledBySource
+        | FilterProp::NameMatchesAnyPermanent { .. }
+        | FilterProp::IsCommander
+        | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::Other { .. } => false,
+    }
+}
+
+/// Structural check for `FilterProp::IsChosenColor` reached through a
+/// `PlayerFilter` — the third node of the object-filter closure.
+///
+/// EXHAUSTIVE, and the reason it exists at all: `TargetFilter::PlayerMatching`
+/// used to sit in [`filter_has_chosen_color`]'s `=> false` list, which answered
+/// "no" for every filter boxed inside a player filter. `OpponentDealtDamage`
+/// boxes a source `TargetFilter` (CR 120.9), `ControlsCount` and
+/// `TrackedSetPossessor` each carry one outright, and `AllExcept` recurses into
+/// `PlayerFilter` itself. The 22 leaf variants in the final arm carry no nested
+/// filter at all.
+///
+/// The `..` on `ControlsCount` is the quantity-field boundary
+/// [`filter_has_chosen_color`] states: its `count` sub-expression is a count,
+/// not an affected-object filter, and is not walked.
+fn player_filter_has_chosen_color(pf: &PlayerFilter) -> bool {
+    match pf {
+        PlayerFilter::OpponentDealtDamage { source, .. } => {
+            source.as_deref().is_some_and(filter_has_chosen_color)
+        }
+        PlayerFilter::AllExcept { exclude } => player_filter_has_chosen_color(exclude),
+        PlayerFilter::ControlsCount { filter, .. } => filter_has_chosen_color(filter),
+        PlayerFilter::TrackedSetPossessor { filter, .. } => filter_has_chosen_color(filter),
+        PlayerFilter::Controller
+        | PlayerFilter::Opponent
+        | PlayerFilter::DefendingPlayer
+        | PlayerFilter::OpponentLostLife
+        | PlayerFilter::OpponentGainedLife
+        | PlayerFilter::HasLostTheGame
+        | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
+        | PlayerFilter::All
+        | PlayerFilter::HighestSpeed
+        | PlayerFilter::ZoneChangedThisWay
+        | PlayerFilter::PerformedActionThisWay { .. }
+        | PlayerFilter::OwnersOfCardsExiledBySource
+        | PlayerFilter::TriggeringPlayer
+        | PlayerFilter::OpponentOtherThanTriggering
+        | PlayerFilter::OpponentOfTriggeringPlayer
+        | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::PlayerAttribute { .. }
+        | PlayerFilter::ChosenPlayer { .. }
+        | PlayerFilter::ParentObjectTargetOwner => false,
+    }
+}
+
+/// V-NEST (DETECTOR SELF-TEST) — the three nesting axes
+/// [`filter_has_chosen_color`] gained are exercised here, synthetically, because
+/// NO card on the current pool reaches them. That is not an assumption: `V-PAIR`
+/// below passed on the same four faces BEFORE these arms existed, so every one
+/// of today's stamps is already visible to the pre-existing arms and none of
+/// them would fail if the new recursion were deleted.
+///
+/// Without this test the recursion would be dead code that `V-PAIR` could never
+/// fail on, which is exactly how the hole it closes got in: `PlayerMatching` sat
+/// in the `=> false` list and a `TypedFilter`'s nested props were never read, so
+/// the detector answered "no chosen colour here" for a whole region of the
+/// filter type closure. A detector that cannot see a shape cannot police it.
+///
+/// Every case is a PAIR: the positive proves the walk reaches that depth, and
+/// the same shape with `FilterProp::Tapped` substituted proves the walk is
+/// discriminating rather than returning `true` for anything nested. Revert any
+/// one recursion arm and its positive half fails.
+#[test]
+fn nested_chosen_color_is_seen_at_every_depth_of_the_filter_closure() {
+    /// The stamped leaf both halves nest, parameterized on the prop under test.
+    fn typed_with(prop: FilterProp) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Permanent],
+            controller: None,
+            properties: vec![prop],
+        })
+    }
+
+    // BASELINE: the top-level shape today's cards actually produce. If this
+    // ever fails, every nested case below is meaningless.
+    assert!(
+        filter_has_chosen_color(&typed_with(FilterProp::IsChosenColor)),
+        "top-level stamped prop must be seen — the production shape"
+    );
+    assert!(
+        !filter_has_chosen_color(&typed_with(FilterProp::Tapped)),
+        "an unstamped typed filter must not be seen"
+    );
+
+    // AXIS 1 — nested `FilterProp` (`AnyOf` / `Not`, the property-level
+    // combinators). Two levels deep, so a single-level peek does not pass.
+    for (label, prop) in [
+        (
+            "Not(AnyOf([IsChosenColor]))",
+            FilterProp::Not {
+                prop: Box::new(FilterProp::AnyOf {
+                    props: vec![FilterProp::IsChosenColor],
+                }),
+            },
+        ),
+        (
+            "AnyOf([Not(IsChosenColor)])",
+            FilterProp::AnyOf {
+                props: vec![FilterProp::Not {
+                    prop: Box::new(FilterProp::IsChosenColor),
+                }],
+            },
+        ),
+    ] {
+        assert!(
+            filter_has_chosen_color(&typed_with(prop)),
+            "axis 1 ({label}): a prop nested in the property combinators must be seen"
+        );
+    }
+    assert!(
+        !filter_has_chosen_color(&typed_with(FilterProp::Not {
+            prop: Box::new(FilterProp::AnyOf {
+                props: vec![FilterProp::Tapped],
+            }),
+        })),
+        "axis 1 negative: the same nesting without the prop must NOT be seen"
+    );
+
+    // AXIS 2 — `FilterProp` boxing a whole `TargetFilter`. This is the arm that
+    // reading only a `TypedFilter`'s top-level `properties` missed.
+    assert!(
+        filter_has_chosen_color(&typed_with(FilterProp::Targets {
+            filter: Box::new(typed_with(FilterProp::IsChosenColor)),
+        })),
+        "axis 2: a prop stamped inside FilterProp::Targets' boxed filter must be seen"
+    );
+    assert!(
+        !filter_has_chosen_color(&typed_with(FilterProp::Targets {
+            filter: Box::new(typed_with(FilterProp::Tapped)),
+        })),
+        "axis 2 negative: the same boxed filter without the prop must NOT be seen"
+    );
+
+    // AXIS 3 — `TargetFilter::PlayerMatching` → `PlayerFilter`, including
+    // `PlayerFilter`'s own `AllExcept` self-recursion. `PlayerMatching` is the
+    // variant that used to sit in the `=> false` list outright.
+    let controls_stamped = |prop: FilterProp| PlayerFilter::ControlsCount {
+        relation: PlayerRelation::All,
+        filter: typed_with(prop),
+        comparator: Comparator::GE,
+        count: Box::new(QuantityExpr::Fixed { value: 1 }),
+    };
+    assert!(
+        filter_has_chosen_color(&TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::AllExcept {
+                exclude: Box::new(controls_stamped(FilterProp::IsChosenColor)),
+            }),
+        }),
+        "axis 3: a prop stamped under PlayerMatching → AllExcept → ControlsCount must be seen"
+    );
+    assert!(
+        !filter_has_chosen_color(&TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::AllExcept {
+                exclude: Box::new(controls_stamped(FilterProp::Tapped)),
+            }),
+        }),
+        "axis 3 negative: the same player-filter nesting without the prop must NOT be seen"
+    );
+
+    // THE STATED BOUNDARY, pinned so it cannot drift silently: the walk does NOT
+    // descend `ControlsCount.count`, a QuantityExpr that can itself embed a
+    // TargetFilter. This asserts the documented limitation, not a desired
+    // behaviour — if a later change makes the walk total over quantity fields
+    // too, flip this and delete the boundary paragraph on
+    // `filter_has_chosen_color`.
+    assert!(
+        !filter_has_chosen_color(&TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Any,
+                comparator: Comparator::GE,
+                count: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: typed_with(FilterProp::IsChosenColor),
+                    },
+                }),
+            }),
+        }),
+        "quantity-field boundary: counts are not walked, exactly as documented"
+    );
+}
+
 /// Every filter slot that can carry `FilterProp::IsChosenColor` on a card that
 /// prints "… of the color of your choice":
 ///   * the mass-effect object filters this change's arm produces (Wash Out,
@@ -57144,12 +57465,28 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
 /// EXHAUSTIVE by construction, for the same reason as
 /// [`filter_has_chosen_color`]: a NEW `Effect` variant carrying a filter slot
 /// must be a COMPILE ERROR here, not a silent hole in `V-PAIR`. `Effect` has 232
-/// variants; the 228 in the final arm answer `false` because no parser route
-/// stamps `FilterProp::IsChosenColor` into them — `parse_type_phrase_with_ctx`'s
-/// printed-qualifier arm reaches the three mass-effect object filters, and the
-/// prevention route reaches `damage_source_filter`. That is a decision on each
-/// listed variant, and the compiler now forces the same decision on every
-/// variant added after it.
+/// variants; the 228 in the final arm answer `false`.
+///
+/// That `false` is a DATED POOL CENSUS, not a structural property, and the
+/// distinction matters enough to spell out. `FilterProp::IsChosenColor` is
+/// stamped by the printed-qualifier arm inside the GENERAL type-phrase parser
+/// (`parser/oracle_target.rs` `parse_type_phrase_with_ctx`), gated only on
+/// `ChosenColorQualifierScope::ChainBound` — which `oracle_effect/mod.rs` sets
+/// for EVERY chunk of EVERY chain. So the grammar does not forbid the prop from
+/// landing in a sibling mass-effect object filter: `ChangeZoneAll`, `PumpAll`,
+/// `GainControlAll`, `PutCounterAll`, `CounterAll` and `GoadAll` all carry an
+/// object filter built by that same parser and all sit in the `false` list
+/// below. They answer `false` because on the 2026-08-28 pool (the vintage in
+/// `crates/engine/data/mtgjson-vintage`) no card reaches them with the printed
+/// qualifier — the same dated-census idiom used for the 4-face card list on
+/// `inject_printed_color_choice_filter` — NOT because the compiler proved they
+/// cannot. Re-measure rather than trusting it.
+///
+/// What the exhaustiveness DOES buy is unchanged and is the point: every one of
+/// the 232 variants is a written-down decision rather than a wildcard, and a
+/// variant added after this is a compile error until someone makes that decision
+/// too. `V-PAIR` then catches any variant whose census answer went stale, because
+/// its invariant is over the lowered tree, not over this list.
 fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
     match effect {
         Effect::BounceAll { target, .. }
