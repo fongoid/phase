@@ -3865,7 +3865,8 @@ fn try_parse_inline_delayed_trigger(
     // the parent's tracked set.
     let uses_tracked_set = scan_tracked_set_reference(condition_text);
 
-    let mut inner_ctx = ctx.clone();
+    // CR 105.4: throwaway — the parsed `inner` is kept, `inner_ctx` is dropped.
+    let mut inner_ctx = ctx.clone_throwaway();
     inner_ctx.subject = match &condition {
         DelayedTriggerCondition::WhenDies { filter }
         | DelayedTriggerCondition::WhenLeavesPlayFiltered { filter }
@@ -6766,7 +6767,9 @@ fn try_parse_choose_one_of_inline(
     let mut left_def;
     let mut right_def;
     if scoped_choice_player {
-        let mut branch_ctx = ctx.clone();
+        // CR 105.4: throwaway — only `diagnostics` is copied back, never
+        // `*ctx = branch_ctx`.
+        let mut branch_ctx = ctx.clone_throwaway();
         branch_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
         left_def = parse_effect_chain_with_context(left_orig, AbilityKind::Spell, &mut branch_ctx);
         right_def =
@@ -7875,7 +7878,8 @@ fn try_parse_for_each_target_copy_token(
     // Map the lowercase offset back onto the original-case `text` (ASCII Oracle
     // text keeps byte offsets aligned).
     let target_start = lower.len() - after_count.len();
-    let mut target_ctx = ctx.clone();
+    // CR 105.4: throwaway — the parsed `target` is kept, `target_ctx` is dropped.
+    let mut target_ctx = ctx.clone_throwaway();
     let (target, target_rem) = parse_target_with_ctx(&text[target_start..], &mut target_ctx);
     if !matches!(target, TargetFilter::Typed(_)) {
         return None;
@@ -8114,7 +8118,9 @@ fn parse_for_each_object_copy_parts(
         if let Some(source_filter) =
             parse_for_each_object_filter_clause_with_context(clause, &candidate_ctx)
         {
-            let mut body_ctx = candidate_ctx.clone();
+            // CR 105.4: throwaway — only `candidate_ctx` is merged back
+            // (`*ctx = candidate_ctx` below); `body_ctx` itself never is.
+            let mut body_ctx = candidate_ctx.clone_throwaway();
             if let Some(effect) = token::try_parse_token(body_lower, body, &mut body_ctx) {
                 if matches!(
                     &effect,
@@ -14764,7 +14770,13 @@ fn parse_choose_survivors_destroy_rest_ir(
     })?;
 
     let filter_text = after_count.get(..filter_len)?.trim();
-    let mut filter_ctx = ctx.clone();
+    // CR 105.4: throwaway — the parsed `filter` is KEPT while `filter_ctx` is
+    // dropped, which is exactly the shape rule 1 of `ChosenColorQualifierScope`
+    // forbids inheriting `ChainBound` into: a printed
+    // "… of the color of your choice" filter text here would stamp
+    // `FilterProp::IsChosenColor` and then discard the provenance that injects
+    // the matching chooser.
+    let mut filter_ctx = ctx.clone_throwaway();
     let filter = parse_choose_object_selection_filter(filter_text, &mut filter_ctx)?;
     let TargetFilter::Typed(mut destroy_filter) = filter.clone() else {
         return None;
@@ -16018,8 +16030,10 @@ fn for_each_subject_application(
 }
 
 fn for_each_quantity_context(original: &str, ctx: &ParseContext) -> ParseContext {
-    let mut quantity_ctx = ctx.clone();
-    let mut subject_ctx = ctx.clone();
+    // CR 105.4: both are throwaways — the caller reads `quantity_ctx` only
+    // through a shared `&ParseContext` and never merges either back.
+    let mut quantity_ctx = ctx.clone_throwaway();
+    let mut subject_ctx = ctx.clone_throwaway();
     if quantity_ctx.third_person_player_controller_ref().is_none()
         && for_each_subject_application(original, &mut subject_ctx)
             .is_some_and(|app| app.target.is_some() && is_player_filter(&app.affected))
@@ -17823,7 +17837,10 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
             ..Default::default()
         }
     } else {
-        ctx.clone()
+        // CR 105.4: throwaway — the parsed `sub_clause` is kept,
+        // `continuation_ctx` is dropped. (The `if` arm is already `Unbound` by
+        // construction, so both arms agree.)
+        ctx.clone_throwaway()
     };
     // CR 601.2c + CR 115.1: The continuation starts a new target instruction.
     // Keep the primary phrase's announcer on `ctx`; only a chooser printed in
@@ -18120,12 +18137,18 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // <effect>") reaches this splitter and must recover its bound here too — the
     // direct-clause fixup in `lower_imperative_clause` never runs for the compound
     // return. Re-derive from the same building block that produced the effect.
+    // CR 105.4: both re-derivations run against THROWAWAY contexts — only the
+    // recovered `multi` bound is kept, the derived contexts are dropped.
     let primary_multi_target = match &primary_effect {
         Effect::PutCounter { .. } => {
             let primary_clause = &text[..text.len() - remainder.len()];
             let primary_lower = primary_clause.to_ascii_lowercase();
-            counter::try_parse_put_counter(&primary_lower, primary_clause, &mut ctx.clone())
-                .and_then(|(_, _, multi)| multi)
+            counter::try_parse_put_counter(
+                &primary_lower,
+                primary_clause,
+                &mut ctx.clone_throwaway(),
+            )
+            .and_then(|(_, _, multi)| multi)
         }
         Effect::ReproduceEventCounters { .. } => {
             let primary_clause = &text[..text.len() - remainder.len()];
@@ -18133,7 +18156,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
             counter::try_parse_reproduce_event_counters(
                 &primary_lower,
                 primary_clause,
-                &mut ctx.clone(),
+                &mut ctx.clone_throwaway(),
             )
             .and_then(|(_, _, multi)| multi)
         }
@@ -19904,7 +19927,8 @@ fn try_parse_compound_subject_each(
 
     // Parse the body once. Re-using `parse_effect_chain_with_context`
     // composes the existing body parser surface (Token, Draw, etc.).
-    let mut body_ctx = ctx.clone();
+    // CR 105.4: throwaway — the parsed body is kept, `body_ctx` is dropped.
+    let mut body_ctx = ctx.clone_throwaway();
     let parsed_body = parse_effect_chain_with_context(body_text, AbilityKind::Spell, &mut body_ctx);
 
     // Reject Unimplemented bodies — distribution is meaningless when the body
@@ -29464,8 +29488,26 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// Greevil). Gated on DECLARED per-clause provenance
 /// (`ClauseIr.printed_color_choice`), never on a scan of the lowered tree.
 ///
+/// CLASS SCOPE, measured rather than asserted. The printed form
+/// ("… of the color of your choice") appears on exactly 4 card faces:
+///   * **Wash Out** and **Root Greevil** — the object-filter seam this function
+///     serves. Both are single-clause chains, so head == carrying clause.
+///   * **Prismatic Strands** — the prevention *damage-source* seam. Already
+///     correct before this change and untouched by it: its own parser route
+///     emits `Effect::Choose { Color, persist: true }` plus a `PreventDamage`
+///     whose `damage_source_filter` carries `FilterProp::IsChosenColor`.
+///   * **Avacyn, Guardian Angel** — the SAME prevention damage-source seam, and
+///     still silently misparsed. Both of its activated abilities export
+///     `Effect::PreventDamage` with NO `damage_source_filter` at all, so they
+///     prevent all damage from every source, with no `Effect::Unimplemented`
+///     and no parse warning. That failure is at the sibling seam, not this one
+///     (`docs/parser-misparse-backlog.md` root cause 11, "Replacement /
+///     prevention / 'instead' effect mis-modeled", which lists it), so this
+///     change neither closes it nor makes it worse — it is named here so the
+///     class scope is not overstated.
+///
 /// CR 608.2c LIMITATION, stated rather than hidden: the wrap is applied to the
-/// CHAIN HEAD. Both cards in this class are single-clause chains, so head ==
+/// CHAIN HEAD. Both cards at THIS seam are single-clause chains, so head ==
 /// clause for both; for a hypothetical later-clause case the prompt would be
 /// raised earlier than printed. Pinned by the `V-ORDER` test; follow-up F6.
 ///
@@ -29473,22 +29515,49 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// parser refused must not raise a prompt for semantics it did not model.
 ///
 /// That justification holds only while head == carrier, which is the case for
-/// both cards in this class. On a head != carrier chain (head refused, a LATER
+/// both cards at this seam. On a head != carrier chain (head refused, a LATER
 /// clause carried the printed qualifier) the guard suppresses the chooser for a
 /// clause that DID stamp `FilterProp::IsChosenColor` — trading a spurious
 /// prompt for a match-nothing filter. Deliberate and bounded: no printed-form
-/// card has that shape (the printed slice is 4 faces, and the two in scope are
-/// single-clause). Pinned by `V-UNIMPL`, and resolved by follow-up F6, which
-/// moves the wrap to the carrying clause's own node so the guard's subject and
-/// the provenance's subject are the same clause.
+/// card has that shape (the printed slice is the 4 faces above, and the two at
+/// this seam are single-clause). Pinned by `V-UNIMPL`, and resolved by follow-up
+/// F6, which moves the wrap to the carrying clause's own node so the guard's
+/// subject and the provenance's subject are the same clause.
+///
+/// Skipped when the head effect is ALREADY an `Effect::Choose(Color)` — the
+/// same recursion guard `inject_chosen_color_choice_grant` spells as
+/// `parent_is_color_choice` / `child_under_color_choice`, so the two injectors
+/// agree on what "a colour choice already stands here" means. A chain that
+/// prints both ("Choose a color. Return all permanents of the color of your
+/// choice …") would otherwise raise TWO prompts, and the `find_map` over
+/// `chosen_attributes` reads the FIRST-written (outer) colour, silently
+/// discarding the player's second answer.
+///
+/// Honest consequence, since `ChoiceType::Color` is absent from the `persist:`
+/// match in `oracle_effect/imperative.rs`: the surviving printed choice is
+/// `persist: false`, so it writes no `ChosenAttribute::Color` and the
+/// `IsChosenColor` filter matches nothing until follow-up **F1** adds `Color`
+/// to that match. That is exactly the state the sibling injector's guard
+/// already produces for "Choose a color. Target creature gains protection from
+/// that color" — one gap at one seam, closed once by F1, rather than two
+/// injectors disagreeing about the same shape. No card in the pool prints both
+/// forms in one chain, so this is unreachable today; pinned by `V-DOUBLE`.
 pub(crate) fn inject_printed_color_choice_filter(
     def: &mut AbilityDefinition,
     printed: Option<ChoiceType>,
 ) {
-    // Both guards are explicit and independent: the DECLARED provenance must be
-    // a colour choice, and the head must not be a clause the parser refused.
+    // All three guards are explicit and independent: the DECLARED provenance
+    // must be a colour choice, the head must not be a clause the parser
+    // refused, and the head must not already BE a colour choice.
     if matches!(printed, Some(ChoiceType::Color { .. }))
         && !matches!(&*def.effect, Effect::Unimplemented { .. })
+        && !matches!(
+            &*def.effect,
+            Effect::Choose {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        )
     {
         wrap_in_color_choice(def);
     }
@@ -34583,6 +34652,15 @@ pub(crate) fn parse_effect_chain_ir(
                 .starting_with(starting_with.clone())
                 .multi_target(multi_target)
                 .where_x_expression(where_x_expression)
+                // CR 105.4: `clause` came from the REAL chunk parse, so this
+                // early-return arm must carry the same declared provenance the
+                // three main `.push()` sites do. Dropping it is compile-silent
+                // and leaves `FilterProp::IsChosenColor` stamped with no
+                // injected chooser — a fail-closed, match-NOTHING filter.
+                // (`target_selection_mode` / `target_chooser` are dropped here
+                // too, but that predates this change and is left as-is rather
+                // than folded into an unrelated fix.)
+                .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                 .push();
             continue;
         }
@@ -34645,6 +34723,10 @@ pub(crate) fn parse_effect_chain_ir(
                     .starting_with(starting_with.clone())
                     .multi_target(multi_target)
                     .where_x_expression(where_x_expression)
+                    // CR 105.4: same as the `KeywordOverride` arm above — this
+                    // clause is a real chunk parse, so its declared provenance
+                    // must be threaded rather than defaulted to `None`.
+                    .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                     .push();
                 continue;
             }

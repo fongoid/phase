@@ -23,7 +23,7 @@
 //!   `assert_zone(&[red_aura], Zone::Battlefield)` assertion. Revert and both
 //!   enchantments are destroyed.
 
-use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{ChoiceType, ChosenAttribute, Effect};
 use engine::types::actions::GameAction;
@@ -453,8 +453,3 @@ fn evacuation_without_a_qualifier_is_unchanged() {
         outcome.final_waiting_for()
     );
 }
-
-/// Keep the unused-import checker honest about `GameRunner`, which the helpers
-/// above reference only through method calls on `scenario.build()`.
-#[allow(dead_code)]
-fn _assert_runner_type(_r: &GameRunner) {}

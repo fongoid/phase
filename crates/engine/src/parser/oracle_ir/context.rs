@@ -52,7 +52,11 @@ pub(crate) enum TriggerConditionScope {
 /// RULE, both halves — the same two hazards `pending_damage_multi_target`
 /// documents below:
 ///   1. A clone-derived `ParseContext` that is NOT merged back with `*ctx = ..`
-///      must reset this field to `Unbound` at construction.
+///      must reset this field to `Unbound` at construction. Use
+///      [`ParseContext::clone_throwaway`] rather than `.clone()` at those sites —
+///      it is the named, greppable spelling of this half of the rule, and the
+///      plain `.clone()` that remains is then a positive signal that the site
+///      really does merge back.
 ///   2. A speculative sub-parse that runs against the REAL `&mut ctx` and can
 ///      abandon its result must clear `pending_printed_color_choice` on the
 ///      abandonment path — otherwise the surviving context carries a pending
@@ -440,6 +444,28 @@ impl ParseContext {
             return;
         }
         self.diagnostics.push(d);
+    }
+
+    /// CR 105.4: clone this context for a sub-parse whose CONTEXT is DISCARDED —
+    /// the parsed value is kept, but `*ctx = <derived>` never runs.
+    ///
+    /// This is the runnable half of `ChosenColorQualifierScope`'s rule 1. A plain
+    /// `.clone()` inherits `ChainBound`, so a throwaway derived context can stamp
+    /// `FilterProp::IsChosenColor` on a filter it keeps while dropping the
+    /// `pending_printed_color_choice` that would have injected the matching
+    /// `Effect::Choose(Color)` — a fail-closed, match-NOTHING filter with no
+    /// `Effect::Unimplemented` and therefore no coverage signal.
+    ///
+    /// Deliberately NOT a `Clone` impl: a `Clone` that silently drops state is a
+    /// worse defect than the one it fixes, and the merge-back sites
+    /// (`*ctx = tentative_ctx`, `*ctx = body_ctx`, `*ctx = candidate_ctx`,
+    /// `*ctx = fanout_ctx`) genuinely need the inheriting `.clone()`. The two
+    /// spellings are the two intents, and `clone_throwaway` is greppable.
+    pub fn clone_throwaway(&self) -> Self {
+        Self {
+            chosen_color_qualifier: ChosenColorQualifierScope::Unbound,
+            ..self.clone()
+        }
     }
 
     /// Execute `f` with a temporary relative-player scope, restoring the prior

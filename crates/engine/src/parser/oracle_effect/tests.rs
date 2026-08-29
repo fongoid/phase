@@ -56899,15 +56899,27 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
     }
 }
 
-/// The mass-effect object filters this class can produce.
+/// Every filter slot that can carry `FilterProp::IsChosenColor` on a card that
+/// prints "… of the color of your choice":
+///   * the mass-effect object filters this change's arm produces (Wash Out,
+///     Root Greevil);
+///   * `PreventDamage.damage_source_filter`, the SIBLING seam the same printed
+///     phrase reaches on Prismatic Strands. Included so the pairing detector
+///     below is a real invariant over the whole printed slice rather than over
+///     the one arm this change touched.
 fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
-    let target = match effect {
+    match effect {
         Effect::BounceAll { target, .. }
         | Effect::DestroyAll { target, .. }
-        | Effect::DamageAll { target, .. } => Some(target),
-        _ => None,
-    };
-    target.is_some_and(filter_has_chosen_color)
+        | Effect::DamageAll { target, .. } => filter_has_chosen_color(target),
+        Effect::PreventDamage {
+            damage_source_filter,
+            ..
+        } => damage_source_filter
+            .as_ref()
+            .is_some_and(filter_has_chosen_color),
+        _ => false,
+    }
 }
 
 fn tree_has_is_chosen_color(def: &AbilityDefinition) -> bool {
@@ -57124,5 +57136,267 @@ fn printed_color_choice_is_injected_at_the_chain_head_limitation_pin() {
         nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
         0,
         "no clause may lower to Unimplemented: {def:#?}"
+    );
+}
+
+/// Every ability ROOT a card produces, unflattened — one entry per independent
+/// lowered tree. `all_card_defs` flattens across roots, which is the wrong
+/// granularity for a "paired IN THE SAME TREE" invariant: two roots, one
+/// stamping the filter and the other carrying an unrelated chooser, must read
+/// as a violation, not as a pass.
+fn card_ability_roots(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<&AbilityDefinition> {
+    let mut out: Vec<&AbilityDefinition> = parsed.abilities.iter().collect();
+    out.extend(parsed.triggers.iter().filter_map(|t| t.execute.as_deref()));
+    out.extend(
+        parsed
+            .replacements
+            .iter()
+            .filter_map(|r| r.execute.as_deref()),
+    );
+    out
+}
+
+/// THE INVARIANT, as a walker: a lowered tree that stamps
+/// `FilterProp::IsChosenColor` must also contain an `Effect::Choose` of
+/// `ChoiceType::Color` — the chooser whose `persist` write is the only thing
+/// `IsChosenColor`'s fail-closed `is_some_and` read can ever match against
+/// (`game/filter.rs`). A stamp with no chooser is a silent match-NOTHING filter:
+/// no `Effect::Unimplemented`, no parse warning, coverage still green.
+fn chosen_color_pairing_violation(def: &AbilityDefinition) -> bool {
+    let mut nodes = Vec::new();
+    collect_defs(def, &mut nodes);
+    nodes
+        .iter()
+        .any(|d| effect_filter_has_chosen_color(&d.effect))
+        && !nodes.iter().any(|d| is_color_choice(d))
+}
+
+/// V-PAIR (DETECTOR) — CR 105.4 + CR 607.2d. `FilterProp::IsChosenColor` may
+/// never be stamped into a lowered tree that has no `Effect::Choose(Color)` to
+/// bind it.
+///
+/// This is the runnable half of `ChosenColorQualifierScope`'s clone-inheritance
+/// rule. The hazard it detects is not hypothetical in shape: a throwaway
+/// `ParseContext` clone inherits `ChainBound`, stamps the filter, and then drops
+/// the `pending_printed_color_choice` that would have injected the chooser —
+/// which is why every such site now spells `clone_throwaway()`.
+///
+/// A test that can only pass is not a detector, so this has BOTH halves:
+///   * a POSITIVE REACH-GUARD over the real printed slice, asserting each tree
+///     genuinely stamps the prop AND genuinely carries a chooser — proving the
+///     walker reaches and recognizes the production shape at both seams
+///     (mass-effect object filter; `PreventDamage.damage_source_filter`);
+///   * a NEGATIVE, on a deliberately unpaired tree built by stripping the
+///     injected chooser off Wash Out's REAL parse output, which the detector
+///     must flag.
+#[test]
+fn chosen_color_filter_is_always_paired_with_a_color_chooser() {
+    // Wash Out {3}{U} Sorcery — verbatim.
+    let wash_out = parse_oracle_text(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        "Wash Out",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    // Root Greevil {3}{G} Creature — Beast — verbatim.
+    let root_greevil = parse_oracle_text(
+        "{2}{G}, {T}, Sacrifice this creature: Destroy all enchantments of the color of your \
+         choice.",
+        "Root Greevil",
+        &[],
+        &["Creature".to_string()],
+        &["Beast".to_string()],
+    );
+    // Prismatic Strands {2}{W} Instant — verbatim, INCLUDING the flashback line.
+    // The sibling seam: already correct before this change, and its chooser is
+    // emitted by its own parser route, not by `inject_printed_color_choice_filter`.
+    let prismatic_strands = parse_oracle_text(
+        "Prevent all damage that sources of the color of your choice would deal this turn.\n\
+         Flashback—Tap an untapped white creature you control. (You may cast this card from your \
+         graveyard for its flashback cost. Then exile it.)",
+        "Prismatic Strands",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    // Avacyn, Guardian Angel {4}{W}{W} Creature — Angel — verbatim.
+    //
+    // Deliberately NOT in the reach-guard set below: Avacyn is still misparsed
+    // at the prevention damage-source seam (both abilities export
+    // `PreventDamage` with NO `damage_source_filter`, so they prevent all damage
+    // from every source, silently). That is backlog root cause 11, a different
+    // seam from the one this change fixes. She is asserted only for the
+    // invariant — which holds vacuously today (nothing stamped) and must STILL
+    // hold once root cause 11 lands, so this row never needs revisiting.
+    let avacyn = parse_oracle_text(
+        "Flying, vigilance\n{1}{W}: Prevent all damage that would be dealt to another target \
+         creature this turn by sources of the color of your choice.\n{5}{W}{W}: Prevent all \
+         damage that would be dealt to target player or planeswalker this turn by sources of the \
+         color of your choice.",
+        "Avacyn, Guardian Angel",
+        &["Flying".to_string(), "Vigilance".to_string()],
+        &["Creature".to_string()],
+        &["Angel".to_string()],
+    );
+
+    // THE INVARIANT, over the whole printed slice (all 4 faces that print
+    // "of the color of your choice").
+    for (name, parsed) in [
+        ("Wash Out", &wash_out),
+        ("Root Greevil", &root_greevil),
+        ("Prismatic Strands", &prismatic_strands),
+        ("Avacyn, Guardian Angel", &avacyn),
+    ] {
+        for (idx, root) in card_ability_roots(parsed).into_iter().enumerate() {
+            assert!(
+                !chosen_color_pairing_violation(root),
+                "{name} root {idx}: IsChosenColor stamped with no Effect::Choose(Color) in the \
+                 same tree — a fail-closed match-NOTHING filter: {root:#?}"
+            );
+        }
+    }
+
+    // POSITIVE REACH-GUARD: the walker really does see both halves on the three
+    // faces that carry them, so the loop above is not vacuously true.
+    for (name, parsed) in [
+        ("Wash Out", &wash_out),
+        ("Root Greevil", &root_greevil),
+        ("Prismatic Strands", &prismatic_strands),
+    ] {
+        let roots = card_ability_roots(parsed);
+        assert!(
+            roots.iter().any(|r| tree_has_is_chosen_color(r)),
+            "{name}: no tree stamps IsChosenColor — the invariant loop above would be vacuous"
+        );
+        let mut nodes = Vec::new();
+        for root in &roots {
+            collect_defs(root, &mut nodes);
+        }
+        assert_eq!(
+            nodes.iter().filter(|d| is_color_choice(d)).count(),
+            1,
+            "{name}: exactly one colour chooser must bind the stamped filter"
+        );
+        assert_eq!(
+            nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+            0,
+            "{name}: no clause may lower to Unimplemented"
+        );
+    }
+
+    // THE NEGATIVE: strip the injected chooser off Wash Out's REAL parse output
+    // and the detector must flag the result. Without this half the assertions
+    // above could all pass on a walker that recognizes nothing.
+    let paired = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        is_color_choice(&paired),
+        "reach-guard: the injected chooser must be Wash Out's chain head: {:?}",
+        paired.effect
+    );
+    assert!(
+        !chosen_color_pairing_violation(&paired),
+        "the real, paired tree must NOT be flagged: {paired:#?}"
+    );
+    let unpaired = *paired
+        .sub_ability
+        .clone()
+        .expect("the injected chooser displaces the bounce into sub_ability");
+    assert!(
+        tree_has_is_chosen_color(&unpaired),
+        "reach-guard: the stripped tree still stamps IsChosenColor: {unpaired:#?}"
+    );
+    assert!(
+        chosen_color_pairing_violation(&unpaired),
+        "a tree stamping IsChosenColor with no chooser MUST be flagged: {unpaired:#?}"
+    );
+}
+
+/// V-DOUBLE (SHAPE) — CR 105.4 + CR 608.2c. `inject_printed_color_choice_filter`
+/// must not wrap a head that is ALREADY an `Effect::Choose(Color)`, matching the
+/// sibling injector's `parent_is_color_choice` / `child_under_color_choice`
+/// guard.
+///
+/// Without the guard this chain raises TWO colour prompts, and the `find_map`
+/// over `chosen_attributes` reads the FIRST-written (outer, injected) colour —
+/// so the player's answer to the printed prompt is silently discarded.
+///
+/// Unreachable on today's card pool (no card prints both forms in one chain);
+/// pinned here because the guard is otherwise untestable from card text.
+#[test]
+fn printed_color_choice_is_not_double_wrapped_over_an_existing_color_choice() {
+    let def = parse_effect_chain(
+        "Choose a color. Return all permanents of the color of your choice to their owners' \
+         hands.",
+        AbilityKind::Spell,
+    );
+    let mut nodes = Vec::new();
+    collect_defs(&def, &mut nodes);
+
+    // REACH-GUARD (a): the printed qualifier really was consumed, so the
+    // provenance DID reach the injector. Together with the count below this is
+    // what proves the guard — not a missing provenance — suppressed the wrap.
+    assert!(
+        tree_has_is_chosen_color(&def),
+        "the bounce filter must stamp IsChosenColor: {def:#?}"
+    );
+    // REACH-GUARD (b): nothing was refused, so the `Unimplemented` guard is not
+    // the one doing the work here.
+    assert_eq!(
+        nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+        0,
+        "no clause may lower to Unimplemented: {def:#?}"
+    );
+
+    // THE NEGATIVE: exactly one prompt, and it is the card's OWN printed
+    // "Choose a color." — `persist: false`, because `ChoiceType::Color` is still
+    // absent from the `persist:` match in `oracle_effect/imperative.rs`
+    // (follow-up F1). The sibling injector's guard produces the identical state
+    // for "Choose a color. Target creature gains protection from that color",
+    // so F1 closes both at once.
+    let persists: Vec<bool> = nodes
+        .iter()
+        .filter_map(|d| match &*d.effect {
+            Effect::Choose {
+                choice_type: ChoiceType::Color { .. },
+                persist,
+                ..
+            } => Some(*persist),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        persists,
+        vec![false],
+        "exactly one colour choice — the printed one — must survive: {def:#?}"
+    );
+
+    // POSITIVE TWIN, same test: with no printed head the injector still fires
+    // and its wrap IS the persisting one, so the guard above is a real branch
+    // and not the injector silently doing nothing.
+    let injected = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    let mut injected_nodes = Vec::new();
+    collect_defs(&injected, &mut injected_nodes);
+    let injected_persists: Vec<bool> = injected_nodes
+        .iter()
+        .filter_map(|d| match &*d.effect {
+            Effect::Choose {
+                choice_type: ChoiceType::Color { .. },
+                persist,
+                ..
+            } => Some(*persist),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        injected_persists,
+        vec![true],
+        "the injected chooser must persist: {injected:#?}"
     );
 }
