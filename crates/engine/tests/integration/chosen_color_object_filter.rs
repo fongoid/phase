@@ -44,10 +44,16 @@ const ROOT_GREEVIL: &str =
 /// sibling: the arm must not fire where no qualifier is printed.
 const EVACUATION: &str = "Return all creatures to their owners' hands.";
 
+/// `n` units of one mana type, with no producing source and no spend
+/// restrictions — the plainest pool contents that can pay a printed cost, so a
+/// cast in this suite can never fail for a mana reason the test did not intend.
 fn mana(kind: ManaType, n: usize) -> Vec<ManaUnit> {
     vec![ManaUnit::new(kind, ObjectId(0), false, vec![]); n]
 }
 
+/// A mana pool assembled from `(type, count)` pairs. Each test seeds exactly the
+/// cost it intends to pay rather than an unbounded pool, so a cast that should
+/// have been unaffordable cannot pass unnoticed.
 fn pool(colored: &[(ManaType, usize)]) -> Vec<ManaUnit> {
     colored
         .iter()
@@ -75,6 +81,11 @@ fn count_color_choices(text: &str) -> usize {
     n
 }
 
+/// Recursive worker for [`count_color_choices`]: counts colour choosers in one
+/// definition tree, following every branch a chooser can be displaced into
+/// (`sub_ability` — where the injected wrap puts the displaced effect —
+/// `else_ability`, and each modal branch). Walking only the head would report 0
+/// for exactly the shape this suite exists to assert.
 fn walk_color_choices(def: &engine::types::ability::AbilityDefinition) -> usize {
     let mut n = usize::from(matches!(
         &*def.effect,
@@ -194,15 +205,63 @@ fn wash_out_with_no_permanent_of_the_chosen_color_moves_nothing() {
     scenario.with_mana_pool(P0, pool(&[(ManaType::Blue, 1), (ManaType::Colorless, 3)]));
 
     let mut runner = scenario.build();
-    let outcome = runner.cast(wash_out).choose_option("White").resolve();
+
+    // POSITIVE REACH-GUARD on the RUNTIME CHOICE PATH, in the same
+    // `runner.state().waiting_for` idiom as
+    // `wash_out_raises_one_five_option_color_prompt_before_the_bounce`.
+    //
+    // Load-bearing: `drive_resolution` (`game/scenario.rs`) answers a
+    // `NamedChoice` window only when a choice was declared and otherwise BREAKS,
+    // so a declared `choose_option` that is never consumed is SILENT. Without
+    // this guard the zone assertions below would hold just as well on a build
+    // that raised no chooser at all and simply bounced nothing — the exact
+    // failure this suite exists to catch. Resolving with NO colour declared
+    // halts AT the injected prompt and proves it was reached.
+    let halted = runner.cast(wash_out).resolve();
+    assert!(
+        matches!(
+            halted.final_waiting_for(),
+            WaitingFor::NamedChoice {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        ),
+        "the resolution must reach the injected colour prompt, got {:?}",
+        halted.final_waiting_for()
+    );
+    // CR 608.2c: the choice resolves before the bounce — nothing has moved yet.
+    assert_eq!(
+        runner.state().objects[&blue_bear].zone,
+        Zone::Battlefield,
+        "the bounce must not precede the colour choice (CR 608.2c)"
+    );
+
+    // Answer with a colour NO permanent has, then let the spell finish.
+    runner
+        .act(GameAction::ChooseOption {
+            choice: "White".to_string(),
+        })
+        .expect("answer the colour prompt");
+    for _ in 0..40 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority toward resolution");
+    }
 
     // REACH-GUARD: the spell resolved (CR 608.2n) — it did not hang on a prompt.
-    outcome.assert_zone(&[wash_out], Zone::Graveyard);
-    outcome.assert_zone(&[blue_bear, red_bear], Zone::Battlefield);
+    assert_eq!(runner.state().objects[&wash_out].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&blue_bear].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&red_bear].zone, Zone::Battlefield);
     assert!(
-        matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "no further prompt may be raised, got {:?}",
-        outcome.final_waiting_for()
+        runner.state().waiting_for
     );
 }
 
@@ -301,6 +360,21 @@ fn wash_out_raises_one_five_option_color_prompt_before_the_bounce() {
 
 /// V2 multi-authority (c) — CR 105.4. Wash Out cast twice in one turn raises
 /// two independent prompts, and each choice governs only its own resolution.
+///
+/// SCOPE, stated because it is the limit of what this file proves: the two casts
+/// are two DISTINCT spell objects, so this covers the two-objects case only. The
+/// SOURCE-REUSE case — the SAME storage id resolving a colour choice twice, as a
+/// recursion effect (Regrowth) or flashback (Prismatic Strands) produces — is
+/// NOT covered, and is not coverable here: `ChosenAttribute::Color` accumulates
+/// on the source (`apply_choice_attributes` in `game/effects/choose.rs` replaces
+/// only `Keyword` / `Counter` / `Direction`, and nothing clears the slot on a
+/// zone change off the battlefield — only `reset_for_battlefield_entry` does),
+/// while both `FilterProp::IsChosenColor` readers in `game/filter.rs` take the
+/// FIRST match. A second resolution on the same object therefore binds the
+/// FIRST answer. That is a PRE-EXISTING seam, untouched by this change — it
+/// already reaches Prismatic Strands' flashback via that card's own parser
+/// route — and its fix lives in `game/effects/choose.rs`, outside this change's
+/// scope.
 #[test]
 fn two_wash_outs_bind_their_own_choices_independently() {
     let mut scenario = GameScenario::new();

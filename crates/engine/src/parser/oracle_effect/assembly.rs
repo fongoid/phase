@@ -3219,40 +3219,57 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // fail-closed match-NOTHING filter with no `Effect::Unimplemented` and no
     // parse warning.
     //
-    // CR 608.2c LIMITATION (follow-up F6): `find_map` takes the FIRST surviving
-    // carrier, so a chain that printed the qualifier TWICE would collapse both
-    // filters onto one shared chooser and one `ChosenAttribute::Color`, where
-    // each printed choice is its own choice. Unreachable on the pool — the
-    // printed form appears on 4 card faces and none prints it twice in one chain
-    // — and closed by F6, which gives each carrying clause its own wrap at its
-    // own node.
+    // CR 607.2d: EVERY surviving carrier is collected, in printed order — never
+    // just the first. Each printed "of the color of your choice" is its own
+    // choice linked to its own filter, so a first-wins `find_map` over a chain
+    // that printed the qualifier TWICE would bind both stamped filters to one
+    // `ChosenAttribute::Color` and silently discard the second answer. The
+    // arity contract — and the honest `Effect::unimplemented` refusal the
+    // multi-carrier case now produces instead — is the single authority on
+    // `inject_printed_color_choice_filter`.
     //
-    // That census is the WHOLE safety argument for this collapse, and it is an
-    // assumption with a measurement DATE, not an invariant. It was measured
-    // against the MTGJSON pool whose tracked vintage sidecar
-    // `crates/engine/data/mtgjson-vintage` reads 2026-08-27. Re-measure rather
-    // than trusting the constant:
+    // The fragment is built from the SAME filtered clause set as the choices,
+    // so a refusal's description names exactly the clauses whose printed choices
+    // could not be modelled.
+    //
+    // CENSUS, re-measured 2026-08-29 against the pool whose tracked vintage
+    // sidecar `crates/engine/data/mtgjson-vintage` reads 2026-08-28: the printed
+    // form appears on 4 card faces (Avacyn, Guardian Angel / Prismatic Strands /
+    // Root Greevil / Wash Out) and NO ability line prints it twice — Avacyn's
+    // two occurrences sit in two SEPARATE activated abilities, i.e. two chains
+    // carrying one occurrence each. Nothing rests on that any more; it says only
+    // that the refusal arm is not taken by today's pool. Re-measure rather than
+    // trusting the constant:
     //
     //   jq -r '.data | to_entries[] | .value[]
     //          | select((.text // "") | test("of the color of your choice"))
     //          | (.faceName // .name)' data/mtgjson/AtomicCards.json | sort -u
     //
-    // Nothing FAILS if a future set prints a fifth face: `V-PAIR`
-    // (`chosen_color_filter_is_always_paired_with_a_color_chooser`) enumerates
-    // these faces by LITERAL Oracle text, so a new card is invisible to it. A
-    // drift guard over the full card export is deliberately NOT built — it would
-    // require a test that loads the full export, which
-    // `scripts/check-test-card-data-load.sh` forbids for newly added test code.
-    // The full census, including why Avacyn's two printed occurrences sit in two
-    // SEPARATE activated abilities and so do not violate "twice in one chain",
-    // is on `inject_printed_color_choice_filter`.
-    inject_printed_color_choice_filter(
-        &mut result,
-        ir.clauses
+    // The full census, including why Avacyn's two printed occurrences do not
+    // violate "twice in one chain", is on `inject_printed_color_choice_filter`.
+    let printed_color_carriers: Vec<(ChoiceType, &str)> = ir
+        .clauses
+        .iter()
+        .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
+        .filter_map(|clause| {
+            clause
+                .printed_color_choice
+                .clone()
+                .map(|choice| (choice, clause.source.fragment().unwrap_or_default()))
+        })
+        .collect();
+    if !printed_color_carriers.is_empty() {
+        let printed: Vec<ChoiceType> = printed_color_carriers
             .iter()
-            .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
-            .find_map(|clause| clause.printed_color_choice.clone()),
-    );
+            .map(|(choice, _)| choice.clone())
+            .collect();
+        let fragment = printed_color_carriers
+            .iter()
+            .map(|(_, source)| *source)
+            .collect::<Vec<_>>()
+            .join(" ");
+        inject_printed_color_choice_filter(&mut result, &printed, &fragment);
+    }
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains
     // protection/hexproof from the color of your choice" grant so the source
     // carries a chosen color for the layer applier to bake in.

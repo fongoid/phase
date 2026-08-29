@@ -29588,11 +29588,13 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 ///     change neither closes it nor makes it worse — it is named here so the
 ///     class scope is not overstated.
 ///
-/// CENSUS PROVENANCE — this is an ASSUMPTION carrying a measurement date, not
-/// an invariant, and it is what makes the `find_map` collapse in `assembly.rs`
-/// unreachable. "Exactly 4 faces" was measured against the MTGJSON pool whose
-/// tracked vintage sidecar `crates/engine/data/mtgjson-vintage` reads
-/// **2026-08-27**. Re-measure rather than trusting the constant:
+/// CENSUS PROVENANCE — a measurement carrying a DATE, not an invariant. No
+/// correctness argument rests on it any more: a chain that prints the qualifier
+/// more than once is REFUSED rather than collapsed (see the ARITY CONTRACT
+/// below), so the census records only which arm today's pool takes.
+/// RE-MEASURED **2026-08-29** against the MTGJSON pool whose tracked vintage
+/// sidecar `crates/engine/data/mtgjson-vintage` reads **2026-08-28**.
+/// Re-measure rather than trusting the constant:
 ///
 /// ```text
 /// jq -r '.data | to_entries[] | .value[]
@@ -29613,6 +29615,32 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// built: it would require a test that loads the full export, which
 /// `scripts/check-test-card-data-load.sh` forbids for newly added test code.
 /// Hence the census is documented with a date rather than pinned by a test.
+///
+/// ARITY CONTRACT — `printed` is EVERY surviving carrier in the chain, in
+/// printed order, never just the first one found:
+///
+///   * **none** — no clause declared the provenance: no-op.
+///   * **one** — the live case (Wash Out, Root Greevil): wrap, subject to the
+///     already-a-colour-choice guard below.
+///   * **two or more** — CR 607.2d: each printed "of the color of your choice"
+///     is its OWN choice, linked to its own filter. One injected chooser writes
+///     ONE `ChosenAttribute::Color`, and both `game/filter.rs` readers take the
+///     FIRST one, so a single wrap would bind BOTH stamped filters to the FIRST
+///     answer and silently discard the second — with no `Effect::Unimplemented`
+///     and no parse warning. The parser cannot model that shape until follow-up
+///     **F6** gives each carrying clause its own wrap at its own node, so the
+///     chain is REFUSED here: the definition becomes
+///     `Effect::unimplemented("multiple_printed_color_choices", …)`, the single
+///     authority for "the parser could not handle this". Coverage goes red for
+///     the card and the misparse backlog picks it up, instead of a
+///     wrong-but-green resolution. Refusing the CHAIN rather than the carrying
+///     CLAUSE is forced by the same head-vs-clause seam F6 closes: by the time
+///     the lowered tree reaches this injector it can no longer be addressed per
+///     clause (see the LIMITATION below).
+///
+/// The multi-carrier arm is unreachable from card text today — the census above
+/// is what says so — so it is pinned synthetically by
+/// `two_printed_color_choices_in_one_chain_are_refused_not_collapsed`.
 ///
 /// CR 608.2c LIMITATION, stated rather than hidden: the wrap is applied to the
 /// CHAIN HEAD. Both cards at THIS seam are single-clause chains, so head ==
@@ -29657,23 +29685,45 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 /// forms in one chain, so this is unreachable today; pinned by `V-DOUBLE`.
 pub(crate) fn inject_printed_color_choice_filter(
     def: &mut AbilityDefinition,
-    printed: Option<ChoiceType>,
+    printed: &[ChoiceType],
+    fragment: &str,
 ) {
-    // Both guards here are explicit and independent: the DECLARED provenance
-    // must be a colour choice, and the head must not already BE a colour choice.
-    // The third — "the parser refused this clause" — is deliberately NOT here:
-    // it is applied to the carrying clause at the provenance selection in
-    // `assembly.rs`, per this function's doc.
-    if matches!(printed, Some(ChoiceType::Color { .. }))
-        && !matches!(
-            &*def.effect,
-            Effect::Choose {
-                choice_type: ChoiceType::Color { .. },
-                ..
+    match printed {
+        // No clause declared the provenance.
+        [] => {}
+        // THE LIVE CASE. Both guards here are explicit and independent: the
+        // DECLARED provenance must be a colour choice, and the head must not
+        // already BE a colour choice. The third — "the parser refused this
+        // clause" — is deliberately NOT here: it is applied to the carrying
+        // clause at the provenance selection in `assembly.rs`, per this
+        // function's doc.
+        [ChoiceType::Color { .. }] => {
+            if !matches!(
+                &*def.effect,
+                Effect::Choose {
+                    choice_type: ChoiceType::Color { .. },
+                    ..
+                }
+            ) {
+                wrap_in_color_choice(def);
             }
-        )
-    {
-        wrap_in_color_choice(def);
+        }
+        // A lone declared provenance that is not a COLOUR choice cannot arise
+        // today — `oracle_target.rs` stamps `ChoiceType::color()` and nothing
+        // else — and modelling some other printed choice is not this injector's
+        // job. Left explicit rather than folded into the wrap arm so the two
+        // cases stay distinguishable if a sibling qualifier is ever added.
+        [_] => {}
+        // CR 607.2d: two or more printed colour choices in one chain. Refuse
+        // honestly instead of collapsing them onto one chooser — see the ARITY
+        // CONTRACT on this function.
+        _ => {
+            let kind = def.kind;
+            *def = AbilityDefinition::new(
+                kind,
+                Effect::unimplemented("multiple_printed_color_choices", fragment),
+            );
+        }
     }
 }
 

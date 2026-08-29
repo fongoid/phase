@@ -57032,6 +57032,12 @@ fn all_card_defs(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<&Abilit
     out
 }
 
+/// True when THIS node is a colour chooser — the
+/// `Effect::Choose { ChoiceType::Color, .. }` whose `persist` write is the only
+/// thing `FilterProp::IsChosenColor`'s fail-closed read can bind against
+/// (CR 105.4 + CR 607.2d). Deliberately node-local: the tests below distinguish
+/// "the wrap is at the chain HEAD" from "a chooser exists somewhere in the
+/// tree", and only [`collect_defs`] supplies the second.
 fn is_color_choice(def: &AbilityDefinition) -> bool {
     matches!(
         &*def.effect,
@@ -57042,11 +57048,23 @@ fn is_color_choice(def: &AbilityDefinition) -> bool {
     )
 }
 
+/// True when THIS node is an honest parser refusal. Every test below counts
+/// these: a clause that lowers to `Effect::Unimplemented` is visible to coverage
+/// and to the misparse backlog, so counting them is how these tests assert that
+/// no silent misparse is hiding behind a green assertion.
 fn is_unimplemented_def(def: &AbilityDefinition) -> bool {
     matches!(&*def.effect, Effect::Unimplemented { .. })
 }
 
 /// Structural (never string-scanning) check for `FilterProp::IsChosenColor`.
+///
+/// EXHAUSTIVE by construction: no `_ => false` fallback, so a new `TargetFilter`
+/// variant that nests another filter is a COMPILE ERROR here rather than a
+/// silent hole in the `V-PAIR` pairing invariant below. That is not
+/// hypothetical — writing it out is what surfaced `TrackedSetFiltered` and
+/// `ChosenDamageSource`, two nesting variants the previous wildcard skipped.
+/// The 50 leaf variants in the final arm carry no nested filter at all, so
+/// `false` is their answer, not a default.
 fn filter_has_chosen_color(f: &TargetFilter) -> bool {
     match f {
         TargetFilter::Typed(tf) => tf
@@ -57057,7 +57075,60 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         TargetFilter::Or { filters } | TargetFilter::And { filters } => {
             filters.iter().any(filter_has_chosen_color)
         }
-        _ => false,
+        TargetFilter::TrackedSetFiltered { filter, .. } => filter_has_chosen_color(filter),
+        TargetFilter::ChosenDamageSource { filter } => {
+            filter.as_deref().is_some_and(filter_has_chosen_color)
+        }
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SourceController
+        | TargetFilter::ControllerAndControlledPermanents { .. }
+        | TargetFilter::Opponent
+        | TargetFilter::SelfRef
+        | TargetFilter::GrantingObject
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
+        | TargetFilter::ChosenCard
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::OriginalSource
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => false,
     }
 }
 
@@ -57069,6 +57140,16 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
 ///     phrase reaches on Prismatic Strands. Included so the pairing detector
 ///     below is a real invariant over the whole printed slice rather than over
 ///     the one arm this change touched.
+///
+/// EXHAUSTIVE by construction, for the same reason as
+/// [`filter_has_chosen_color`]: a NEW `Effect` variant carrying a filter slot
+/// must be a COMPILE ERROR here, not a silent hole in `V-PAIR`. `Effect` has 232
+/// variants; the 228 in the final arm answer `false` because no parser route
+/// stamps `FilterProp::IsChosenColor` into them — `parse_type_phrase_with_ctx`'s
+/// printed-qualifier arm reaches the three mass-effect object filters, and the
+/// prevention route reaches `damage_source_filter`. That is a decision on each
+/// listed variant, and the compiler now forces the same decision on every
+/// variant added after it.
 fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
     match effect {
         Effect::BounceAll { target, .. }
@@ -57080,10 +57161,244 @@ fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
         } => damage_source_filter
             .as_ref()
             .is_some_and(filter_has_chosen_color),
-        _ => false,
+        Effect::StartYourEngines { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::EachSourceDealsDamage { .. }
+        | Effect::Draw { .. }
+        | Effect::Pump { .. }
+        | Effect::PairWith { .. }
+        | Effect::Destroy { .. }
+        | Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
+        | Effect::Counter { .. }
+        | Effect::CounterAll { .. }
+        | Effect::Token { .. }
+        | Effect::GainLife { .. }
+        | Effect::LoseLife { .. }
+        | Effect::SetTapState { .. }
+        | Effect::RemoveCounter { .. }
+        | Effect::Sacrifice { .. }
+        | Effect::DiscardCard { .. }
+        | Effect::Mill { .. }
+        | Effect::Scry { .. }
+        | Effect::PumpAll { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::ChangeZone { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::Dig { .. }
+        | Effect::GainControl { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::Attach { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Surveil { .. }
+        | Effect::Fight { .. }
+        | Effect::Bounce { .. }
+        | Effect::Explore
+        | Effect::ExploreAll { .. }
+        | Effect::Investigate
+        | Effect::Tribute { .. }
+        | Effect::TimeTravel
+        | Effect::BecomeMonarch { .. }
+        | Effect::NoOp
+        | Effect::Proliferate
+        | Effect::ProliferateTarget { .. }
+        | Effect::Populate
+        | Effect::Clash
+        | Effect::Behold { .. }
+        | Effect::EndTheTurn
+        | Effect::EndCombatPhase
+        | Effect::Vote { .. }
+        | Effect::SeparateIntoPiles { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::CopySpell { .. }
+        | Effect::EpicCopy { .. }
+        | Effect::CastCopyOfCard { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::Myriad
+        | Effect::Encore
+        | Effect::CombineHost { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::Meld { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::HideawayConceal { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::ChoosePermanent { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::PutCounter { .. }
+        | Effect::ChooseCounterKind { .. }
+        | Effect::PutChosenCounter { .. }
+        | Effect::PutCounterAll { .. }
+        | Effect::MultiplyCounter { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::DoublePT { .. }
+        | Effect::DoublePTAll { .. }
+        | Effect::MoveCounters { .. }
+        | Effect::ReproduceEventCounters { .. }
+        | Effect::Animate { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::GenericEffect { .. }
+        | Effect::Cleanup { .. }
+        | Effect::Mana { .. }
+        | Effect::Discard { .. }
+        | Effect::Shuffle { .. }
+        | Effect::Transform { .. }
+        | Effect::FlipPermanent { .. }
+        | Effect::SearchLibrary { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealChosenNumbers { .. }
+        | Effect::RevealTop { .. }
+        | Effect::ExileTop { .. }
+        | Effect::ExileFaceDownPile { .. }
+        | Effect::TargetOnly { .. }
+        | Effect::Choose { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::Connive { .. }
+        | Effect::PhaseOut { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::ForceBlock { .. }
+        | Effect::ForceAttack { .. }
+        | Effect::SolveCase
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::PayCost { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::FreeCastFromZones { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::LoseTheGame { .. }
+        | Effect::WinTheGame { .. }
+        | Effect::RollDie { .. }
+        | Effect::FlipCoin { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::RingTemptsYou
+        | Effect::VentureIntoDungeon
+        | Effect::VentureInto { .. }
+        | Effect::TakeTheInitiative
+        | Effect::ArrangePlanarDeckTop { .. }
+        | Effect::Planeswalk
+        | Effect::ChaosEnsues
+        | Effect::ReverseTurnOrder
+        | Effect::RedistributeLifeTotals
+        | Effect::OpenAttractions { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::CrankContraptions { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::ProcessRadCounters
+        | Effect::GrantCastingPermission { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::RememberCard { .. }
+        | Effect::NoteManaSpent
+        | Effect::ForEachCategory { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::EachPlayerCopyChosen { .. }
+        | Effect::Exploit { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GivePlayerCounter { .. }
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::Discover { .. }
+        | Effect::Heist { .. }
+        | Effect::HeistExile
+        | Effect::Cascade
+        | Effect::Ripple { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::GiftDelivery { .. }
+        | Effect::Goad { .. }
+        | Effect::GoadAll { .. }
+        | Effect::Detain { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::ExchangeControl { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Cloak { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::ExtraTurn { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::SkipNextTurn { .. }
+        | Effect::SkipNextStep { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::Double { .. }
+        | Effect::RuntimeHandled { .. }
+        | Effect::Incubate { .. }
+        | Effect::Amass { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Specialize
+        | Effect::Renown { .. }
+        | Effect::Bolster { .. }
+        | Effect::Adapt { .. }
+        | Effect::Learn
+        | Effect::Forage
+        | Effect::CompletePlayerAction { .. }
+        | Effect::Harness
+        | Effect::CollectEvidence { .. }
+        | Effect::Endure { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Seek { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExchangeLifeTotals { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::GiveControl { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
+        | Effect::Conjure { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::Intensify { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::Unimplemented { .. } => false,
     }
 }
 
+/// True when ANY node of `def`'s lowered tree stamps
+/// `FilterProp::IsChosenColor`.
+///
+/// This is the POSITIVE REACH-GUARD the negative assertions below depend on: it
+/// proves the printed qualifier was actually consumed by the parser, so an
+/// assertion like "no second colour prompt was raised" cannot pass merely
+/// because the qualifier was never recognized in the first place.
 fn tree_has_is_chosen_color(def: &AbilityDefinition) -> bool {
     let mut nodes = Vec::new();
     collect_defs(def, &mut nodes);
@@ -57593,6 +57908,93 @@ fn printed_color_choice_is_not_double_wrapped_over_an_existing_color_choice() {
         injected_persists,
         vec![true],
         "the injected chooser must persist: {injected:#?}"
+    );
+}
+
+/// V-MULTI (SHAPE) — CR 607.2d + CR 608.2c. TWO clauses in ONE chain that each
+/// print "of the color of your choice" print TWO INDEPENDENT choices, each
+/// linked to its own filter.
+///
+/// One injected chooser writes ONE `ChosenAttribute::Color` and both
+/// `game/filter.rs` readers take the FIRST, so binding both stamped filters to
+/// a single wrap would silently discard the second printed choice — no
+/// `Effect::Unimplemented`, no parse warning, coverage still green. The parser
+/// cannot model the shape until follow-up **F6** wraps each carrying clause at
+/// its own node, so `inject_printed_color_choice_filter` REFUSES the chain
+/// instead of collapsing it.
+///
+/// Unreachable from card text — the census on that function (re-measured
+/// 2026-08-29 against the 2026-08-28 pool) finds the printed form on 4 faces,
+/// with no ability line printing it twice — so the fixture is synthetic. It
+/// exists because "unreachable today" is not a fix: this is the test that fails
+/// if the provenance selection in `assembly.rs` ever regresses to a first-wins
+/// `find_map`.
+#[test]
+fn two_printed_color_choices_in_one_chain_are_refused_not_collapsed() {
+    const TEXT: &str = "Return all permanents of the color of your choice to their owners' \
+                        hands. Destroy all enchantments of the color of your choice.";
+
+    let ir = parse_effect_chain_ir(TEXT, AbilityKind::Spell, &mut ParseContext::default());
+    // REACH-GUARD (a): the fixture really does reach the multi-carrier arm —
+    // TWO clauses survive the `Unimplemented` filter AND declare the printed
+    // provenance. Without this the refusal below could just as well be an
+    // ordinary parse failure of the second sentence.
+    let carriers: Vec<_> = ir
+        .clauses
+        .iter()
+        .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
+        .filter(|clause| matches!(clause.printed_color_choice, Some(ChoiceType::Color { .. })))
+        .collect();
+    assert_eq!(
+        carriers.len(),
+        2,
+        "the fixture must produce TWO surviving printed-colour carriers: {ir:#?}"
+    );
+    // REACH-GUARD (b): each carrier stamped `IsChosenColor` into its OWN filter,
+    // so both really are filters that would need a chooser of their own.
+    for carrier in &carriers {
+        assert!(
+            effect_filter_has_chosen_color(&carrier.parsed.effect),
+            "each carrying clause must stamp IsChosenColor: {:?}",
+            carrier.parsed.effect
+        );
+    }
+
+    let def = parse_effect_chain(TEXT, AbilityKind::Spell);
+    let mut nodes = Vec::new();
+    collect_defs(&def, &mut nodes);
+    // THE ASSERTION THAT FLIPS if the selection regresses to first-wins: the
+    // chain is an honest refusal, not a shared chooser over two filters.
+    assert!(
+        is_unimplemented_def(&def),
+        "a chain printing TWO colour choices must be refused, not collapsed: {def:#?}"
+    );
+    assert_eq!(
+        nodes.iter().filter(|d| is_color_choice(d)).count(),
+        0,
+        "no chooser may be injected for a shape the parser refused: {def:#?}"
+    );
+    // The refusal must not leave a stamped-but-unbindable filter behind either —
+    // that is exactly the fail-closed match-NOTHING state `V-PAIR` detects.
+    assert!(
+        !tree_has_is_chosen_color(&def),
+        "a refused chain must carry no orphaned IsChosenColor: {def:#?}"
+    );
+
+    // POSITIVE TWIN, same test: with ONE carrier the injector still wraps, so
+    // the refusal above is driven by ARITY and is not the injector silently
+    // doing nothing on this text shape.
+    let single = parse_effect_chain(
+        "Return all permanents of the color of your choice to their owners' hands.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        is_color_choice(&single),
+        "one carrier still gets its chooser: {single:#?}"
+    );
+    assert!(
+        tree_has_is_chosen_color(&single),
+        "one carrier still stamps its filter: {single:#?}"
     );
 }
 

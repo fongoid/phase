@@ -1176,6 +1176,18 @@ impl ClauseDraft<'_> {
         self.target_chooser = v;
         self
     }
+    /// CR 105.4 + CR 608.2c: declare that THIS clause's text printed its own
+    /// colour choice ("… of the color of your choice").
+    ///
+    /// The only writer is the chain chunk loop, lifting
+    /// `ParseContext::pending_printed_color_choice` immediately after the chunk
+    /// parses. Setting it here is what licenses `assemble_effect_chain` to
+    /// inject the matching `Effect::Choose(Color)`; the injector reads THIS
+    /// declared provenance and never a shape scan of the lowered tree, so a
+    /// clause that stamped `FilterProp::IsChosenColor` and a clause that gets a
+    /// chooser are the same clause by construction. Leaving it `None` on a
+    /// clause that did stamp the filter yields a fail-closed, match-NOTHING
+    /// filter with no `Effect::Unimplemented` and no parse warning.
     pub(crate) fn printed_color_choice(mut self, v: Option<ChoiceType>) -> Self {
         self.printed_color_choice = v;
         self
