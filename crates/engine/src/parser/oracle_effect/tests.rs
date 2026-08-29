@@ -57594,6 +57594,8 @@ fn printed_color_choice_is_not_double_wrapped_over_an_existing_color_choice() {
         vec![true],
         "the injected chooser must persist: {injected:#?}"
     );
+}
+
 /// CR 700.4 + CR 701.20a + CR 202.3 + CR 608.2c + CR 603.3b: Part in
 /// Friendship (HOB) — "Whenever a nontoken creature you control dies, reveal
 /// cards from the top of your library until you reveal a creature card. If
