@@ -29460,6 +29460,45 @@ fn collapse_ephemeral_color_choice_mana(def: &mut AbilityDefinition) {
 /// Moves `def`'s current effect under a freshly injected colour choice. Any
 /// existing `sub_ability` chain rides along beneath the displaced effect so
 /// downstream effects still resolve after it.
+///
+/// CR 608.2c LIMITATION — stated rather than silently inherited: the wrap moves
+/// ONLY `effect` and any prior `sub_ability`. The `std::mem::replace` below
+/// swaps just the effect, and the displaced ability is rebuilt with
+/// `AbilityDefinition::new`, which DEFAULTS every other slot — so a DECORATED
+/// chain head (one carrying `condition`, `optional`, `optional_for`, or
+/// `duration`) leaves those slots behind on the injected `Effect::Choose`
+/// instead of moving them down with the displaced effect. A leading condition
+/// would then gate the PROMPT while the effect it was printed to guard became
+/// unconditional; a "you may" would make the CHOICE optional rather than the
+/// effect; a duration would attach to the chooser.
+///
+/// This is PRE-EXISTING behaviour shared with the keyword-grant injector, not a
+/// regression introduced by the printed-filter one: it is exactly what
+/// `inject_chosen_color_choice_grant` has always done. Mother of Runes' lowered
+/// snapshot shows it directly — the ability-level `duration: UntilEndOfTurn`
+/// ends up on the injected `Choose(Color)` node, and the displaced grant's own
+/// ability-level `duration` is `null`. It is not OBSERVABLE there, because what
+/// actually bounds the protection is the grant's own effect-level `duration` on
+/// the `GenericEffect`. The misplaced ability-level slot is not ignored — it is
+/// still threaded onto the resolved chooser by `build_resolved_from_def`
+/// (`game/ability_utils.rs`) — it simply has nothing to bound on a resolved
+/// `Choose`. What is new is only the EXPOSURE: this function is now the single
+/// authority and is applied to an arbitrary chain head.
+///
+/// So the stranding itself is REACHED today (Mother of Runes), but it is
+/// HARMLESS at both live seams, and no card reaches the harmful shape — a head
+/// whose `condition` / `optional` / `optional_for` genuinely gates the displaced
+/// effect. At the printed-filter seam specifically the printed slice is 4 card
+/// faces (census with its measurement date on
+/// `inject_printed_color_choice_filter` below), and both faces at the
+/// object-filter seam are bare single-clause chains whose head carries no
+/// condition, no `optional`, and no `duration` at all.
+///
+/// The field-moving behaviour is deliberately NOT changed here. Relocating
+/// those slots would be a real behaviour change needing its own regression
+/// proof, and follow-up **F6** supersedes it: F6 moves the wrap off the chain
+/// head onto the carrying clause's OWN node, which removes the decorated-head
+/// case rather than patching around it.
 fn wrap_in_color_choice(def: &mut AbilityDefinition) {
     let displaced_effect = std::mem::replace(
         &mut def.effect,
@@ -29512,10 +29551,41 @@ fn wrap_in_color_choice(def: &mut AbilityDefinition) {
 ///     change neither closes it nor makes it worse — it is named here so the
 ///     class scope is not overstated.
 ///
+/// CENSUS PROVENANCE — this is an ASSUMPTION carrying a measurement date, not
+/// an invariant, and it is what makes the `find_map` collapse in `assembly.rs`
+/// unreachable. "Exactly 4 faces" was measured against the MTGJSON pool whose
+/// tracked vintage sidecar `crates/engine/data/mtgjson-vintage` reads
+/// **2026-08-27**. Re-measure rather than trusting the constant:
+///
+/// ```text
+/// jq -r '.data | to_entries[] | .value[]
+///        | select((.text // "") | test("of the color of your choice"))
+///        | (.faceName // .name)' data/mtgjson/AtomicCards.json | sort -u
+/// ```
+///
+/// Reading that output: Avacyn prints the phrase TWICE, but across two SEPARATE
+/// activated abilities — two chains, one occurrence each — which is why "no face
+/// prints it twice in ONE chain" still holds. Swap the projection for
+/// `[match("of the color of your choice";"g")] | length` per face to see the raw
+/// counts, then split by ability line before concluding anything about chains.
+///
+/// Nothing FAILS if a future set prints a fifth face. `V-PAIR`
+/// (`chosen_color_filter_is_always_paired_with_a_color_chooser`) enumerates
+/// these faces by LITERAL Oracle text, so a new card is invisible to it. The
+/// alternative — a drift guard over the full card export — is deliberately NOT
+/// built: it would require a test that loads the full export, which
+/// `scripts/check-test-card-data-load.sh` forbids for newly added test code.
+/// Hence the census is documented with a date rather than pinned by a test.
+///
 /// CR 608.2c LIMITATION, stated rather than hidden: the wrap is applied to the
 /// CHAIN HEAD. Both cards at THIS seam are single-clause chains, so head ==
 /// clause for both; for a hypothetical later-clause case the prompt would be
 /// raised earlier than printed. Pinned by the `V-ORDER` test; follow-up F6.
+/// The same head-vs-clause seam has a second consequence at the node level:
+/// `wrap_in_color_choice` moves only `effect` and the prior `sub_ability`, so a
+/// DECORATED head would strand `condition` / `optional` / `optional_for` /
+/// `duration` on the chooser — see that function's own LIMITATION paragraph for
+/// why it is pre-existing, unreachable here, and closed by the same F6.
 ///
 /// Skipped when the parser REFUSED the clause that would have declared the
 /// provenance: a clause the parser refused must not raise a prompt for

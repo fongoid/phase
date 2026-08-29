@@ -3226,6 +3226,26 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // printed form appears on 4 card faces and none prints it twice in one chain
     // — and closed by F6, which gives each carrying clause its own wrap at its
     // own node.
+    //
+    // That census is the WHOLE safety argument for this collapse, and it is an
+    // assumption with a measurement DATE, not an invariant. It was measured
+    // against the MTGJSON pool whose tracked vintage sidecar
+    // `crates/engine/data/mtgjson-vintage` reads 2026-08-27. Re-measure rather
+    // than trusting the constant:
+    //
+    //   jq -r '.data | to_entries[] | .value[]
+    //          | select((.text // "") | test("of the color of your choice"))
+    //          | (.faceName // .name)' data/mtgjson/AtomicCards.json | sort -u
+    //
+    // Nothing FAILS if a future set prints a fifth face: `V-PAIR`
+    // (`chosen_color_filter_is_always_paired_with_a_color_chooser`) enumerates
+    // these faces by LITERAL Oracle text, so a new card is invisible to it. A
+    // drift guard over the full card export is deliberately NOT built — it would
+    // require a test that loads the full export, which
+    // `scripts/check-test-card-data-load.sh` forbids for newly added test code.
+    // The full census, including why Avacyn's two printed occurrences sit in two
+    // SEPARATE activated abilities and so do not violate "twice in one chain",
+    // is on `inject_printed_color_choice_filter`.
     inject_printed_color_choice_filter(
         &mut result,
         ir.clauses
