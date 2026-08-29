@@ -65,6 +65,17 @@ pub(crate) enum TriggerConditionScope {
 ///      alternative, and the shape already used elsewhere in this file's
 ///      neighbourhood, is to run against a clone and commit with
 ///      `*ctx = tentative_ctx` only on success.
+///
+///      AUDIT, so the next reader inherits it rather than re-deriving it: one
+///      site structurally matches this half — `parse_leading_subject_application`
+///      (`oracle_effect/subject.rs`), which is called with the real `chunk_ctx`
+///      and can abandon its result. It is UNREACHABLE for this hazard: it
+///      extracts the SUBJECT phrase, and the printed qualifier is only ever
+///      consumed off an object filter in predicate position (no card in the pool
+///      prints "of the color of your choice" in subject position). Left unedited
+///      deliberately; revisit if a subject-position printed qualifier ever
+///      appears. No other site runs a speculative sub-parse against the real
+///      `&mut ctx` while this gate is `ChainBound`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ChosenColorQualifierScope {
     /// Default, and the value every `ParseContext::default()` carries — which
@@ -74,8 +85,10 @@ pub(crate) enum ChosenColorQualifierScope {
     Unbound,
     /// An effect-chain chunk parse. This is the SINGLE context that both opens
     /// this channel and reads `pending_printed_color_choice` back
-    /// (`oracle_effect/mod.rs`: the chunk-ctx literal and the three `.push()`
-    /// sites), so "consumed" and "supplied" are one decision made in one place.
+    /// (`oracle_effect/mod.rs`: the chunk-ctx literal and the chunk loop's
+    /// `.push()` sites), so "consumed" and "supplied" are one decision made in
+    /// one place. Phrased by role rather than by count so it cannot go stale
+    /// when the loop grows another emit arm.
     ChainBound,
 }
 

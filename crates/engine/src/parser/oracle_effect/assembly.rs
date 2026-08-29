@@ -3210,10 +3210,27 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // per-clause provenance, never on a shape scan. Runs BEFORE the keyword-grant
     // injector so that injector's `Effect::Choose{Color}` recursion guard
     // (`child_under_color_choice`) sees this wrap and cannot double-prompt.
+    //
+    // The "a clause the parser refused must not raise a prompt for semantics it
+    // did not model" guard lives HERE, on the clause that DECLARED the
+    // provenance, not on the chain head the wrap lands on: a head != carrier
+    // chain (head refused, a LATER clause printed the qualifier) would otherwise
+    // lose its chooser while still stamping `FilterProp::IsChosenColor` — a
+    // fail-closed match-NOTHING filter with no `Effect::Unimplemented` and no
+    // parse warning.
+    //
+    // CR 608.2c LIMITATION (follow-up F6): `find_map` takes the FIRST surviving
+    // carrier, so a chain that printed the qualifier TWICE would collapse both
+    // filters onto one shared chooser and one `ChosenAttribute::Color`, where
+    // each printed choice is its own choice. Unreachable on the pool — the
+    // printed form appears on 4 card faces and none prints it twice in one chain
+    // — and closed by F6, which gives each carrying clause its own wrap at its
+    // own node.
     inject_printed_color_choice_filter(
         &mut result,
         ir.clauses
             .iter()
+            .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
             .find_map(|clause| clause.printed_color_choice.clone()),
     );
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains

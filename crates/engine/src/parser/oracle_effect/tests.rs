@@ -57020,24 +57020,37 @@ fn anaphor_color_cards_are_unchanged_by_the_printed_qualifier_arm() {
     }
 }
 
-/// V-UNIMPL (SHAPE) — the head-node `Effect::Unimplemented` guard fires on the
-/// branch it claims to.
+/// V-UNIMPL (SHAPE) — the `Effect::Unimplemented` guard is applied to the
+/// CARRYING clause, not to the chain head.
 ///
 /// The fixture must be MULTI-CLAUSE: a single-clause refusal cannot reach the
-/// guard, because if the head clause lowered to `Unimplemented` then
+/// guard, because if the clause lowered to `Unimplemented` then
 /// `parse_type_phrase_with_ctx` generally never ran on it, so
 /// `printed_color_choice` is `None` and the injector's `Some(_) | None` arm is
-/// taken instead — indistinguishable from the guard firing.
+/// taken instead — indistinguishable from the guard firing. That same argument
+/// is why the guard's own negative arm (the CARRIER itself refused, so
+/// `assembly.rs` filters it out and no chooser is injected) has no constructible
+/// fixture: consuming the printed qualifier is what stamps the provenance in the
+/// first place. The arm is retained as fail-closed defence, not as live
+/// behaviour, and is asserted here only through the positive it gates.
+///
+/// This fixture is a head ≠ carrier chain: the HEAD is refused and a LATER
+/// clause printed the qualifier. The chooser IS injected, because the guard's
+/// subject is the clause that DECLARED the provenance and that clause parsed
+/// fine. Testing the chain head instead (the pre-fix behaviour) left the
+/// carrier's `FilterProp::IsChosenColor` with nothing to bind against — a
+/// fail-closed, match-NOTHING filter with no `Effect::Unimplemented` of its own
+/// and no parse warning.
 #[test]
-fn head_unimplemented_suppresses_the_printed_color_choice_injection() {
+fn a_refused_head_still_gets_the_carrying_clauses_printed_color_choice() {
     const TEXT: &str = "Lose life equal to the total mana value of those cards. Return all \
                         permanents of the color of your choice to their owners' hands.";
 
     let ir = parse_effect_chain_ir(TEXT, AbilityKind::Spell, &mut ParseContext::default());
 
-    // RG (b): the IR proves the guard branch is the one taken — a LATER clause
-    // declared the printed provenance, so `printed` reached the injector as
-    // `Some(Color)`.
+    // RG (b): the IR proves the head != carrier branch is the one taken — a
+    // LATER clause declared the printed provenance, so `printed` reached the
+    // injector as `Some(Color)`.
     let carrier_index = ir
         .clauses
         .iter()
@@ -57048,32 +57061,52 @@ fn head_unimplemented_suppresses_the_printed_color_choice_injection() {
         "the carrier must be a LATER clause than the refused head, got index 0"
     );
     let carrier = &ir.clauses[carrier_index];
-    // RG (c): that clause's own filter really does carry IsChosenColor.
+    // RG (c): that clause's own filter really does carry IsChosenColor, and the
+    // clause itself is NOT what the parser refused — so it survives the
+    // `Unimplemented` filter that `assembly.rs` applies to the provenance scan.
     assert!(
         effect_filter_has_chosen_color(&carrier.parsed.effect),
         "the carrying clause's filter must stamp IsChosenColor: {:?}",
+        carrier.parsed.effect
+    );
+    assert!(
+        !matches!(carrier.parsed.effect, Effect::Unimplemented { .. }),
+        "the CARRYING clause must be one the parser accepted: {:?}",
         carrier.parsed.effect
     );
 
     let def = parse_effect_chain(TEXT, AbilityKind::Spell);
     let mut nodes = Vec::new();
     collect_defs(&def, &mut nodes);
-    // RG (a): exactly one honest refusal, and it is the HEAD.
+    // RG (a): exactly one honest refusal, and it is still the refused head
+    // clause — now displaced one level down by the injected wrap.
     assert_eq!(
         nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
         1,
-        "the head clause must stay an honest single Unimplemented: {def:#?}"
+        "the refused clause must stay an honest single Unimplemented: {def:#?}"
     );
-    assert!(
-        is_unimplemented_def(&def),
-        "the HEAD is the refused clause: {:?}",
-        def.effect
-    );
-    // THE NEGATIVE: no prompt is raised for semantics the parser refused.
+    // THE POSITIVE, and the assertion that flips if this change is reverted:
+    // the chooser is supplied for the clause that printed it, so the carrier's
+    // stamped filter has something to bind against.
     assert_eq!(
         nodes.iter().filter(|d| is_color_choice(d)).count(),
-        0,
-        "a refused head must not raise a colour prompt: {def:#?}"
+        1,
+        "the carrying clause's printed choice must be supplied: {def:#?}"
+    );
+    assert!(
+        tree_has_is_chosen_color(&def),
+        "the mass bounce filter must stamp IsChosenColor: {def:#?}"
+    );
+    // SHAPE, per the still-open F6 chain-head limitation: the wrap lands on the
+    // chain HEAD, so the refused clause rides directly beneath the chooser.
+    assert!(
+        is_color_choice(&def),
+        "the wrap is at the chain HEAD (F6): {:?}",
+        def.effect
+    );
+    assert!(
+        def.sub_ability.as_deref().is_some_and(is_unimplemented_def),
+        "the refused head is displaced directly under the chooser: {def:#?}"
     );
 
     // POSITIVE TWIN, same test: the single-clause card DOES get its chooser.

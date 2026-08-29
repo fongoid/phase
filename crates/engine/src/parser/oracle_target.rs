@@ -7463,7 +7463,8 @@ fn parse_shared_quality_reference<'a>(
     }
 
     if let Ok((rest, ())) = parse_word_bounded(input, "it") {
-        // CR 105.4: throwaway — only the resolved filter is kept.
+        // Throwaway (`ChosenColorQualifierScope` rule 1) — only the resolved
+        // filter is kept.
         let mut ctx_mut = ctx.clone_throwaway();
         return Ok((rest, resolve_pronoun_target(&mut ctx_mut, "it")));
     }
@@ -7479,7 +7480,8 @@ fn parse_shared_quality_reference<'a>(
     // ("a creature you control") still parses as its own filter below.
     for demonstrative in ["that creature", "that permanent", "that card", "that token"] {
         if let Ok((rest, ())) = parse_word_bounded(input, demonstrative) {
-            // CR 105.4: throwaway — only the resolved filter is kept.
+            // Throwaway (`ChosenColorQualifierScope` rule 1) — only the resolved
+            // filter is kept.
             let mut ctx_mut = ctx.clone_throwaway();
             return Ok((rest, resolve_pronoun_target(&mut ctx_mut, "it")));
         }
