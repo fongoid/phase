@@ -4039,12 +4039,9 @@ mod tests {
         assert!(matches!(
             qty,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::ManaValue,
-                    ..
-                }
-            }
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         ));
         assert!(rest.is_empty());
     }

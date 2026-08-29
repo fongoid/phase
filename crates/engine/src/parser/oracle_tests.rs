@@ -20089,17 +20089,23 @@ fn assert_abzan_greatest_toughness_gate(condition: &AbilityCondition) {
             comparator: Comparator::GE,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Toughness,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Toughness
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature] && population.controller.is_none()
     });
     assert!(
@@ -20664,17 +20670,23 @@ fn assert_controlled_creature_greatest_power_filter(filter: &TargetFilter) {
             comparator: Comparator::GE,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Power,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Power
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature]
             && population.properties.iter().any(|prop| {
                 matches!(

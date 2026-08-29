@@ -3307,6 +3307,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::None
         | TargetFilter::GrantingObject
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::TrackedSet { .. }

@@ -591,6 +591,8 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::LastRevealed => "last revealed".into(),
         TargetFilter::LastZoneChanged => "last zone changed".into(),
         TargetFilter::CostPaidObject => "cost-paid object".into(),
+        // CR 701.47c: matches `ObjectScope::AmassedArmy`'s description string.
+        TargetFilter::AmassedArmy => "amassed Army".into(),
         TargetFilter::ChosenCard => "last chosen card".into(),
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
@@ -1515,23 +1517,24 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             }
         }
         QuantityRef::SelfManaValue => "self mana value".into(),
-        QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        } => {
-            let func = match function {
+        QuantityRef::PropertyAggregate(aggregate) => {
+            let func = match aggregate.function() {
                 AggregateFunction::Max => "max",
                 AggregateFunction::Min => "min",
                 AggregateFunction::Sum => "total",
             };
-            let prop = match property {
+            let prop = match aggregate.property() {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
                 ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
-            format!("{func} {prop} of {}", fmt_target(filter))
+            let population = if matches!(aggregate.source(), CardTypeSetSource::TrackedSet { .. }) {
+                "those cards".into()
+            } else {
+                fmt_characteristic_population_bounded(aggregate.source())
+            };
+            format!("{func} {prop} of {population}")
         }
         QuantityRef::Devotion { colors } => match colors {
             crate::types::ability::DevotionColors::Fixed(colors) => {
@@ -1641,24 +1644,6 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::TrackedSetSize => "cards moved".into(),
         QuantityRef::FilteredTrackedSetSize { filter, .. } => {
             format!("filtered tracked set ({})", fmt_target(filter))
-        }
-        QuantityRef::TrackedSetAggregate {
-            function,
-            property,
-            source: _,
-        } => {
-            let func = match function {
-                AggregateFunction::Max => "max",
-                AggregateFunction::Min => "min",
-                AggregateFunction::Sum => "total",
-            };
-            let prop = match property {
-                ObjectProperty::Power => "power",
-                ObjectProperty::Toughness => "toughness",
-                ObjectProperty::ManaValue => "mana value",
-                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
-            };
-            format!("{func} {prop} of those cards")
         }
         QuantityRef::ExiledFromHandThisResolution => "cards exiled from hand this way".into(),
         QuantityRef::LifeLostThisTurn { player } => {
@@ -2383,7 +2368,7 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
         }
         CardTypeSetSource::ExiledBySource => "cards exiled with source".into(),
         CardTypeSetSource::Objects { filter } => fmt_target(filter),
-        CardTypeSetSource::TrackedSet { caused_by } => match caused_by {
+        CardTypeSetSource::TrackedSet { caused_by, .. } => match caused_by {
             Some(cause) => {
                 use crate::types::ability::ThisWayCause;
                 let verb = match cause {
@@ -3670,12 +3655,23 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             filter,
             kept_destination,
             rest_destination,
+            kept_destination_if,
             ..
         } => {
             d.push(("player".into(), fmt_target(player)));
             d.push(("until".into(), fmt_target(filter)));
             d.push(("kept".into(), format!("{:?}", kept_destination)));
             d.push(("rest".into(), format!("{:?}", rest_destination)));
+            // CR 202.3 + CR 608.2c: surface the card-property-driven destination
+            // branch (Part in Friendship) so coverage output distinguishes it
+            // from the unconditional `kept` default it repurposes as the
+            // "otherwise" zone.
+            if let Some((cond_filter, if_true_zone)) = kept_destination_if {
+                d.push((
+                    "kept if".into(),
+                    format!("{} -> {:?}", fmt_target(cond_filter), if_true_zone),
+                ));
+            }
         }
         Effect::Discover {
             mana_value_limit,
@@ -8441,7 +8437,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::BatchSource => ("BatchSourceManaSymbolsInManaCost", Handled),
         },
         QuantityRef::SelfManaValue => ("SelfManaValue", Handled),
-        QuantityRef::Aggregate { .. } => ("Aggregate", Handled),
+        QuantityRef::PropertyAggregate(_) => ("PropertyAggregate", Handled),
         QuantityRef::Devotion { .. } => ("Devotion", Handled),
         QuantityRef::DistinctCardTypes { .. } => ("DistinctCardTypes", Handled),
         QuantityRef::DistinctSubtypes { .. } => ("DistinctSubtypes", Handled),
@@ -8456,7 +8452,6 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::PreviousEffectCount => ("PreviousEffectCount", Handled),
         QuantityRef::TrackedSetSize => ("TrackedSetSize", Handled),
         QuantityRef::FilteredTrackedSetSize { .. } => ("FilteredTrackedSetSize", Handled),
-        QuantityRef::TrackedSetAggregate { .. } => ("TrackedSetAggregate", Handled),
         QuantityRef::ExiledFromHandThisResolution => ("ExiledFromHandThisResolution", Handled),
         QuantityRef::LifeLostThisTurn { .. } => ("LifeLostThisTurn", Handled),
         QuantityRef::EventContextAmount => ("EventContextAmount", Handled),

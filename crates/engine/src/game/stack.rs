@@ -65,6 +65,22 @@ pub(super) fn finish_resolving_stack_entry(
     }
 }
 
+/// Abandon the currently resolving family as one lifecycle unit. Prompt owners
+/// call this only after settling any events already completed by their cursor.
+pub(super) fn abandon_active_resolution_carrier(
+    state: &mut GameState,
+    disposition: super::lifecycle::DelayedTerminalDisposition,
+) {
+    super::priority::clear_priority_passes(state);
+    let _ = state
+        .clear_active_ability_continuation()
+        .expect("resolution abandonment cannot clear a buried ability continuation");
+    finish_resolving_stack_entry(state, disposition);
+    state.resolution_source_relatch = None;
+    state.deferred_entry_events.clear();
+    state.pending_token_battlefield_entry = None;
+}
+
 /// CR 405.1: Add an object to the stack.
 pub fn push_to_stack(state: &mut GameState, entry: StackEntry, events: &mut Vec<GameEvent>) {
     let trigger_firing = matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
