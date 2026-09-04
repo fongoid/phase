@@ -5171,11 +5171,13 @@ carrying `Protection(ChosenColor)` / `HexproofFrom(ChosenColor)`. The same
 "two simultaneously live grants both read the CURRENT answer" residual is
 STILL LIVE on two sibling axes that were deliberately left unlatched this
 round because the pool has no constructible two-simultaneously-live-grants
-member for either: `ProtectionTarget::ChosenCardType` (Serra's Emissary and
-True-Name Nemesis carry the grant on `statics`, so CR 611.3a exempts them;
-Guardian Archon is activate-once) and `ProtectionTarget::ChosenPlayer`. A
-future printing that repeats either grant in one turn reopens F10 for that
-axis specifically.
+member for either: `ProtectionTarget::ChosenCardType` (Serra's Emissary
+carries the grant on a `static_abilities` entry, so CR 611.3a exempts it) and
+`ProtectionTarget::ChosenPlayer` (True-Name Nemesis also carries the grant on
+a `static_abilities` entry, exempted the same way; Guardian Archon carries it
+on an activated ability instead, gated "Activate only once"). A future
+printing that repeats either grant in one turn reopens F10 for that axis
+specifically.
 
 **F14 — `mana_abilities.rs`'s own `ChosenAttribute::Color` retain is
 NARROWER than its comment claims, and must not be read as bounding the

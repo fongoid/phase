@@ -183,6 +183,25 @@ fn shield_has_color(
     }
 }
 
+/// Every `FilterProp::HasColor` colour recorded on a resolved prevention
+/// shield's `damage_source_filter`, in property order — the discriminating
+/// counterpart to `shield_has_color`. Unlike the plain boolean, a failed
+/// `assert_eq!` against this prints the actual colour set alongside the
+/// expected one instead of a bare `false`.
+fn shield_colors(shield: &engine::types::ability::ReplacementDefinition) -> Vec<ManaColor> {
+    match &shield.damage_source_filter {
+        Some(TargetFilter::Typed(tf)) => tf
+            .properties
+            .iter()
+            .filter_map(|p| match p {
+                FilterProp::HasColor { color } => Some(*color),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// S-3 — drive a run parked on repeated `NamedChoice` windows to completion,
 /// answering each one with `choice` and returning the number of windows it
 /// actually answered.
@@ -543,8 +562,9 @@ fn armored_guardian_two_recipients_keep_their_own_colors() {
 ///
 /// `/card-test` check 9 waiver: this test drives `game::effects::attach::attach_to`
 /// (a `pub` fn) directly rather than a cast — the repo's own idiom for
-/// attach-legality tests (`aspect_of_wolf_per_axis_xy.rs`,
-/// `graveyard_to_hand_activation_zone.rs`). U1's PRODUCTION half is covered by
+/// attach-legality tests (`aura_on_player.rs`, `aura_token_attach_guard.rs`,
+/// `archnemesis_you_attack_enchanted_player.rs`, `aspect_of_wolf_per_axis_xy.rs`,
+/// `aura_graft_enchant_restriction.rs`). U1's PRODUCTION half is covered by
 /// T1/T2, which drive real activations; this consumer has no cast-shaped
 /// entry point of its own.
 #[test]
@@ -990,11 +1010,9 @@ fn prismatic_strands_recast_on_the_same_object_prevents_its_own_color() {
     );
 
     // THE ASSERTION THAT FLIPS.
-    assert!(
-        shield_has_color(
-            &runner.state().pending_damage_replacements[1],
-            ManaColor::Blue
-        ),
+    assert_eq!(
+        shield_colors(&runner.state().pending_damage_replacements[1]),
+        vec![ManaColor::Blue],
         "CR 608.2d: cast 2's shield must filter its OWN colour, blue"
     );
 }
