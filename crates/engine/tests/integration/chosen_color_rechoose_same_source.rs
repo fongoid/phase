@@ -62,7 +62,7 @@
 //!   second answer).
 
 use engine::game::effects::attach::attach_to;
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameScenario, P0, P1};
 use engine::game::zones::move_to_zone;
 use engine::types::ability::{ChoiceType, ChosenAttribute, FilterProp, TargetFilter};
 use engine::types::game_state::WaitingFor;
@@ -1257,5 +1257,428 @@ fn floating_shield_sacrifice_grant_reads_the_as_enters_color() {
         chosen_colors(&runner, shield),
         vec![ManaColor::Blue],
         "the Aura must still hold exactly its as-enters answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T6 — CR 614.15 + CR 608.2d: a self-replacement override announces its OWN
+// choice.
+// ---------------------------------------------------------------------------
+
+/// Faith's Shield {W} Instant — verbatim (Scryfall-verified). The
+/// "Fateful hour — " ability word is part of the printed text.
+const FAITHS_SHIELD: &str =
+    "Target permanent you control gains protection from the color of your choice until end of \
+     turn.\nFateful hour — If you have 5 or less life, instead you and each permanent you control \
+     gain protection from the color of your choice until end of turn.";
+
+/// T6 (RUNTIME) — CR 614.15 + CR 608.2d. Faith's Shield's fateful-hour
+/// self-replacement override announces its OWN colour choice, rather than
+/// silently reading (and destroying) the base's.
+///
+/// THIS PHASE'S REGRESSION, not a pre-existing bug: `game/ability_utils.rs`
+/// `apply_instead_swap` (`overridden.effect = sub.effect`) discards the base's
+/// effect — including its injected chooser — the moment the override applies.
+/// `detect_linked_choice_linked_color`'s deleted CR 614.15 arm suppressed the
+/// override's own chooser on the theory that the base's choice would carry
+/// over; it does not, because the swap throws the base away before the choice
+/// is announced. Before this fix: 0 prompts, `chosen == []`, and every
+/// controlled permanent stayed unprotected despite two continuous effects
+/// being created (`tce == 2`) — the colour to bake into them was simply never
+/// chosen.
+#[test]
+fn faiths_shield_fateful_hour_branch_chooses_its_own_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P0, 5);
+
+    let targeted = scenario.add_creature(P0, "Targeted Bear", 2, 2).id();
+    let untargeted = scenario.add_creature(P0, "Untargeted Bear", 2, 2).id();
+    let opponents = scenario.add_creature(P1, "Opponent's Bear", 2, 2).id();
+
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Faith's Shield", true, FAITHS_SHIELD)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 0,
+        })
+        .from_oracle_text_with_keywords(&["Fateful hour"], FAITHS_SHIELD)
+        .id();
+    // Exactly the printed cost ({W}) — an unbounded pool would let an
+    // unaffordable cast pass unnoticed.
+    scenario.with_mana_pool(P0, white_mana(1));
+
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_object(targeted).resolve();
+    // REACH-GUARD (a): the run parks at the override's OWN colour prompt
+    // before any answer is supplied.
+    assert!(
+        matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::NamedChoice {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        ),
+        "the fateful-hour branch must announce its own CR 608.2d colour choice, got {:?}",
+        outcome.final_waiting_for()
+    );
+
+    let prompts = drain_named_choices(&mut runner, "Red");
+    // COUNTED PROMPT: exactly one, not the two a naive un-suppression fix
+    // would raise (one at cast time from the base's chooser, unreachable
+    // because it never resolves, plus one from the override).
+    assert_eq!(
+        prompts, 1,
+        "the fateful branch announces exactly one CR 608.2d colour choice"
+    );
+    assert_eq!(
+        chosen_colors(&runner, spell),
+        vec![ManaColor::Red],
+        "the override's own answer must be recorded"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the drained run must reach priority: {:?}",
+        runner.state().waiting_for
+    );
+
+    // REACH-GUARD (d), NOT a discriminator (measured 2 on both trees — it
+    // proves the branch applied, nothing more): one transient continuous
+    // effect per controlled permanent.
+    assert_eq!(
+        runner.state().transient_continuous_effects.len(),
+        2,
+        "the fateful branch must create one continuous effect per controlled permanent"
+    );
+
+    // THE ASSERTIONS THAT FLIP: the fateful branch's WIDE scope — "you and
+    // each permanent you control" — reaches both of P0's permanents, targeted
+    // or not.
+    assert!(
+        has_protection_from(&runner.state().objects[&targeted], ManaColor::Red),
+        "the targeted permanent must gain protection from the chosen colour"
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&untargeted], ManaColor::Red),
+        "the untargeted controlled permanent must ALSO gain protection (wide fateful scope)"
+    );
+
+    // NEGATIVE, paired with the two positives above and the counted prompt so
+    // it cannot pass on a card that granted nothing: the opponent's permanent
+    // is outside "you and each permanent you control" and must get nothing.
+    assert!(
+        !has_protection_from(&runner.state().objects[&opponents], ManaColor::Red),
+        "the opponent's permanent must NOT gain protection: {:?}",
+        runner.state().objects[&opponents].keywords
+    );
+
+    // STATED LIMITATION (F11): this test does not and cannot assert
+    // player-level protection for the controller. The fateful branch creates
+    // no player-scoped continuous effect at all (`tce == 2`, one per
+    // controlled permanent, none for the player), and
+    // `game/static_abilities.rs::player_protection_from_object` has no
+    // coloured-transient authority to read even if it did. Narrower than the
+    // literal "you ... gain protection" ask; filed as backlog F11.
+}
+
+/// T6's non-fateful sibling — same construction, life kept above 5 so the
+/// BASE ability (not the override) applies.
+///
+/// Asserts the counted single prompt and the recorded colour, but
+/// DELIBERATELY DOES NOT assert protection: the non-fateful branch installs
+/// ZERO transient continuous effects, measured identically at
+/// `PHASE_BASE_SHA`, on the candidate, and with U2 reverted — this is
+/// PRE-EXISTING and OUT OF SCOPE for this phase. Filed as backlog F12; its
+/// mechanism (an announced-but-unbound target on the base ability's own
+/// node) is a hypothesis, not diagnosed to the line. Asserting protection
+/// here would misrepresent an undiagnosed pre-existing gap as something this
+/// phase pinned.
+#[test]
+fn faiths_shield_non_fateful_branch_still_chooses_its_own_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P0, 20);
+
+    let targeted = scenario.add_creature(P0, "Targeted Bear", 2, 2).id();
+
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Faith's Shield", true, FAITHS_SHIELD)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 0,
+        })
+        .from_oracle_text_with_keywords(&["Fateful hour"], FAITHS_SHIELD)
+        .id();
+    scenario.with_mana_pool(P0, white_mana(1));
+
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_object(targeted).resolve();
+    assert!(
+        matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::NamedChoice {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        ),
+        "the base ability must still announce its own colour choice, got {:?}",
+        outcome.final_waiting_for()
+    );
+
+    let prompts = drain_named_choices(&mut runner, "Red");
+    assert_eq!(
+        prompts, 1,
+        "shape (i) adds no second prompt to the branch it does not apply to"
+    );
+    assert_eq!(chosen_colors(&runner, spell), vec![ManaColor::Red]);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// T7 — CR 607.2d + CR 608.2d: an independently printed chooser is NOT
+// suppressed by a linked anaphoric reader on the same object.
+// ---------------------------------------------------------------------------
+
+/// SYNTHETIC — no such card exists. No Magic card prints both a linked
+/// anaphoric reader ("the chosen color") AND an independently-choosing grant
+/// ("the color of your choice") on one object (measured: printed supplier ∧
+/// independent grant on one face → 0 of 35,961, reach-guard 110). This
+/// fixture pins the STRUCTURAL rule at the seam where a real such card would
+/// land. The anaphoric half's coverage on a REAL card is T5
+/// (`floating_shield_sacrifice_grant_reads_the_as_enters_color`, above).
+const SYNTHETIC_WARD: &str =
+    "Enchant creature\nAs this Aura enters, choose a color.\nEnchanted creature has protection \
+     from the chosen color.\n{2}: Target creature gains protection from the color of your choice \
+     until end of turn.";
+
+/// T7 (RUNTIME) — CR 607.2d + CR 608.2d. An independently printed chooser
+/// ("the color of your choice") is NOT suppressed by a linked anaphoric
+/// reader ("the chosen color") on the same object; each prompts and binds
+/// separately.
+///
+/// THE ASSERTIONS THAT FLIP are in Step 2: the independent grant announces
+/// its own prompt (1, not 0), the recipient binds THAT answer, and — the
+/// BL-2 catcher a prior round shipped with no test for — the linked STATIC
+/// on the host keeps reading its OWN supplier's answer, unmoved by the newer,
+/// unrelated choice made elsewhere on the object.
+#[test]
+fn linked_and_independent_color_grants_on_one_object_prompt_and_bind_separately() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let host = scenario.add_creature(P0, "Host Bear", 2, 2).id();
+    let recipient = scenario.add_creature(P0, "Recipient Bear", 2, 2).id();
+    let aura = scenario
+        .add_enchantment_from_oracle(P0, "Synthetic Ward", SYNTHETIC_WARD)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 2,
+        })
+        .from_oracle_text_with_keywords(&["Enchant"], SYNTHETIC_WARD)
+        .id();
+    // {2}{W} for the cast, plus {2} for the activation.
+    scenario.with_mana_pool(P0, white_mana(5));
+
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), aura, Zone::Hand, &mut events);
+
+    // Step 1 (reach-guard) — measured identical on base and candidate: the
+    // as-enters replacement's own chooser is untouched by this phase.
+    let cast = runner.cast(aura).target_object(host).resolve();
+    assert!(
+        matches!(
+            cast.final_waiting_for(),
+            WaitingFor::NamedChoice {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        ),
+        "the as-enters replacement must still announce its own choice, got {:?}",
+        cast.final_waiting_for()
+    );
+    let cast_prompts = drain_named_choices(&mut runner, "Blue");
+    assert_eq!(cast_prompts, 1);
+    assert_eq!(chosen_colors(&runner, aura), vec![ManaColor::Blue]);
+    assert!(
+        has_protection_from(&runner.state().objects[&host], ManaColor::Blue),
+        "the linked static must give the host protection from the as-enters colour"
+    );
+    assert_eq!(
+        runner.state().objects[&aura].zone,
+        Zone::Battlefield,
+        "the Aura must resolve onto the battlefield"
+    );
+
+    // Step 2 — THE ASSERTIONS THAT FLIP.
+    let activation = runner.activate(aura, 0).target_object(recipient).resolve();
+    assert!(
+        matches!(
+            activation.final_waiting_for(),
+            WaitingFor::NamedChoice {
+                choice_type: ChoiceType::Color { .. },
+                ..
+            }
+        ),
+        "the independent grant must announce its OWN colour choice, got {:?}",
+        activation.final_waiting_for()
+    );
+    let act_prompts = drain_named_choices(&mut runner, "Red");
+    assert_eq!(
+        act_prompts, 1,
+        "the independent grant announces exactly one prompt of its own"
+    );
+    assert_eq!(
+        runner.state().objects[&recipient].keywords,
+        vec![Keyword::Protection(ProtectionTarget::Color(ManaColor::Red))],
+        "the recipient must bind the independent grant's OWN answer"
+    );
+    assert_eq!(
+        runner.state().objects[&host].keywords,
+        vec![Keyword::Protection(ProtectionTarget::Color(
+            ManaColor::Blue
+        ))],
+        "the BL-2 catcher: the linked static must keep reading its OWN supplier's answer, \
+         unmoved by the newer independent choice made elsewhere on the object"
+    );
+    assert_eq!(
+        chosen_colors(&runner, aura),
+        vec![ManaColor::Blue, ManaColor::Red],
+        "the Aura accumulates both answers (phase 1's storage split)"
+    );
+    assert_eq!(runner.state().transient_continuous_effects.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// T7c — CR 607.2d ordering hostile case.
+// ---------------------------------------------------------------------------
+
+/// SYNTHETIC — no such card exists, for the same reason T7's fixture is
+/// synthetic. Two SEPARATE activated abilities so an anaphoric activation can
+/// be driven both BEFORE and AFTER the independent one.
+const SYNTHETIC_WARD_TWO: &str =
+    "Enchant creature\nAs this Aura enters, choose a color.\n{1}: Target creature gains \
+     protection from the chosen color until end of turn.\n{2}: Target creature gains protection \
+     from the color of your choice until end of turn.";
+
+/// T7c (RUNTIME) — CR 607.2d. An anaphoric grant activated AFTER an
+/// independent choice keeps reading the LINKED colour, however many
+/// unrelated choices the object has made since.
+///
+/// THE ASSERTION THAT FLIPS: the SECOND `{1}` activation (on bear C, after
+/// the `{2}` activation put a second, different answer on the object) counts
+/// ZERO prompts and grants `Prot(Blue)` — the object's FIRST (linked) answer,
+/// not its most recent one.
+///
+/// HONESTY NOTE: at `PHASE_BASE_SHA` bear C also gets `Prot(Blue)`, but
+/// VACUOUSLY — the object only ever held one answer there, because the `{2}`
+/// activation raised 0 prompts (wrongly suppressed) rather than 1. This
+/// assertion is only meaningful together with its reach-guards: the `{2}`
+/// activation must have counted exactly 1 prompt and bear B must really hold
+/// `Prot(Red)`, so the object genuinely holds two answers by the time the
+/// final assertion runs.
+#[test]
+fn an_anaphoric_grant_activated_after_an_independent_choice_keeps_the_linked_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let bear_a = scenario.add_creature(P0, "Bear A", 2, 2).id();
+    let bear_b = scenario.add_creature(P0, "Bear B", 2, 2).id();
+    let bear_c = scenario.add_creature(P0, "Bear C", 2, 2).id();
+    let aura = scenario
+        .add_enchantment_from_oracle(P0, "Synthetic Ward Two", SYNTHETIC_WARD_TWO)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 2,
+        })
+        .from_oracle_text_with_keywords(&["Enchant"], SYNTHETIC_WARD_TWO)
+        .id();
+    // {2}{W} for the cast, plus {1} + {2} + {1} for the three activations —
+    // headroom over the exact {7}, because the activations here are
+    // generic-only and the exact-pool convention is a CAST guard.
+    scenario.with_mana_pool(P0, white_mana(12));
+
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), aura, Zone::Hand, &mut events);
+
+    let cast = runner.cast(aura).target_object(bear_a).resolve();
+    let cast_prompts = drain_named_choices(&mut runner, "Blue");
+    assert_eq!(
+        cast_prompts, 1,
+        "reach-guard: the as-enters choice must land"
+    );
+    assert!(matches!(
+        cast.final_waiting_for(),
+        WaitingFor::NamedChoice { .. }
+    ));
+
+    // Activate ability 0 ({1}, anaphoric) on bear A, BEFORE any independent
+    // choice exists.
+    let act0 = runner.activate(aura, 0).target_object(bear_a).resolve();
+    assert!(
+        matches!(act0.final_waiting_for(), WaitingFor::Priority { .. }),
+        "the anaphoric grant must raise no prompt of its own, got {:?}",
+        act0.final_waiting_for()
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_a], ManaColor::Blue),
+        "bear A must get the linked (as-enters) colour"
+    );
+
+    // Activate ability 1 ({2}, independent) on bear B.
+    let act1 = runner.activate(aura, 1).target_object(bear_b).resolve();
+    assert!(matches!(
+        act1.final_waiting_for(),
+        WaitingFor::NamedChoice {
+            choice_type: ChoiceType::Color { .. },
+            ..
+        }
+    ));
+    let act1_prompts = drain_named_choices(&mut runner, "Red");
+    // REACH-GUARD: the `{2}` activation really did count one prompt and bear
+    // B really did get the independent colour, so the object genuinely holds
+    // two answers when the final assertion below runs.
+    assert_eq!(
+        act1_prompts, 1,
+        "the independent grant announces its own prompt"
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_b], ManaColor::Red),
+        "bear B must get the independent grant's own colour"
+    );
+    assert_eq!(
+        chosen_colors(&runner, aura),
+        vec![ManaColor::Blue, ManaColor::Red],
+        "reach-guard: the object must genuinely hold two answers here"
+    );
+    // REACH-GUARD: bear A's earlier answer must still stand — phase 1's latch
+    // is doing its half.
+    assert!(has_protection_from(
+        &runner.state().objects[&bear_a],
+        ManaColor::Blue
+    ));
+
+    // THE ASSERTION THAT FLIPS: activate ability 0 ({1}, anaphoric) AGAIN, on
+    // bear C, with a second (unrelated) answer now on the object.
+    let act0_again = runner.activate(aura, 0).target_object(bear_c).resolve();
+    assert!(
+        matches!(act0_again.final_waiting_for(), WaitingFor::Priority { .. }),
+        "the anaphoric grant must STILL raise no prompt of its own, got {:?}",
+        act0_again.final_waiting_for()
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_c], ManaColor::Blue),
+        "CR 607.2d: the anaphoric ability must read only its OWN supplier's choice, not the \
+         object's most recent answer: {:?}",
+        runner.state().objects[&bear_c].keywords
     );
 }

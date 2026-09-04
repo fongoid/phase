@@ -528,6 +528,107 @@ pub(crate) fn parse_printed_color_choice_qualifier(input: &str) -> OracleResult<
     .parse(input)
 }
 
+/// CR 607.2d (@2748) + CR 608.2d (@2799): which KIND of chosen-colour reference a
+/// KEYWORD GRANT printed. CR 607.2d links only a reader saying "the chosen
+/// [value]", "the last chosen [value]", "or similar"; "the color of your choice"
+/// is a FRESH CR 608.2d choice the player announces while applying the effect.
+/// `types/keywords.rs::parse_protection_target` / `parse_hexproof_filter` map both
+/// onto `ProtectionTarget::ChosenColor` / `HexproofFilter::ChosenColor`, which is
+/// correct at RUNTIME (the layer applier bakes either identically) and lossy for
+/// CR 607.2d LINKAGE. This recovers the lost axis at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum ChosenColorGrantReference {
+    /// Every chosen-colour grant phrase in this clause is a CR 607.2d anaphor.
+    AnaphoricOnly,
+    /// At least one grant phrase printed a fresh CR 608.2d "the color of your
+    /// choice", so this clause must keep a chooser of its own.
+    IncludesIndependentChoice,
+}
+
+/// The GRANT prefix, shared by both forms.
+///
+/// DOMAIN, stated exactly. This text classifier's domain is a strict SUPERSET of
+/// the injector's: `oracle_effect/mod.rs::effect_grants_chosen_color_keyword`
+/// destructures `Effect::GenericEffect { static_abilities, .. }` and returns
+/// `false` for everything else, so a clause whose printed text carries the grant
+/// phrase inside, say, a `ReturnAsAura { grants }` quoted body is classified here
+/// and never visited there. The excess is EMPTY today — measured: 16 pool cards
+/// print an "…Aura enchantment with enchant…" quoted-grant body and NONE contains
+/// a chosen-colour grant phrase — but the excess direction is
+/// `IncludesIndependentChoice`, i.e. suppression WITHHELD, the unsafe direction.
+/// That is why phase 1's `floating_shield_sacrifice_grant_reads_the_as_enters_color`
+/// is the load-bearing regression guard for this file.
+///
+/// "becomes the color of your choice" (`AddChosenColor`, Mondo Gecko) is
+/// deliberately NOT in the prefix — the injector never visits that modification.
+fn parse_chosen_color_grant_prefix(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("protection from "), tag("hexproof from ")))).parse(input)
+}
+
+/// CR 607.2d's own phrase list. `the last chosen color` is DEFENSIVE ONLY: no
+/// `ChosenColor` keyword is ever produced from it — `parse_protection_target` has
+/// no such arm and `grep -rn "last chosen color" crates/engine/src/` returns zero
+/// — so the alternative can never fire on a grant the injector visits. It is kept
+/// because it is CR 607.2d's own wording and because its failure direction is
+/// `AnaphoricOnly`, i.e. suppression preserved.
+fn parse_anaphoric_chosen_color_grant(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        preceded(
+            parse_chosen_color_grant_prefix,
+            alt((
+                tag("the last chosen color"),
+                tag("the chosen color"),
+                tag("chosen color"),
+                tag("that color"),
+            )),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 608.2d: a fresh choice this clause's own text offers.
+fn parse_independent_chosen_color_grant(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        preceded(
+            parse_chosen_color_grant_prefix,
+            alt((
+                tag("the color of your choice"),
+                tag("a color of your choice"),
+                tag("color of your choice"),
+            )),
+        ),
+    )
+    .parse(input)
+}
+
+/// SINGLE AUTHORITY for a clause's chosen-colour grant provenance. `None` = the
+/// clause prints no chosen-colour keyword grant at all.
+///
+/// Clause `source_text` is ORIGINAL-CASED (the committed Mother of Runes IR
+/// snapshot's fragment begins "Target creature you control gains …") and every
+/// `tag()` above is lowercase and case-sensitive, so the scan runs over an
+/// explicitly lowercased copy. This is the same shape
+/// `oracle_replacement.rs::parse_as_enters_choose` already uses
+/// (`scan_at_word_boundaries(norm_lower, …)`); `bridge::nom_on_lower` is NOT
+/// applicable — it applies its parser ONCE at offset 0 and maps the consumed
+/// length back onto original-cased text, so it cannot wrap a scanner.
+pub(crate) fn classify_chosen_color_grant(clause_text: &str) -> Option<ChosenColorGrantReference> {
+    let lower = clause_text.to_ascii_lowercase();
+    let independent =
+        super::primitives::scan_at_word_boundaries(&lower, parse_independent_chosen_color_grant)
+            .is_some();
+    let anaphoric =
+        super::primitives::scan_at_word_boundaries(&lower, parse_anaphoric_chosen_color_grant)
+            .is_some();
+    match (independent, anaphoric) {
+        (true, _) => Some(ChosenColorGrantReference::IncludesIndependentChoice),
+        (false, true) => Some(ChosenColorGrantReference::AnaphoricOnly),
+        (false, false) => None,
+    }
+}
+
 /// CR 614.1a + CR 109.1: the parsed "\[other\] `<plural-type>` you control" tail
 /// of a compound damage recipient. A named struct rather than a tuple so both
 /// axes are explicit at every call site.
@@ -1172,6 +1273,71 @@ mod tests {
             assert!(
                 parse_printed_color_choice_qualifier(adjacent).is_err(),
                 "{adjacent:?} must NOT be recognized as the printed chosen-colour qualifier"
+            );
+        }
+    }
+
+    /// CR 607.2d vs CR 608.2d: `classify_chosen_color_grant`'s single-authority
+    /// contract. Cases 1-8 are positive reach-guards (real or synthetic clauses
+    /// that DO print a chosen-colour grant); cases 9-12 are the negatives, so
+    /// they cannot pass vacuously on a classifier that matches nothing.
+    ///
+    /// Case 1 is the committed Mother of Runes IR-snapshot fragment, verbatim
+    /// and original-cased — exactly the string production hands the classifier.
+    /// Cases 2 and 3 are SYNTHETIC and exist only to pin the lowercase step:
+    /// zero pool cards print a capitalised chosen-colour grant phrase at a line
+    /// or sentence start (measured: 0 of 35,961 faces, against a reach-guard of
+    /// 150 faces printing a capitalised `Protection from ` / `Hexproof from ` at
+    /// a line or sentence start), so no real-cased pool fragment can catch a
+    /// dropped `to_ascii_lowercase()` — only these two synthetic rows can.
+    #[test]
+    fn classify_chosen_color_grant_distinguishes_anaphoric_from_independent() {
+        let cases: &[(&str, Option<ChosenColorGrantReference>)] = &[
+            (
+                "Target creature you control gains protection from the color of your choice until end of turn",
+                Some(ChosenColorGrantReference::IncludesIndependentChoice),
+            ),
+            (
+                "Protection from the color of your choice",
+                Some(ChosenColorGrantReference::IncludesIndependentChoice),
+            ),
+            (
+                "Hexproof from the chosen color",
+                Some(ChosenColorGrantReference::AnaphoricOnly),
+            ),
+            (
+                "gains protection from the chosen color until end of turn",
+                Some(ChosenColorGrantReference::AnaphoricOnly),
+            ),
+            (
+                "gains protection from the color of your choice until end of turn",
+                Some(ChosenColorGrantReference::IncludesIndependentChoice),
+            ),
+            (
+                "gains hexproof from that color",
+                Some(ChosenColorGrantReference::AnaphoricOnly),
+            ),
+            (
+                "gains protection from a color of your choice",
+                Some(ChosenColorGrantReference::IncludesIndependentChoice),
+            ),
+            (
+                "gains protection from the chosen color and hexproof from the color of your choice",
+                Some(ChosenColorGrantReference::IncludesIndependentChoice),
+            ),
+            ("gains protection from red", None),
+            ("gains protection from the chosen card type", None),
+            ("becomes the color of your choice", None),
+            ("draw a card", None),
+        ];
+
+        for (i, (input, want)) in cases.iter().enumerate() {
+            let got = classify_chosen_color_grant(input);
+            assert_eq!(
+                got,
+                *want,
+                "case {} ({input:?}): got {got:?}, want {want:?}",
+                i + 1
             );
         }
     }

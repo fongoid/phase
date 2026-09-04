@@ -5115,6 +5115,34 @@ the three accessors over `ChosenAttribute::Color`
 `GameObject::current_chosen_color`) reads a well-defined end of the
 accumulated list regardless of how many prior choices the source holds, so a
 newly-persisted repeated chooser's writes stay unambiguous by construction.
+**F1's *code* fix is out of scope for the chosen-colour work; this entry
+records it, not implements it.** Four riders, added by the follow-up phase that
+built the per-clause chosen-colour provenance channel:
+(a) `ChoiceType::Color` is also absent from
+`types/ability.rs::needs_choice_source_context`, so `named_choice_authority`
+returns `(None, None)` and a `persist: false` colour choice writes no
+`ChosenAttribute::Color` anywhere, confirming the gap is not merely the
+`persist:` match.
+(b) A distinct sub-population from the 51 above: of the pool cards whose
+chosen-colour grant reaches
+`game/effects/effect.rs::snapshot_transient_modifications`, some have no
+persisting colour chooser at all — Akroma's Blessing, Aven Warcraft, Bathe in
+Light, Brave the Elements, Glory, Mondo Gecko, Prismatic Boon, Reverent Mantra,
+Skrelv, Sungold Sentinel, and trigger-borne Kabira Evangel. The 51 counts
+printed `persist: false` colour choosers pool-wide; this named set counts
+latched-grant cards lacking a persisting chooser — a different denominator
+entirely. Regenerate with `bin/pool.rs census` before citing a count; an
+earlier round's **47** here was measured, independently, to overstate the
+candidate's own card data by 3 cards, so no number is repeated here.
+(c) The recommended shape: mark a printed colour chooser `persist: true`
+exactly when the document contains a reader of it, reusing the per-clause
+provenance channel `ClauseIr.chosen_color_grant` this phase built for the
+CR 607.2d linkage seam (`parser/oracle_nom/filter.rs::classify_chosen_color_grant`).
+(d) When F1 lands, the `AddStaticMode { … IsChosenColor }` arm of
+`snapshot_transient_modifications` must land with it, phase 1's
+`None => modification.clone()` fallback gains its first discriminating test at
+the same moment, and **Chromatic Armor** becomes the first pool permanent able
+to hold two persisting colour answers.
 
 **F6 — wrap the printed colour choice at the CARRYING clause's own node.**
 `inject_printed_color_choice_filter`
@@ -5125,26 +5153,61 @@ silently reordered. Wrapping at the carrying clause's own arena node makes both
 wrappable and also removes the decorated-head field-moving limitation on
 `wrap_in_color_choice`.
 
-**F8 — declared per-clause provenance for keyword grants.**
+**F8 — CLOSED (channel) — declared per-clause provenance for keyword grants.**
 `crates/engine/src/types/keywords.rs::parse_protection_target` /
 `parse_hexproof_filter` map BOTH the printed qualifier ("of the color of your
 choice") and the anaphor ("the chosen color") onto
 `ProtectionTarget::ChosenColor` / `HexproofFilter::ChosenColor`, so the
 keyword-grant injector cannot tell them apart from the lowered shape. The
 document relation `LinkedChoiceKind::LinkedColorChoice` recovers the distinction
-for the cross-item case (CR 607.2d); the general fix is a per-clause provenance
-channel for keyword grants, mirroring `ClauseIr.printed_color_choice`. Blocked
-behind `parse_granted_keyword_fragment` being a pure, context-free function with
-ten call sites including `crates/engine/src/database/synthesis.rs`. Residual it
-would close: a hypothetical card printing BOTH its own `choose a color` and a
-genuinely independent `of the color of your choice` grant on another ability
-would have its second chooser suppressed. Measured: zero such cards exist today.
+for the cross-item case (CR 607.2d). **The per-clause provenance channel this
+entry called for now exists**: `ClauseIr.chosen_color_grant`
+(`parser/oracle_ir/effect_chain.rs`), derived at `ClauseDraft::push` — the
+sealed single construction gate — from the clause's own verbatim `source_text`
+via `parser/oracle_nom/filter.rs::classify_chosen_color_grant`, mirroring
+`ClauseIr.printed_color_choice`'s shape exactly. The `ParseContext` route stays
+blocked for the reason this entry already gave:
+`parse_protection_target` / `parse_hexproof_filter` (nee
+`parse_granted_keyword_fragment`) are pure, context-free functions with ten call
+sites including `crates/engine/src/database/synthesis.rs`, so there is no ctx
+channel to lift — deriving from `source_text` at the sealed mint point sidesteps
+that entirely. Residual this closes: a card printing BOTH its own `choose a
+color` and a genuinely independent `of the color of your choice` grant on
+another ability would have had its second chooser wrongly suppressed before
+this channel existed. **Still measured at zero cards**: printed supplier
+("choose a/one/another color") ∧ `(protection|hexproof) from (the |a )?color of
+your choice` on one face → 0 of 35,961 faces (MTGJSON `5.3.0+20260828`),
+reach-guard: printed supplier alone → 110 cards. (Secondary, narrower census:
+both an anaphoric "the chosen color" reader and an independent grant on one
+face → also 0, reach-guards 31 / 22.)
 
-**F9 — "the last chosen color" falls through to `ProtectionTarget::CardType`.**
+**F9 — "the last chosen color" falls through to `ProtectionTarget::CardType`,
+and two sibling keyword-mapper asymmetries.**
 `parse_protection_target` has no arm for the CR 607.2d "the last chosen [value]"
 phrasing, so **Sanctuary Blade** lowers to
 `Protection(CardType("the last chosen color"))` and its equipped creature's
 protection reads no colour at all — silently, with no `Effect::Unimplemented`.
+Three riders, added by the follow-up phase that audited both keyword mappers
+line-by-line while building F8's provenance channel:
+(a) `parse_protection_target` has no `"that color"` arm, while
+`parse_hexproof_filter` does — so "protection from that color" falls through to
+`ProtectionTarget::CardType("that color")` on a card that would otherwise print
+a valid CR 607.2d anaphor, the same silent failure mode as the "last chosen
+color" phrasing above but on the more common wording.
+(b) `"the last chosen color"` reaches **neither** mapper —
+`grep -rn "last chosen color" crates/engine/src/` returns zero — so
+**Sanctuary Blade** and **Chromatic Armor**'s prevention phrasing are outside
+the `ChosenColor` class entirely, which is exactly what keeps this phase's own
+combinator (`parser/oracle_nom/filter.rs::parse_anaphoric_chosen_color_grant`,
+which keeps a defensive `"the last chosen color"` alternative for CR 607.2d
+completeness) honest: the alternative can never fire on a grant either keyword
+mapper produces.
+(c) **Pippin, Guard of the Citadel** ("protection from the card type of your
+choice") and **Avacyn, Guardian Angel** ("sources of the color of your choice",
+measured to lower NO colour chooser at all — see the standalone entry below)
+are the same family of missing "…of your choice" aliases, on the card-type and
+prevention routes respectively rather than the protection/hexproof route this
+entry otherwise covers.
 
 **F10 — CLOSED. CR 608.2h + CR 611.2d per-grant colour latching.** Two
 continuous grants created by two activations of the SAME source that are
@@ -5195,6 +5258,56 @@ not be cited as evidence that any OTHER `ChosenAttribute::Color` reader in the
 crate sees at most one entry — that invariant no longer holds anywhere else.
 Filed so a future reader of `mana_abilities.rs:777` does not generalize its
 local retain into a crate-wide assumption the accessor split just removed.
+
+**F11 — Faith's Shield's player half has neither a producer nor a
+consumer.** The fateful-hour branch's "you and each permanent you control gain
+protection …" creates one continuous effect PER CONTROLLED PERMANENT and NONE
+for the controlling player — measured, `transient_continuous_effects.len()`
+equals the controlled-permanent count with every `affected` a `SpecificObject`,
+never the player. Even given a player-scoped effect,
+`game/static_abilities.rs::player_protection_from_object` scans only
+`game_functioning_statics` for `StaticMode::PlayerProtection`, its transient
+authority `player_has_protection_from_everything` matches
+`ProtectionTarget::Everything` and nothing else, and `types/player.rs` has no
+`keywords` field to hold a coloured grant if one were latched. BOTH halves are
+needed. The comment on `player_protection_from_object`'s
+`ProtectionTarget::Color(_)` arm ("no card grants these qualities to a player")
+is factually wrong on Faith's Shield's own text and should be corrected when
+this is fixed. Labelled: measured `false` on every tree tested; there is no
+positive control for `player_protection_from_object` returning `true` for a
+colour.
+
+**F12 — a CR 614.15 override's non-fateful branch installs zero continuous
+effects. Mechanism is a HYPOTHESIS, not diagnosed to the line.** Fact, measured
+on three trees (the pre-fix base, the fix candidate, and the fix reverted):
+Faith's Shield at life above 5 records the chosen colour (one counted colour
+prompt, the answer recorded on the spell object) and installs ZERO transient
+continuous effects — this is PRE-EXISTING and unrelated to the CR 614.15
+chooser-suppression fix. Fact about the tree: the lowered `else_ability` node
+(the base, non-fateful branch) DOES carry its own target; its parent (the
+`ConditionInstead` node) carries `target: null`. An earlier hypothesis — that
+the target-bearing node sitting below a targetless `ConditionInstead` node is
+the cause — is REFUTED by this fact. Undiagnosed: Stave Off's working narrow
+grant has the identical node shape (a target-bearing leaf below a targetless
+`ConditionInstead`); the only structural difference from Faith's Shield here is
+`else_ability` vs `sub_ability`. HYPOTHESIS, explicitly not measured: targets
+are announced by walking the resolution chain from the root, and the
+`else_ability` slot's own target slot is never announced or bound during that
+walk, so its `ParentTarget` resolves to nothing and no continuous effect is
+ever created to bind a colour into. Filed rather than fixed; out of scope for
+the chosen-colour work.
+
+**F13 — Sudden Demise drops the chosen-colour FILTER, not just the
+binding.** Its lowered shape is `Choose { Color, persist: false }` →
+`DamageAll { Typed { properties: ["Creature"], .. } }` — the colour filter
+itself is dropped at lowering, not merely left unbound. Persisting the choice
+(F1's fix) would NOT repair this card, because there is no
+`FilterProp::HasColor` in the lowered filter for a persisted colour to bind
+into. Same family as the Wash Out / Root Greevil object-filter route this PR's
+earlier work fixed (a printed colour choice must reach the object filter, not
+just the keyword-grant path), and a DISTINCT item from F1 — the two entries
+must not be conflated as the same fix. Filed rather than fixed; out of scope
+for the chosen-colour work.
 
 **Avacyn, Guardian Angel — `by sources of the color of your choice` is dropped.**
 Both activated abilities export `Effect::PreventDamage` with NO

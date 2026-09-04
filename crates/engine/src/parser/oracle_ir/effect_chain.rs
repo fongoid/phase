@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use super::ast::{ClauseBoundary, ContinuationAst, ParsedEffectClause};
 use super::doc::{OracleDocBuilder, OracleSourceSpan, OracleUnitSource};
+use crate::parser::oracle_nom::filter::ChosenColorGrantReference;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ControllerRef,
@@ -91,8 +92,7 @@ pub(crate) enum InjectedColorChoice {
     Permitted,
     /// CR 607.2d: a linked ability elsewhere on this object already makes the
     /// choice this chain's grant reads back (Floating Shield's as-enters
-    /// replacement; a CR 614.15 override reading its base's choice), so the
-    /// grant must NOT make a second choice of its own.
+    /// replacement), so the grant must NOT make a second choice of its own.
     SuppressedByLinkedAbility,
 }
 
@@ -903,6 +903,27 @@ pub(crate) struct ClauseIr {
     /// chooser injected — a fail-closed, match-NOTHING filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) printed_color_choice: Option<ChoiceType>,
+    /// CR 607.2d (@2748) + CR 608.2d (@2799): which KIND of chosen-colour
+    /// reference this clause's KEYWORD GRANT printed, DERIVED ONCE from this
+    /// clause's own verbatim `source_text` at `ClauseDraft::push` — the sealed
+    /// single construction gate.
+    ///
+    /// Deriving here rather than lifting a `ParseContext` channel is deliberate:
+    /// `Protection`/`HexproofFrom(ChosenColor)` are produced by
+    /// `types/keywords.rs::parse_protection_target` / `parse_hexproof_filter`,
+    /// pure context-free functions with ten call sites (backlog F8), so no ctx
+    /// channel exists to lift. Because EVERY `ClauseIr` is minted here, no
+    /// `.push()` site can forget it, and `absorb_clause` RE-DERIVES it from the
+    /// re-located fragment rather than copying it.
+    ///
+    /// FAILURE POLARITY, stated once: `None` means "no chosen-colour grant phrase
+    /// found", which the consumer treats as NOT independent, so the CR 607.2d
+    /// suppression still fires and today's behaviour is preserved byte-for-byte.
+    /// Suppression is withheld ONLY on an affirmative `IncludesIndependentChoice`
+    /// stamp. A missed or unclassifiable clause therefore cannot un-suppress
+    /// Floating Shield, the pool's only live consumer of this relation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) chosen_color_grant: Option<ChosenColorGrantReference>,
     /// CR 608.2c + CR 603.7a: where this clause's lowered definition attaches.
     /// `Sibling` (default) is promoted only when this clause continues an open
     /// delayed payload and is consumed by `assemble_effect_chain`'s relocation step.
@@ -1271,6 +1292,9 @@ impl ClauseDraft<'_> {
             target_selection_mode: self.target_selection_mode,
             target_chooser: self.target_chooser,
             printed_color_choice: self.printed_color_choice,
+            chosen_color_grant: crate::parser::oracle_nom::filter::classify_chosen_color_grant(
+                &self.source_text,
+            ),
             placement: self.placement,
             _sealed: (),
         });

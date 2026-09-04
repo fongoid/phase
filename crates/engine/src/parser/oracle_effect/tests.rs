@@ -59982,9 +59982,14 @@ fn linked_color_choice_suppresses_the_injected_chooser() {
         "Mother of Runes must keep her injected chooser: {mother_of_runes:#?}"
     );
 
-    // SIBLING (CR 614.15): Faith's Shield's "Fateful hour —" paragraph is a
-    // self-replacement override of the base ability, so only one of the two ever
-    // applies and the override reads the base's choice. One chooser, not two.
+    // SIBLING (CR 614.15 + CR 608.2d): Faith's Shield's "Fateful hour —"
+    // paragraph is a self-replacement override of the base ability.
+    // `game/ability_utils.rs::apply_instead_swap` assigns
+    // `overridden.effect = sub.effect`, so when the override applies, the base's
+    // effect — including its injected chooser — is discarded before it resolves.
+    // CR 608.2d puts the choice on the effect that is APPLIED, so each branch
+    // must carry its own chooser: TWO choosers, one per branch, not one shared
+    // between them.
     let faiths_shield = parse_oracle_text(
         "Target permanent you control gains protection from the color of your choice until end \
          of turn.\nFateful hour — If you have 5 or less life, instead you and each permanent you \
@@ -59996,8 +60001,32 @@ fn linked_color_choice_suppresses_the_injected_chooser() {
     );
     assert_eq!(
         card_color_choice_persists(&faiths_shield),
-        vec![true],
-        "Faith's Shield must lower to exactly one colour chooser: {faiths_shield:#?}"
+        vec![true, true],
+        "Faith's Shield must lower to one colour chooser PER BRANCH: {faiths_shield:#?}"
+    );
+
+    // SIBLING, SYNTHETIC — no such card exists (no Magic card prints both a
+    // linked anaphoric reader AND an independently-choosing grant on one
+    // object). This fixture pins the PARSE-level shape only: two choosers, one
+    // for the linked reader's own supplier and one for the independent grant.
+    // The BEHAVIOURAL assertion — that each chooser binds its own answer at
+    // runtime — lives in T7
+    // (`linked_and_independent_color_grants_on_one_object_prompt_and_bind_separately`
+    // in `tests/integration/chosen_color_rechoose_same_source.rs`), not here.
+    let synthetic_ward = parse_oracle_text(
+        "Enchant creature\nAs this Aura enters, choose a color.\nEnchanted creature has \
+         protection from the chosen color.\n{2}: Target creature gains protection from the \
+         color of your choice until end of turn.",
+        "Synthetic Ward",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    assert_eq!(
+        card_color_choice_persists(&synthetic_ward),
+        vec![true, true],
+        "the linked reader's own supplier and the independent grant each keep a chooser: \
+         {synthetic_ward:#?}"
     );
 
     // HOSTILE: Akroma's Blessing prints its chooser and its grant in ONE item.
@@ -60040,6 +60069,7 @@ fn linked_color_choice_suppresses_the_injected_chooser() {
         ("Floating Shield", &floating_shield),
         ("Mother of Runes", &mother_of_runes),
         ("Faith's Shield", &faiths_shield),
+        ("Synthetic Ward", &synthetic_ward),
         ("Akroma's Blessing", &akromas_blessing),
         ("Voice of All", &voice_of_all),
     ] {

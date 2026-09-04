@@ -1314,14 +1314,19 @@ fn item_static(item: &OracleItemIr) -> Option<&StaticDefinition> {
 /// both the main and Class document-construction paths converge here.
 fn finalize_document_relations(mut doc: OracleDocIr, types: &[String]) -> OracleDocIr {
     let mut relations = detect_document_relations(&doc.items, types);
-    // CR 607.2d + CR 614.15: the linked-colour-choice detector is the one
-    // detector that reads relations ALREADY on the document. The CR 614.15
-    // self-replacement override is recorded by the dispatch loop itself (it needs
-    // the emitter's `last_ability_id`), not by `detect_document_relations`, so it
-    // is on `doc.relations` by the time this runs and nowhere else. Ordering is
-    // load-bearing: run this after that vector is populated, never inside the
-    // item-only registry.
-    detect_linked_choice_linked_color(&doc.items, &doc.relations, &mut relations);
+    // CR 607.2d: `detect_linked_choice_linked_color` no longer reads any
+    // pre-existing relation (it takes only `items`), so its position here is not
+    // ordered against `detect_document_relations`'s own output. What remains
+    // load-bearing: this detector must run BEFORE
+    // `apply_linked_color_choice_suppression`, which is what stamps its verdict
+    // onto the consumers' chains, and its verdict must be in `relations` before
+    // `doc.relations.extend(relations)` below.
+    //
+    // (CR 614.15 self-replacement overrides are still recorded by the dispatch
+    // loop itself, not by `detect_document_relations`, so they are on
+    // `doc.relations` by the time this runs — but `apply_self_replacement_override`
+    // is the consumer of that relation, not this detector.)
+    detect_linked_choice_linked_color(&doc.items, &mut relations);
     finalize_relation_syntheses(&mut doc, &relations);
     apply_linked_color_choice_suppression(&mut doc, &relations);
     doc.relations.extend(relations);
@@ -1353,52 +1358,78 @@ fn finalize_document_relations(mut doc: OracleDocIr, types: &[String]) -> Oracle
 /// synthesized description, so a description-keyed rule would be both
 /// stringly-typed and wrong.
 ///
-/// CR 614.15 is the second producer: when no item printed a choice, an override
-/// paragraph folded into its base (Faith's Shield's "Fateful hour —") reads the
-/// base's injected choice, because only one of the two effects ever applies. The
-/// base keeps its chooser and the override is suppressed.
+/// That objection is about the LOWERED description and does not reach a
+/// PRE-LOWERING `source_text` classifier: `ClauseIr.chosen_color_grant` is
+/// derived at `ClauseDraft::push` from the clause's own verbatim printed
+/// fragment, before any description is synthesized.
+///
+/// CR 614.15 (@3126) + CR 608.2d (@2799): a self-replacement override does NOT
+/// read its base's choice. `game/ability_utils.rs::apply_instead_swap` assigns
+/// `overridden.effect = sub.effect`, so when the override applies, the base's
+/// effect — including a chooser injected above it — is discarded before it
+/// resolves. CR 608.2d puts the choice on the effect that is APPLIED, so each
+/// branch must carry its own chooser. Suppressing the override's chooser here is
+/// what left Faith's Shield's fateful-hour branch with no colour at all: counted
+/// prompts on the fateful branch are 0 with the arm present and 1 with it
+/// removed, and still 1 — not 2 — on the non-fateful branch.
 fn detect_linked_choice_linked_color(
     items: &[OracleItemIr],
-    existing: &[DocumentRelationIr],
     relations: &mut Vec<DocumentRelationIr>,
 ) {
-    let supplier = items.iter().find(|item| item_prints_color_choice(item));
-    let consumers: Vec<OracleItemId> = match supplier {
-        Some(supplier) => items
-            .iter()
-            .filter(|item| item.id != supplier.id)
-            .filter(|item| item_is_injectable_chosen_color_grant(item))
-            .map(|item| item.id)
-            .collect(),
-        // CR 614.15: no printed supplier. The base of a self-replacement override
-        // supplies the choice for its own override once lowering injects one, so
-        // the override must not inject a second.
-        None => existing
-            .iter()
-            .filter_map(|relation| match relation {
-                DocumentRelationIr::SelfReplacementOverride {
-                    base,
-                    override_item,
-                } => Some((*base, *override_item)),
-                _ => None,
-            })
-            .filter(|(base, override_item)| {
-                items
-                    .iter()
-                    .any(|item| item.id == *base && item_is_injectable_chosen_color_grant(item))
-                    && items.iter().any(|item| {
-                        item.id == *override_item && item_is_injectable_chosen_color_grant(item)
-                    })
-            })
-            .map(|(_, override_item)| override_item)
-            .collect(),
+    let Some(supplier) = items.iter().find(|item| item_prints_color_choice(item)) else {
+        return;
     };
+    let consumers: Vec<OracleItemId> = items
+        .iter()
+        .filter(|item| item.id != supplier.id)
+        .filter(|item| item_is_injectable_chosen_color_grant(item))
+        .filter(|item| item_reads_anaphoric_chosen_color(item))
+        .map(|item| item.id)
+        .collect();
     if consumers.is_empty() {
         return;
     }
     relations.push(DocumentRelationIr::LinkedChoice(
         LinkedChoiceKind::LinkedColorChoice { consumers },
     ));
+}
+
+/// CR 607.2d (@2748) vs CR 608.2d (@2799): whether every chosen-colour keyword
+/// grant this item prints is an ANAPHORIC reader of a choice made elsewhere on
+/// the object.
+///
+/// A NARROWING conjunct on `item_is_injectable_chosen_color_grant`, never a
+/// replacement for it: that predicate is what guarantees detection and
+/// application share a domain, and this one only removes items whose own printed
+/// text makes a FRESH CR 608.2d choice.
+///
+/// CALLER CONTRACT: use ONLY in conjunction with
+/// `item_is_injectable_chosen_color_grant`. The `else { return false }` below is
+/// the OPPOSITE polarity from `ClauseIr.chosen_color_grant`'s "unstamped =>
+/// suppress" rule — a non-`Spell` node answers "not an anaphoric reader", which
+/// alone would WITHHOLD suppression. Unreachable in the conjunction (a non-`Spell`
+/// node is already excluded by the other predicate's
+/// `matches!(item.node, OracleNodeIr::Spell(_))`), but a future caller using this
+/// predicate alone would get the unsafe direction.
+///
+/// AGGREGATION RULE (per-clause provenance -> per-item stamp). The suppression is
+/// stamped on `ability_ir.body.injected_color_choice`, at ITEM granularity, while
+/// the provenance is per CLAUSE. An item is a consumer only if NO clause carries
+/// `IncludesIndependentChoice`. CR 608.2d requires the fresh choice to be
+/// announced while applying the effect, so one independent clause forfeits the
+/// whole item's suppression; the item-granular channel cannot express "suppress
+/// clause A but not clause B", and CR 608.2d is the half that must not be lost.
+/// Zero cards in the pool reach this disagreement.
+fn item_reads_anaphoric_chosen_color(item: &OracleItemIr) -> bool {
+    let OracleNodeIr::Spell(ability_ir) = &item.node else {
+        return false;
+    };
+    !ability_ir.body.clauses.iter().any(|clause| {
+        matches!(
+            clause.chosen_color_grant,
+            Some(crate::parser::oracle_nom::filter::ChosenColorGrantReference::IncludesIndependentChoice)
+        )
+    })
 }
 
 /// Whether this item PRINTED a colour choice, read from its pre-lowering IR.

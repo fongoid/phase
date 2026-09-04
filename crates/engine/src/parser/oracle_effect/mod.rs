@@ -30726,18 +30726,24 @@ fn refuse_printed_color_choice(def: &mut AbilityDefinition, name: &str, fragment
 /// answers "a colour choice already stands in THIS chain"; `injected` answers the
 /// half this function cannot see — "a colour choice already stands on this
 /// OBJECT, made by a LINKED ability" (Floating Shield's as-enters choice, read
-/// back by its "Sacrifice this Aura:" grant; Faith's Shield's CR 614.15 override
-/// reading its base's choice). Injecting there raises a SECOND prompt for a value
-/// the rules say is already fixed, and the source's `ChosenAttribute::Color` then
-/// carries two answers for one printed choice.
+/// back by its "Sacrifice this Aura:" grant). Injecting there raises a SECOND
+/// prompt for a value the rules say is already fixed, and the source's
+/// `ChosenAttribute::Color` then carries two answers for one printed choice.
 ///
 /// The suppression is decided from the DECLARED document relation
 /// (`LinkedChoiceKind::LinkedColorChoice`), never from a scan of the lowered tree:
 /// the printed/anaphoric distinction is erased by `types/keywords.rs`
 /// `parse_protection_target`, which maps BOTH "the chosen color" and "the color of
-/// your choice" onto `ProtectionTarget::ChosenColor`. Follow-up **F8** gives the
-/// keyword-grant route its own per-clause provenance channel, as
-/// `ClauseIr.printed_color_choice` already does for the object-filter route.
+/// your choice" onto `ProtectionTarget::ChosenColor`. **F8**: the keyword-grant
+/// route now has its own per-clause provenance channel,
+/// `ClauseIr.chosen_color_grant`, derived at `ClauseDraft::push` from the clause's
+/// own verbatim fragment, as `ClauseIr.printed_color_choice` already does for the
+/// object-filter route. The `ParseContext` route stays blocked for the reason F8
+/// already gave: `types/keywords.rs::parse_protection_target` /
+/// `parse_hexproof_filter` are pure, context-free functions with ten call sites
+/// (including `database/synthesis.rs`), so there is no ctx channel to lift. The
+/// residual this closes is still measured at zero cards (printed supplier ∧
+/// independent grant on one object → 0 of 35,961 faces, reach-guard 110).
 fn inject_chosen_color_choice_grant(
     def: &mut AbilityDefinition,
     parent_is_color_choice: bool,
