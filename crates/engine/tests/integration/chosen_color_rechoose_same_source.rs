@@ -1,28 +1,39 @@
 //! Runtime coverage for the LIFETIME of `ChosenAttribute::Color` on one source
-//! (CR 607.2d + CR 400.7 + CR 608.2d).
+//! (CR 607.2d + CR 400.7 + CR 608.2d + CR 608.2h + CR 611.2d + CR 611.3a).
 //!
 //! Two seams, one file, because they only make sense together:
 //!
-//! * **U1 — replace-on-rechoose.** `apply_choice_attributes`
-//!   (`game/effects/choose.rs`) used to clear only `Keyword` / `Counter` /
-//!   `Direction`, so a source that resolved a colour choice twice ACCUMULATED
-//!   both answers while every reader (`GameObject::chosen_color`, both
-//!   `FilterProp::IsChosenColor` arms in `game/filter.rs`,
-//!   `DevotionColors::ChosenColor` in `game/quantity.rs`) takes the FIRST match.
-//!   The second resolution therefore silently used the first resolution's
-//!   answer. CR 607.2d links "choose a [value]" to "the chosen [value]" per
-//!   choice; CR 400.7 makes a recast spell a new object that nonetheless keeps
-//!   the storage object's attributes, because `chosen_attributes` is cleared
-//!   only by `reset_for_battlefield_entry`, which a spell never reaches.
+//! * **U4 — the chosen-colour storage split.** `apply_choice_attributes`
+//!   (`game/effects/choose.rs`) used to REPLACE a source's prior
+//!   `ChosenAttribute::Color` on every re-choice, so three rules concepts
+//!   that read this list — CR 607.2d's linked read, CR 608.2d's "this
+//!   resolution" read, and "the current answer" — all collapsed onto
+//!   whichever single answer the `retain` left standing. Colours now
+//!   ACCUMULATE, and `GameObject::chosen_color` (oldest), `choose::
+//!   resolution_chosen_color` (this resolution) and `GameObject::
+//!   current_chosen_color` (newest) each read the end of that list their
+//!   rule entitles them to. CR 607.2d links "choose a [value]" to "the
+//!   chosen [value]" per choice; CR 400.7 makes a recast spell a new object
+//!   that nonetheless keeps the storage object's attributes, because
+//!   `chosen_attributes` is cleared only by `reset_for_battlefield_entry`,
+//!   which a spell never reaches.
 //!
-//! * **U0 — the CR 607.2d linked colour choice.** Floating Shield makes its
-//!   choice on its as-enters replacement and READS IT BACK on its
-//!   "Sacrifice this Aura:" ability. The keyword-grant injector used to hand
-//!   that ability a chooser of its own, so the Aura ended up holding two
-//!   answers — and today's first-match read accidentally preserved the
-//!   as-enters one. U1 alone would flip that read to the SECOND (spurious)
-//!   answer, so the document relation that removes the spurious chooser has to
-//!   land with it. This file pins both directions.
+//! * **U1 — the resolution-time latch.** A resolution-generated continuous
+//!   effect (`effects/effect.rs::snapshot_transient_modifications`) now
+//!   latches its granting source's chosen colour into the `AddKeyword`
+//!   payload ONCE, when the effect is applied (CR 608.2h + CR 611.2d), so
+//!   TWO SIMULTANEOUSLY LIVE grants from the same source each keep their own
+//!   colour instead of both re-reading whichever answer is CURRENT at layer-
+//!   apply time. CR 611.3a scopes this deliberately: a printed STATIC
+//!   ability's grant (Floating Shield's own "Enchanted creature has
+//!   protection from the chosen color") is never latched — it stays live,
+//!   read every layer evaluation from `game/layers.rs`.
+//!
+//! Floating Shield's linked as-enters/sacrifice pair is the card the storage
+//! split (U4) would otherwise break: its "Sacrifice this Aura:" ability reads
+//! the colour chosen by its LINKED as-enters replacement and must make no
+//! independent choice of its own (the parser's `LinkedColorChoice` relation
+//! suppresses that chooser). This file pins both directions.
 //!
 //! Built via the `/card-test` recipe: `GameScenario` +
 //! `GameRunner::cast(..)/activate(..).resolve()` + `CastOutcome`/`Outcome` zone
@@ -30,16 +41,30 @@
 //! positive reach-guard in the same test.
 //!
 //! REVERT DISCRIMINATORS:
-//! * `wash_out_recast_on_the_same_object_uses_its_own_color` — revert the
-//!   `ChoiceType::Color` arm in `apply_choice_attributes` and the second cast
-//!   bounces the FIRST cast's colour.
+//! * `knight_of_dawn_two_live_grants_keep_their_own_colors` /
+//!   `armored_guardian_two_recipients_keep_their_own_colors` /
+//!   `armored_guardian_grants_gate_aura_attachment_per_grant_color` — revert
+//!   the resolution-time latch in `effects/effect.rs::snapshot_transient_modifications`
+//!   and a later grant retroactively rewrites an earlier one's colour.
+//! * `wash_out_recast_on_the_same_object_uses_its_own_color` /
+//!   `wash_out_recast_choosing_an_absent_color_moves_nothing` /
+//!   `knight_of_dawn_second_activation_uses_its_own_color` — revert the
+//!   `ChoiceType::Color` `retain` deletion in `apply_choice_attributes`
+//!   (charter Rule R-3's forbidden candidate) and a second choice replaces
+//!   the first instead of accumulating behind it.
+//! * `prismatic_strands_recast_on_the_same_object_prevents_its_own_color` —
+//!   revert `prevent_damage.rs`'s `current_chosen_color()` read back to
+//!   `chosen_color()` and the second shield wrongly filters the FIRST cast's
+//!   colour.
 //! * `floating_shield_sacrifice_grant_reads_the_as_enters_color` — revert the
 //!   `LinkedColorChoice` relation and the activation raises a second colour
-//!   prompt (and, with U1 in place, the grant then reads that second answer).
+//!   prompt (and, with the storage split in place, the grant then reads that
+//!   second answer).
 
+use engine::game::effects::attach::attach_to;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::zones::move_to_zone;
-use engine::types::ability::{ChoiceType, ChosenAttribute};
+use engine::types::ability::{ChoiceType, ChosenAttribute, FilterProp, TargetFilter};
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, ProtectionTarget};
@@ -66,6 +91,27 @@ const FLOATING_SHIELD: &str =
      from the chosen color. This effect doesn't remove this Aura.\nSacrifice this Aura: Target \
      creature gains protection from the chosen color until end of turn.";
 
+/// Armored Guardian {3}{W}{U} Creature — verbatim, reminder text INCLUDED
+/// (`/card-test` requires verbatim text; MTGJSON's printed shroud reminder is
+/// part of it).
+const ARMORED_GUARDIAN: &str =
+    "{1}{W}{W}: Target creature you control gains protection from the color of your choice until \
+     end of turn.\n{1}{U}{U}: This creature gains shroud until end of turn. (It can't be the \
+     target of spells or abilities.)";
+
+/// Firebreathing {R} Enchantment — Aura — verbatim. A second copy built with a
+/// `{U}` cost is the blue control Aura for T3 — its colour comes from its
+/// PRINTED MANA COST (`printed_cards::derive_colors_from_mana_cost`), never a
+/// hand-set `color` field.
+const FIREBREATHING: &str =
+    "Enchant creature\n{R}: Enchanted creature gets +1/+0 until end of turn.";
+
+/// Prismatic Strands {2}{W} Instant — verbatim, reminder text INCLUDED.
+const PRISMATIC_STRANDS: &str =
+    "Prevent all damage that sources of the color of your choice would deal this turn.\nFlashback\
+     —Tap an untapped white creature you control. (You may cast this card from your graveyard for \
+     its flashback cost. Then exile it.)";
+
 /// A one-colour mana cost, so `with_mana_cost` derives exactly that colour
 /// (CR 202.2 / CR 105.2).
 fn one_color(shard: ManaCostShard) -> ManaCost {
@@ -76,7 +122,9 @@ fn one_color(shard: ManaCostShard) -> ManaCost {
 }
 
 /// `n` units of white mana with no producing source and no spend restrictions —
-/// the plainest pool contents that can pay a printed activation cost.
+/// the plainest pool contents that can pay a printed activation cost. Generic
+/// costs are paid from this pool too, so it also covers `{1}{W}{W}`-shaped
+/// activations without a separate colourless helper.
 fn white_mana(n: usize) -> Vec<engine::types::mana::ManaUnit> {
     vec![
         engine::types::mana::ManaUnit::new(
@@ -102,8 +150,11 @@ fn has_protection_from(obj: &engine::game::game_object::GameObject, color: ManaC
         .any(|keyword| keyword == &Keyword::Protection(ProtectionTarget::Color(color)))
 }
 
-/// Every `ChosenAttribute::Color` currently recorded on an object, in order.
-/// The whole point of U1 is that this is at most one element long.
+/// Every `ChosenAttribute::Color` currently recorded on an object, in order
+/// (oldest first). The whole point of U4's storage split is that this can now
+/// hold more than one element, and that three different readers
+/// (`chosen_color`, `resolution_chosen_color`, `current_chosen_color`) each
+/// take a different end of it.
 fn chosen_colors(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> Vec<ManaColor> {
     runner.state().objects[&id]
         .chosen_attributes
@@ -115,11 +166,522 @@ fn chosen_colors(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> V
         .collect()
 }
 
+/// Whether a resolved prevention shield's `damage_source_filter` carries a
+/// concrete `FilterProp::HasColor` for `color` — the shape
+/// `prevent_damage.rs::resolve_source_filter` produces once `IsChosenColor`
+/// is resolved at shield-creation time (CR 608.2d, U4d).
+fn shield_has_color(
+    shield: &engine::types::ability::ReplacementDefinition,
+    color: ManaColor,
+) -> bool {
+    match &shield.damage_source_filter {
+        Some(TargetFilter::Typed(tf)) => tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::HasColor { color: c } if *c == color)),
+        _ => false,
+    }
+}
+
+/// S-3 — drive a run parked on repeated `NamedChoice` windows to completion,
+/// answering each one with `choice` and returning the number of windows it
+/// actually answered.
+///
+/// `SpellCast::choose_option` / `AbilityActivation::choose_option` set a
+/// SINGLE answer slot which `drive_resolution` CLONES at every `NamedChoice`
+/// it re-enters — so a plain `.resolve()` run cannot COUNT prompts: an effect
+/// that asked twice would be silently answered twice from that one slot and
+/// still reach `Priority`. This drives the run by hand instead, answering
+/// each open `NamedChoice` with a fresh `GameAction::ChooseOption` and passing
+/// priority toward the next one, so the number of windows actually answered
+/// is observable.
+///
+/// This proves "N prompts were raised and answered". It does NOT by itself
+/// prove the ability that raised them fully resolved to completion — pair it
+/// with a zone or state assertion for that.
+fn drain_named_choices(runner: &mut engine::game::scenario::GameRunner, choice: &str) -> u32 {
+    let mut answered = 0;
+    for _ in 0..40 {
+        if matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }) {
+            runner
+                .act(engine::types::actions::GameAction::ChooseOption {
+                    choice: choice.to_string(),
+                })
+                .expect("answer the open colour prompt");
+            answered += 1;
+            continue;
+        }
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        runner
+            .act(engine::types::actions::GameAction::PassPriority)
+            .expect("pass priority toward resolution");
+    }
+    answered
+}
+
 // ---------------------------------------------------------------------------
-// T1 — the maintainer's explicit ask: the SAME object resolving twice.
+// T1 — TWO SIMULTANEOUSLY LIVE grants from the SAME source.
 // ---------------------------------------------------------------------------
 
-/// T1 (RUNTIME) — CR 607.2d + CR 400.7 + CR 608.2d. A source that resolves a
+/// T1 (RUNTIME) — CR 608.2h + CR 611.2d. TWO SIMULTANEOUSLY LIVE grants from
+/// the SAME source each keep their OWN colour.
+///
+/// The sibling test below, `knight_of_dawn_second_activation_uses_its_own_color`,
+/// crosses a turn boundary, so grant 1 has EXPIRED (CR 514.2) before grant 2
+/// is created — it pins the storage split (U4) but cannot discriminate the
+/// per-effect LATCH (U1), because only one grant is ever live at a time. This
+/// test activates TWICE IN THE SAME TURN, so both grants are live
+/// simultaneously and the per-effect latch is the ONLY mechanism that can
+/// keep them apart.
+///
+/// THE ASSERTIONS THAT FLIP if the latch (U1) is reverted: after activation 2,
+/// grant 1 (`Protection(Color(Red))`) is retroactively rewritten to Blue,
+/// because the layer applier's `chosen_color()` pre-read reads whichever
+/// answer is CURRENT at layer-evaluation time rather than the answer that was
+/// current when grant 1 was created.
+#[test]
+fn knight_of_dawn_two_live_grants_keep_their_own_colors() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let knight = scenario
+        .add_creature_from_oracle(P0, "Knight of Dawn", 2, 2, KNIGHT_OF_DAWN)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::White],
+            generic: 1,
+        })
+        .id();
+    // Exactly the two activations' cost — an unbounded pool would let an
+    // unaffordable activation pass unnoticed.
+    scenario.with_mana_pool(P0, white_mana(4));
+
+    let mut runner = scenario.build();
+
+    // ACTIVATION 1 — Red.
+    let first = runner.activate(knight, 0).choose_option("Red").resolve();
+    // POSITIVE REACH-GUARD (a): activation 1 resolves.
+    assert!(
+        matches!(first.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 1 must resolve, got {:?}",
+        first.final_waiting_for()
+    );
+    // POSITIVE REACH-GUARD (b): grant 1 genuinely landed, so the later
+    // assertion about it surviving is not vacuous.
+    assert!(
+        has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
+        "activation 1 must grant protection from RED: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+    let tce_after_first = runner.state().transient_continuous_effects.len();
+
+    // ACTIVATION 2 — Blue, SAME TURN, so grant 1 is still live.
+    let second = runner.activate(knight, 0).choose_option("Blue").resolve();
+    assert!(
+        matches!(second.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 2 must resolve, got {:?}",
+        second.final_waiting_for()
+    );
+    // POSITIVE REACH-GUARD (c): the two assertions below are about TWO
+    // grants, not one.
+    assert_eq!(
+        runner.state().transient_continuous_effects.len(),
+        tce_after_first + 1,
+        "activation 2 must create a SECOND transient continuous effect"
+    );
+
+    // THE ASSERTIONS THAT FLIP.
+    assert!(
+        has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
+        "grant 1 must KEEP red — CR 608.2h fixes its colour when it was applied: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&knight], ManaColor::Blue),
+        "grant 2 must bind its OWN colour, blue: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+    assert_eq!(
+        chosen_colors(&runner, knight),
+        vec![ManaColor::Red, ManaColor::Blue],
+        "both answers are recorded, oldest first"
+    );
+}
+
+/// T9d (RUNTIME) — CR 607.2d + CR 514.2. A permanent that activates its colour
+/// choice on two different turns grants protection from its SECOND answer.
+///
+/// The two activations are on DIFFERENT turns on purpose: the first grant has
+/// expired (CR 514.2) before the second is created, so this asserts only the
+/// storage-split seam (U4) and not U1's per-effect latch, which
+/// `knight_of_dawn_two_live_grants_keep_their_own_colors` (T1) covers.
+#[test]
+fn knight_of_dawn_second_activation_uses_its_own_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let knight = scenario
+        .add_creature_from_oracle(P0, "Knight of Dawn", 2, 2, KNIGHT_OF_DAWN)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::White],
+            generic: 1,
+        })
+        .id();
+    // Exactly the `{W}{W}` the first activation costs — an unbounded pool would
+    // let an unaffordable activation pass unnoticed.
+    scenario.with_mana_pool(P0, white_mana(2));
+
+    let mut runner = scenario.build();
+
+    // ACTIVATION 1 — Red. POSITIVE REACH-GUARD: the grant genuinely lands.
+    let first = runner.activate(knight, 0).choose_option("Red").resolve();
+    assert!(
+        matches!(first.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 1 must resolve, got {:?}",
+        first.final_waiting_for()
+    );
+    assert_eq!(
+        chosen_colors(&runner, knight),
+        vec![ManaColor::Red],
+        "activation 1 records its own answer"
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
+        "activation 1 must actually grant protection from RED: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+
+    // CR 514.2: cross the turn boundary (through cleanup) so the first grant
+    // expires. The ability has no timing restriction, so the next turn's upkeep
+    // is a legal activation window (CR 602.2).
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[])
+        .expect("declare no attackers (CR 508.1)");
+    runner.advance_to_upkeep();
+    // REACH-GUARD: the turn really turned over and the first grant really
+    // expired, so the "protection from red is gone" assertion at the end is
+    // about the SECOND activation's answer and not about a leftover first one.
+    assert_eq!(
+        runner.state().phase,
+        Phase::Upkeep,
+        "the run must cross the turn boundary to activate again, got {:?}",
+        runner.state().phase
+    );
+    assert!(
+        !has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
+        "CR 514.2: the first grant must have expired at cleanup: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+    // CR 117.3a: the new turn's active player receives priority first; pass it
+    // to the Knight's controller.
+    runner
+        .act(engine::types::actions::GameAction::PassPriority)
+        .expect("pass priority to the Knight's controller");
+    // CR 500.4: the pool emptied at each step/phase boundary — refill exactly
+    // the second activation's cost.
+    for unit in white_mana(2) {
+        let _ = runner.state_mut().add_mana_to_pool(P0, unit);
+    }
+
+    // ACTIVATION 2 — Blue.
+    let second = runner.activate(knight, 0).choose_option("Blue").resolve();
+    assert!(
+        matches!(second.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 2 must resolve, got {:?}",
+        second.final_waiting_for()
+    );
+
+    // SHAPE ROW — CR 400.7: the answers ACCUMULATE; oldest first.
+    assert_eq!(
+        chosen_colors(&runner, knight),
+        vec![ManaColor::Red, ManaColor::Blue],
+        "T9d: CR 607.2d — the answers ACCUMULATE, oldest first"
+    );
+    // THE ASSERTIONS THAT FLIP if the storage split (U4) is reverted: without
+    // it the source holds `[Red]` after the second choice replaces the first
+    // in place, or — under the FORBIDDEN candidate that deletes only the
+    // `retain` without the resolution-scoped read — the layer applier's
+    // pre-read reads the OLDEST answer and bakes red again.
+    assert!(
+        has_protection_from(&runner.state().objects[&knight], ManaColor::Blue),
+        "activation 2 must grant protection from its OWN colour: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+    assert!(
+        !has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
+        "the expired first grant must not survive into turn 2: {:?}",
+        runner.state().objects[&knight].keywords
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2 — U1 hostile, multi-authority, TWO RECIPIENTS.
+// ---------------------------------------------------------------------------
+
+/// T2 (RUNTIME) — CR 608.2h, hostile multi-authority form. TWO DIFFERENT
+/// RECIPIENTS, each granted by the SAME source's ability, each keep their
+/// OWN grant's colour.
+///
+/// T1's grants land on ONE object, where a wrong colour could in principle be
+/// masked by keyword dedup. This test separates the recipients, so the
+/// per-effect latch is the only mechanism that can produce the split.
+#[test]
+fn armored_guardian_two_recipients_keep_their_own_colors() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let guardian = scenario
+        .add_creature_from_oracle(P0, "Armored Guardian", 4, 4, ARMORED_GUARDIAN)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::Blue],
+            generic: 3,
+        })
+        .id();
+    let bear_a = scenario.add_creature(P0, "Bear A", 2, 2).id();
+    let bear_b = scenario.add_creature(P0, "Bear B", 2, 2).id();
+    // Sized to exactly the two activations' cost (2 x {1}{W}{W}); white mana
+    // pays both the coloured and the generic portion.
+    scenario.with_mana_pool(P0, white_mana(6));
+
+    let mut runner = scenario.build();
+
+    // ACTIVATION 1 — bear A gains protection from Red.
+    let first = runner
+        .activate(guardian, 0)
+        .target_object(bear_a)
+        .choose_option("Red")
+        .resolve();
+    assert!(
+        matches!(first.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 1 must resolve, got {:?}",
+        first.final_waiting_for()
+    );
+    let tce_after_first = runner.state().transient_continuous_effects.len();
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_a], ManaColor::Red),
+        "bear A must gain protection from RED after activation 1: {:?}",
+        runner.state().objects[&bear_a].keywords
+    );
+
+    // ACTIVATION 2 — bear B gains protection from Blue.
+    let second = runner
+        .activate(guardian, 0)
+        .target_object(bear_b)
+        .choose_option("Blue")
+        .resolve();
+    assert!(
+        matches!(second.final_waiting_for(), WaitingFor::Priority { .. }),
+        "activation 2 must resolve, got {:?}",
+        second.final_waiting_for()
+    );
+    assert_eq!(
+        runner.state().transient_continuous_effects.len(),
+        tce_after_first + 1,
+        "activation 2 must create a SECOND transient continuous effect"
+    );
+    // POSITIVE REACH-GUARD: each bear carries SOME protection keyword, so
+    // "not Blue" / "not Red" below cannot pass vacuously on an empty list.
+    assert!(
+        runner.state().objects[&bear_a]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Protection(_))),
+        "bear A must carry a protection keyword"
+    );
+    assert!(
+        runner.state().objects[&bear_b]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Protection(_))),
+        "bear B must carry a protection keyword"
+    );
+
+    // THE ASSERTIONS THAT FLIP: each bear keeps its OWN grant's colour.
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_a], ManaColor::Red),
+        "bear A must keep grant 1's colour, RED: {:?}",
+        runner.state().objects[&bear_a].keywords
+    );
+    assert!(
+        !has_protection_from(&runner.state().objects[&bear_a], ManaColor::Blue),
+        "bear A must NOT carry grant 2's colour: {:?}",
+        runner.state().objects[&bear_a].keywords
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&bear_b], ManaColor::Blue),
+        "bear B must bind grant 2's OWN colour, BLUE: {:?}",
+        runner.state().objects[&bear_b].keywords
+    );
+    assert!(
+        !has_protection_from(&runner.state().objects[&bear_b], ManaColor::Red),
+        "bear B must NOT carry grant 1's colour: {:?}",
+        runner.state().objects[&bear_b].keywords
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3 — U1's SECOND consumer (CR 702.16c attach legality), standalone.
+// ---------------------------------------------------------------------------
+
+/// T3 (RUNTIME) — CR 702.16c: U1's SECOND consumer. A creature's protection
+/// GATES Aura attachment, and each Armored Guardian grant gates it by that
+/// grant's OWN colour.
+///
+/// Standalone `#[test]`, deliberately NOT folded into T2's scenario: under a
+/// revert that removes the per-effect latch (U1) but keeps the storage split
+/// (U4), a version folded into T2's own scenario would panic at T2's colour
+/// assertions and never reach the attach-legality rows below at all.
+///
+/// THE OBSERVABLE IS `attached_to`, NEVER `attach_to`'s return value:
+/// `attach_to` returns `None` on an illegal attach AND on a no-op alike, so it
+/// carries no legality information by itself.
+///
+/// `/card-test` check 9 waiver: this test drives `game::effects::attach::attach_to`
+/// (a `pub` fn) directly rather than a cast — the repo's own idiom for
+/// attach-legality tests (`aspect_of_wolf_per_axis_xy.rs`,
+/// `graveyard_to_hand_activation_zone.rs`). U1's PRODUCTION half is covered by
+/// T1/T2, which drive real activations; this consumer has no cast-shaped
+/// entry point of its own.
+#[test]
+fn armored_guardian_grants_gate_aura_attachment_per_grant_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let guardian = scenario
+        .add_creature_from_oracle(P0, "Armored Guardian", 4, 4, ARMORED_GUARDIAN)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::Blue],
+            generic: 3,
+        })
+        .id();
+    let bear_a = scenario.add_creature(P0, "Bear A", 2, 2).id();
+    let bear_b = scenario.add_creature(P0, "Bear B", 2, 2).id();
+    // Grant-free: neither activation targets this bear.
+    let bear_c = scenario.add_creature(P0, "Bear C", 2, 2).id();
+    scenario.with_mana_pool(P0, white_mana(6));
+
+    // Firebreathing's colour comes from its PRINTED MANA COST, never a
+    // hand-set `color` field.
+    let red_aura = scenario
+        .add_enchantment_from_oracle(P0, "Firebreathing", FIREBREATHING)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(one_color(ManaCostShard::Red))
+        .from_oracle_text_with_keywords(&["Enchant"], FIREBREATHING)
+        .id();
+    let blue_aura = scenario
+        .add_enchantment_from_oracle(P0, "Firebreathing", FIREBREATHING)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(one_color(ManaCostShard::Blue))
+        .from_oracle_text_with_keywords(&["Enchant"], FIREBREATHING)
+        .id();
+
+    let mut runner = scenario.build();
+    // Build-time attach to the GRANT-FREE bear, via the PRODUCTION `attach_to`
+    // (not a raw field write) — this is also reach-guard 3, the instrument
+    // proving `attach_to` itself works on this fixture. Without it, CR 704.5m
+    // would put an unattached Aura into the graveyard before the activations
+    // below even resolve.
+    attach_to(runner.state_mut(), red_aura, bear_c);
+    assert_eq!(
+        runner.state().objects[&red_aura].attached_to,
+        Some(bear_c.into()),
+        "reach-guard 3: the red Aura must attach to the grant-free bear"
+    );
+    attach_to(runner.state_mut(), blue_aura, bear_c);
+    assert_eq!(
+        runner.state().objects[&blue_aura].attached_to,
+        Some(bear_c.into()),
+        "reach-guard 3: the blue Aura must attach to the grant-free bear"
+    );
+
+    // Grant 1 — bear A, red. Grant 2 — bear B, blue.
+    let first = runner
+        .activate(guardian, 0)
+        .target_object(bear_a)
+        .choose_option("Red")
+        .resolve();
+    assert!(matches!(
+        first.final_waiting_for(),
+        WaitingFor::Priority { .. }
+    ));
+    let second = runner
+        .activate(guardian, 0)
+        .target_object(bear_b)
+        .choose_option("Blue")
+        .resolve();
+    assert!(matches!(
+        second.final_waiting_for(),
+        WaitingFor::Priority { .. }
+    ));
+    // POSITIVE REACH-GUARD, deliberately colour-agnostic: a colour-specific
+    // guard would itself fail on every U1-absent tree, before ever reaching
+    // the attach rows below (that assertion is T2's job, not this test's).
+    assert!(
+        runner.state().objects[&bear_a]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Protection(_))),
+        "bear A must carry SOME protection keyword"
+    );
+    assert!(
+        runner.state().objects[&bear_b]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Protection(_))),
+        "bear B must carry SOME protection keyword"
+    );
+
+    // THE ASSERTION THAT FLIPS: CR 702.16c — the red Aura must be REFUSED by
+    // a creature with protection from red; its host must be unchanged.
+    let before = runner.state().objects[&red_aura].attached_to;
+    attach_to(runner.state_mut(), red_aura, bear_a);
+    assert_eq!(
+        runner.state().objects[&red_aura].attached_to,
+        before,
+        "CR 702.16c: the red Aura must be REFUSED by a creature with protection from red; its \
+         host must be unchanged"
+    );
+
+    // REACH-GUARD 1: the SAME red Aura DOES attach to bear B (protection from
+    // blue does not stop it).
+    attach_to(runner.state_mut(), red_aura, bear_b);
+    assert_eq!(
+        runner.state().objects[&red_aura].attached_to,
+        Some(bear_b.into()),
+        "the red Aura must be ACCEPTED by a creature whose protection is from blue"
+    );
+
+    // REACH-GUARD 2 — mirror: blue Aura refused by bear B.
+    let before = runner.state().objects[&blue_aura].attached_to;
+    attach_to(runner.state_mut(), blue_aura, bear_b);
+    assert_eq!(
+        runner.state().objects[&blue_aura].attached_to,
+        before,
+        "CR 702.16c: the blue Aura must be REFUSED by a creature with protection from blue"
+    );
+    attach_to(runner.state_mut(), blue_aura, bear_a);
+    assert_eq!(
+        runner.state().objects[&blue_aura].attached_to,
+        Some(bear_a.into()),
+        "the blue Aura must be ACCEPTED by a creature whose protection is from red"
+    );
+
+    // Zone guard.
+    assert_eq!(runner.state().objects[&bear_a].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&bear_b].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&bear_c].zone, Zone::Battlefield);
+}
+
+// ---------------------------------------------------------------------------
+// T9b/c — Wash Out recast on the same storage object.
+// ---------------------------------------------------------------------------
+
+/// T9b (RUNTIME) — CR 607.2d + CR 400.7 + CR 608.2d. A source that resolves a
 /// colour choice TWICE binds its OWN answer the second time.
 ///
 /// Wash Out is a sorcery, so CR 608.2n puts it into the graveyard on
@@ -129,9 +691,9 @@ fn chosen_colors(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> V
 /// copy, which would be two objects and would not reach this seam at all.
 ///
 /// THE ASSERTION THAT FLIPS on revert: `red_bear` in `Zone::Hand` after the
-/// second cast. Before the fix the source held `[Color(Blue), Color(Red)]`, both
-/// `FilterProp::IsChosenColor` readers took the FIRST, and the second Wash Out
-/// bounced BLUE permanents again while red stayed put.
+/// second cast. Before the fix the source held `[Color(Blue), Color(Red)]` (or,
+/// under the pre-U4 `retain`, only `[Color(Red)]`), and a reader that took the
+/// FIRST match would bounce BLUE permanents again while red stayed put.
 #[test]
 fn wash_out_recast_on_the_same_object_uses_its_own_color() {
     let mut scenario = GameScenario::new();
@@ -234,12 +796,15 @@ fn wash_out_recast_on_the_same_object_uses_its_own_color() {
             .expect("pass priority toward resolution");
     }
 
-    // THE ASSERTIONS THAT FLIP if the `Color` arm is reverted.
+    // SHAPE ROW — T9b: CR 607.2d — the answers ACCUMULATE; the second cast
+    // reads the NEWEST via `current_chosen_color()`.
     assert_eq!(
         chosen_colors(&runner, wash_out),
-        vec![ManaColor::Red],
-        "the second choice must REPLACE the first, not accumulate behind it"
+        vec![ManaColor::Blue, ManaColor::Red],
+        "T9b: CR 607.2d — the answers ACCUMULATE; the second cast reads the NEWEST via \
+         current_chosen_color()"
     );
+    // THE ASSERTION THAT FLIPS if the storage split is reverted (load-bearing).
     assert_eq!(
         runner.state().objects[&red_bear].zone,
         Zone::Hand,
@@ -260,11 +825,12 @@ fn wash_out_recast_on_the_same_object_uses_its_own_color() {
     );
 }
 
-/// T1 sibling — CR 105.4. The second resolution choosing a colour NOTHING has
-/// moves nothing, and in particular does not fall back to the first answer.
+/// T9c (RUNTIME) — CR 105.4. The second resolution choosing a colour NOTHING
+/// has moves nothing, and in particular does not fall back to the first
+/// answer.
 ///
-/// This is the vacuity guard for T1: if the second resolution silently reused
-/// the first colour, this run would bounce `blue_bear` again.
+/// This is the vacuity guard for T9b: if the second resolution silently
+/// reused the first colour, this run would bounce `blue_bear` again.
 #[test]
 fn wash_out_recast_choosing_an_absent_color_moves_nothing() {
     let mut scenario = GameScenario::new();
@@ -304,10 +870,12 @@ fn wash_out_recast_choosing_an_absent_color_moves_nothing() {
 
     // THE NEGATIVE: nothing moved, because nothing is white.
     second.assert_zone(&[blue_bear, red_bear], Zone::Battlefield);
+    // SHAPE ROW — the answers accumulate; `current_chosen_color()` reads the
+    // newest, White, which is what governed this resolution.
     assert_eq!(
         chosen_colors(&runner, wash_out),
-        vec![ManaColor::White],
-        "the source holds only its CURRENT answer"
+        vec![ManaColor::Blue, ManaColor::White],
+        "the source ACCUMULATES both answers; the resolution reads only its CURRENT one"
     );
     // REACH-GUARD: the spell resolved (CR 608.2n) rather than hanging.
     assert_eq!(runner.state().objects[&wash_out].zone, Zone::Graveyard);
@@ -319,127 +887,130 @@ fn wash_out_recast_choosing_an_absent_color_moves_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// T2 — a permanent that re-chooses without ever leaving the battlefield.
+// Prismatic Strands — the only pin for U4d.
 // ---------------------------------------------------------------------------
 
-/// T2 (RUNTIME) — CR 607.2d + CR 514.2. A permanent that activates its colour
-/// choice on two different turns grants protection from its SECOND answer.
+/// (RUNTIME) — CR 608.2d. The ONLY test that pins U4d: a prevention shield
+/// resolves its `IsChosenColor` filter into a concrete `HasColor` at CREATION
+/// time, from the source's CURRENT (newest) chosen colour — not its
+/// CR 607.2d linked (oldest) one.
 ///
-/// The two activations are on DIFFERENT turns on purpose: the first grant has
-/// expired (CR 514.2) before the second is created, so this asserts only the
-/// replace-on-rechoose seam and not the CR 611.2c / CR 613.7b per-effect
-/// latching residual (two SIMULTANEOUSLY live grants from one source both bake
-/// from the source's current colour — filed as F10, deliberately unasserted).
+/// Built on the Wash Out recast recipe: `move_to_zone` back to hand, then a
+/// second cast driven by hand (same storage object, CR 400.7) — Prismatic
+/// Strands' own Flashback ability is not exercised; the recast mechanism does
+/// not matter to CR 400.7's "same object, new resolution" premise.
+///
+/// THE ASSERTION THAT FLIPS: the SECOND shield's resolved filter carries
+/// `HasColor(Blue)`. Under U4d reverted, `prevent_damage.rs` would resolve
+/// BOTH shields' filters from `chosen_color()` (oldest), so shield [1] would
+/// wrongly carry `HasColor(Red)`.
 #[test]
-fn knight_of_dawn_second_activation_uses_its_own_color() {
+fn prismatic_strands_recast_on_the_same_object_prevents_its_own_color() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
-    let knight = scenario
-        .add_creature_from_oracle(P0, "Knight of Dawn", 2, 2, KNIGHT_OF_DAWN)
-        .with_mana_cost(ManaCost::Cost {
-            shards: vec![ManaCostShard::White, ManaCostShard::White],
-            generic: 1,
-        })
+    let strands = scenario
+        .add_spell_to_hand_from_oracle(P0, "Prismatic Strands", true, PRISMATIC_STRANDS)
+        .with_mana_cost(ManaCost::zero())
+        .from_oracle_text_with_keywords(&["Flashback"], PRISMATIC_STRANDS)
         .id();
-    // Exactly the `{W}{W}` the first activation costs — an unbounded pool would
-    // let an unaffordable activation pass unnoticed.
-    scenario.with_mana_pool(P0, white_mana(2));
 
     let mut runner = scenario.build();
 
-    // ACTIVATION 1 — Red. POSITIVE REACH-GUARD: the grant genuinely lands.
-    let first = runner.activate(knight, 0).choose_option("Red").resolve();
+    // CAST 1 — start the cast with NO pre-supplied answer, so the number of
+    // prompts raised is OBSERVABLE via `drain_named_choices` (a pre-supplied
+    // `.choose_option()` answer cannot distinguish 1 prompt from N).
+    runner.cast(strands).resolve();
     assert!(
-        matches!(first.final_waiting_for(), WaitingFor::Priority { .. }),
-        "activation 1 must resolve, got {:?}",
-        first.final_waiting_for()
+        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),
+        "the cast must raise its own colour prompt, got {:?}",
+        runner.state().waiting_for
     );
+    let answered_1 = drain_named_choices(&mut runner, "Red");
+    // POSITIVE REACH-GUARD: cast 1 raises EXACTLY one prompt.
+    assert_eq!(answered_1, 1, "cast 1 must raise exactly ONE colour prompt");
     assert_eq!(
-        chosen_colors(&runner, knight),
+        chosen_colors(&runner, strands),
         vec![ManaColor::Red],
-        "activation 1 records its own answer"
+        "cast 1 records its own answer"
     );
-    assert!(
-        has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
-        "activation 1 must actually grant protection from RED: {:?}",
-        runner.state().objects[&knight].keywords
-    );
-
-    // CR 514.2: cross the turn boundary (through cleanup) so the first grant
-    // expires. The ability has no timing restriction, so the next turn's upkeep
-    // is a legal activation window (CR 602.2).
-    runner.advance_to_combat();
-    runner
-        .declare_attackers(&[])
-        .expect("declare no attackers (CR 508.1)");
-    runner.advance_to_upkeep();
-    // REACH-GUARD: the turn really turned over and the first grant really
-    // expired, so the "protection from red is gone" assertion at the end is
-    // about the SECOND activation's answer and not about a leftover first one.
     assert_eq!(
-        runner.state().phase,
-        Phase::Upkeep,
-        "the run must cross the turn boundary to activate again, got {:?}",
-        runner.state().phase
+        runner.state().pending_damage_replacements.len(),
+        1,
+        "cast 1 must install exactly ONE prevention shield"
     );
     assert!(
-        !has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
-        "CR 514.2: the first grant must have expired at cleanup: {:?}",
-        runner.state().objects[&knight].keywords
+        shield_has_color(
+            &runner.state().pending_damage_replacements[0],
+            ManaColor::Red
+        ),
+        "shield 0's resolved filter must carry HasColor(Red)"
     );
-    // CR 117.3a: the new turn's active player receives priority first; pass it
-    // to the Knight's controller.
-    runner
-        .act(engine::types::actions::GameAction::PassPriority)
-        .expect("pass priority to the Knight's controller");
-    // CR 500.4: the pool emptied at each step/phase boundary — refill exactly
-    // the second activation's cost.
-    for unit in white_mana(2) {
-        let _ = runner.state_mut().add_mana_to_pool(P0, unit);
-    }
+    assert_eq!(runner.state().objects[&strands].zone, Zone::Graveyard);
 
-    // ACTIVATION 2 — Blue.
-    let second = runner.activate(knight, 0).choose_option("Blue").resolve();
-    assert!(
-        matches!(second.final_waiting_for(), WaitingFor::Priority { .. }),
-        "activation 2 must resolve, got {:?}",
-        second.final_waiting_for()
-    );
-
-    // THE ASSERTIONS THAT FLIP if the `Color` arm is reverted: without
-    // replace-on-rechoose the source holds `[Red, Blue]`, the layer applier's
-    // first-match `chosen_color()` pre-read bakes RED, and the second grant is
-    // protection from red.
+    // CR 400.7: the move to hand must not clear the prior answer.
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), strands, Zone::Hand, &mut events);
+    assert_eq!(runner.state().objects[&strands].zone, Zone::Hand);
     assert_eq!(
-        chosen_colors(&runner, knight),
-        vec![ManaColor::Blue],
-        "the second activation must REPLACE the first answer"
+        chosen_colors(&runner, strands),
+        vec![ManaColor::Red],
+        "the move to hand must not clear the prior answer"
     );
+
+    // CAST 2 — Blue.
+    runner.cast(strands).resolve();
     assert!(
-        has_protection_from(&runner.state().objects[&knight], ManaColor::Blue),
-        "activation 2 must grant protection from its OWN colour: {:?}",
-        runner.state().objects[&knight].keywords
+        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),
+        "cast 2 must raise its own colour prompt, got {:?}",
+        runner.state().waiting_for
     );
+    let answered_2 = drain_named_choices(&mut runner, "Blue");
+    // POSITIVE REACH-GUARD: cast 2 raises EXACTLY one prompt, and installs a
+    // SECOND shield — `len() == 2` proves both shields exist, so the
+    // assertion below is about the right one.
+    assert_eq!(answered_2, 1, "cast 2 must raise exactly ONE colour prompt");
+    assert_eq!(
+        chosen_colors(&runner, strands),
+        vec![ManaColor::Red, ManaColor::Blue],
+        "the answers accumulate on the storage object (CR 400.7)"
+    );
+    assert_eq!(
+        runner.state().pending_damage_replacements.len(),
+        2,
+        "cast 2 must install a SECOND prevention shield"
+    );
+    // POSITIVE REACH-GUARD: a live shield is not retroactively rewritten.
     assert!(
-        !has_protection_from(&runner.state().objects[&knight], ManaColor::Red),
-        "the expired first grant must not survive into turn 2: {:?}",
-        runner.state().objects[&knight].keywords
+        shield_has_color(
+            &runner.state().pending_damage_replacements[0],
+            ManaColor::Red
+        ),
+        "shield 0 must still filter its ORIGINAL colour, red"
+    );
+
+    // THE ASSERTION THAT FLIPS.
+    assert!(
+        shield_has_color(
+            &runner.state().pending_damage_replacements[1],
+            ManaColor::Blue
+        ),
+        "CR 608.2d: cast 2's shield must filter its OWN colour, blue"
     );
 }
 
 // ---------------------------------------------------------------------------
-// T3 — the 59-card as-enters bucket is a no-op.
+// T3 (as-enters bucket) — the 59-card as-enters bucket is a no-op.
 // ---------------------------------------------------------------------------
 
-/// T3 (RUNTIME) — CR 400.7. The as-enters chooser class is untouched: the
+/// (RUNTIME) — CR 400.7. The as-enters chooser class is untouched: the
 /// permanent holds exactly one `Color` before and after, and its dependent
 /// static still applies.
 ///
 /// `reset_for_battlefield_entry` clears `chosen_attributes` before each
 /// battlefield entry, so this bucket could never accumulate; the row exists so a
-/// `retain` that fired on the wrong key would be caught here rather than in the
-/// pool.
+/// storage-split defect that fired on the wrong key would be caught here rather
+/// than in the pool.
 #[test]
 fn as_enters_color_chooser_still_holds_exactly_one_color() {
     let mut scenario = GameScenario::new();
@@ -487,31 +1058,26 @@ fn as_enters_color_chooser_still_holds_exactly_one_color() {
 }
 
 // ---------------------------------------------------------------------------
-// T0b — the CR 607.2d linked colour choice, at runtime.
+// T4 — U5, Floating Shield through the FULL production path.
 // ---------------------------------------------------------------------------
 
-/// T0b (RUNTIME) — CR 607.2d. Floating Shield's "Sacrifice this Aura:" grant
-/// reads the colour chosen by its LINKED as-enters replacement, and makes no
-/// choice of its own.
+/// T4 (RUNTIME) — U5 production-path coverage for the Floating Shield linked-
+/// choice class. `Keyword::Enchant` is NOT scaffolding: CR 303.4a makes the
+/// enchant ability the Aura spell's targeting authority — `from_oracle_text`
+/// alone leaves `keywords = []`, `spell_targets` is empty, and CR 704.5m bins
+/// the spell before it can even resolve. `from_oracle_text_with_keywords`
+/// supplies it.
 ///
-/// This is the card the replace-on-rechoose fix would otherwise break. Before
-/// the `LinkedColorChoice` relation the injector handed the sacrifice ability a
-/// chooser, so the Aura accumulated a SECOND answer; today's first-match read
-/// accidentally preserved the as-enters one, and U1 alone would have flipped it
-/// to the spurious second.
-///
-/// THE NEGATIVE THAT MATTERS, and the assertion that flips if U0 is reverted:
-/// the activation is resolved with NO colour declared and must run to
-/// completion. `drive_resolution` halts AT any `NamedChoice` window it has no
-/// answer for, so a second prompt would leave the run parked there.
+/// STATUS, stated plainly: this test asserts behaviour ALREADY GREEN at
+/// `PHASE_BASE_SHA` and discriminates NO production change this phase makes —
+/// it is F-C coverage, not a regression test. Its discriminating sibling for
+/// this phase's storage-split change is T5, below.
 #[test]
-fn floating_shield_sacrifice_grant_reads_the_as_enters_color() {
+fn floating_shield_cast_records_and_reuses_the_as_enters_color() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
     let host = scenario.add_creature(P0, "Host Bear", 2, 2).id();
-    let recipient = scenario.add_creature(P0, "Recipient Bear", 2, 2).id();
-
     let shield = scenario
         .add_enchantment_from_oracle(P0, "Floating Shield", FLOATING_SHIELD)
         .with_subtypes(vec!["Aura"])
@@ -519,54 +1085,151 @@ fn floating_shield_sacrifice_grant_reads_the_as_enters_color() {
             shards: vec![ManaCostShard::White],
             generic: 2,
         })
+        .from_oracle_text_with_keywords(&["Enchant"], FLOATING_SHIELD)
         .id();
+    // Exactly the printed cost ({2}{W}) — an unbounded pool would let an
+    // unaffordable cast pass unnoticed.
+    scenario.with_mana_pool(P0, white_mana(3));
 
     let mut runner = scenario.build();
-    // Attach the Aura and record the as-enters answer, the state the replacement
-    // produces on entry (the same construction `issue_6499_flickering_ward_…`
-    // uses for this card class).
-    {
-        let state = runner.state_mut();
-        let aura = state.objects.get_mut(&shield).expect("aura exists");
-        aura.attached_to = Some(host.into());
-        aura.chosen_attributes
-            .push(ChosenAttribute::Color(ManaColor::Blue));
-        state
-            .objects
-            .get_mut(&host)
-            .expect("host exists")
-            .attachments
-            .push(shield);
-        state.layers_dirty.mark_full();
-    }
-    engine::game::layers::evaluate_layers(runner.state_mut());
+    // Seeding lands directly on the battlefield with no ETB replacement run
+    // (CR 603.6a note on `from_oracle_text_with_keywords`); move it to hand so
+    // casting it below drives the FULL production path, including the
+    // as-enters colour replacement.
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), shield, Zone::Hand, &mut events);
+    assert_eq!(runner.state().objects[&shield].zone, Zone::Hand);
+    assert!(
+        chosen_colors(&runner, shield).is_empty(),
+        "reach-guard: the Aura must not carry a colour before it is cast"
+    );
 
-    // POSITIVE REACH-GUARD (a): the linked STATIC reads the same choice, so the
-    // suppression did not strand the enchanted creature's protection.
+    let outcome = runner
+        .cast(shield)
+        .target_object(host)
+        .choose_option("Blue")
+        .resolve();
+
+    assert!(
+        matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
+        "the cast must resolve, got {:?}",
+        outcome.final_waiting_for()
+    );
+    outcome.assert_zone(&[shield], Zone::Battlefield);
+    assert_eq!(
+        runner.state().objects[&shield].attached_to,
+        Some(host.into()),
+        "CR 608.3c: the Aura must attach to the creature it targeted"
+    );
+    assert_eq!(
+        chosen_colors(&runner, shield),
+        vec![ManaColor::Blue],
+        "the as-enters choice must be recorded through PRODUCTION, never pushed by hand"
+    );
+    assert!(
+        has_protection_from(&runner.state().objects[&host], ManaColor::Blue),
+        "the linked STATIC must give the host protection from the as-enters colour: {:?}",
+        runner.state().objects[&host].keywords
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T5 — U5/U3 guard, the linked grant off a production board.
+// ---------------------------------------------------------------------------
+
+/// T5 (RUNTIME) — CR 607.2d. Floating Shield's "Sacrifice this Aura:" grant
+/// reads the colour chosen by its LINKED as-enters replacement, off a board
+/// built entirely through PRODUCTION (cast, not hand-seeded).
+///
+/// This is the card the storage split (U4) would otherwise break: before the
+/// parser's `LinkedColorChoice` relation, the sacrifice ability's injector
+/// handed it a chooser of its own, so the Aura would accumulate a SECOND
+/// answer and the sacrifice grant would bind the activation's own (spurious)
+/// colour instead of the as-enters one.
+///
+/// THE ASSERTION THAT FLIPS: the activation, resolved with NO colour
+/// declared, ends at `WaitingFor::Priority` — the linked grant raises NO
+/// prompt of its own (CR 607.2d). `drive_resolution` halts at any
+/// `NamedChoice` it has no answer for, so "reaches `Priority` with nothing
+/// declared" proves zero prompts exactly.
+///
+/// REACH-GUARD ORDERING: the sacrifice-cost zone guard (the shield reaching
+/// the graveyard) is asserted BEFORE the flip, not after — costs are paid on
+/// activation, before resolution, so it is the guard that establishes the
+/// ACTIVATION itself happened. Without it, a broken fixture where the
+/// activation never ran at all would satisfy "reaches `Priority`" just as
+/// readily as correct behaviour (nothing would be on the stack either way).
+/// The recipient's protection delta and the Aura's shape row are downstream
+/// of the resolution the flip is about and stay AFTER it — moving them above
+/// would make this test fail at a GUARD, rather than at its own
+/// discriminator, on the tree where the production change is absent.
+#[test]
+fn floating_shield_sacrifice_grant_reads_the_as_enters_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let host = scenario.add_creature(P0, "Host Bear", 2, 2).id();
+    let recipient = scenario.add_creature(P0, "Recipient Bear", 2, 2).id();
+    let shield = scenario
+        .add_enchantment_from_oracle(P0, "Floating Shield", FLOATING_SHIELD)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 2,
+        })
+        .from_oracle_text_with_keywords(&["Enchant"], FLOATING_SHIELD)
+        .id();
+    // Exactly the printed cost ({2}{W}) — an unbounded pool would let an
+    // unaffordable cast pass unnoticed. The later sacrifice activation has
+    // no mana component, so this pool need not cover it too.
+    scenario.with_mana_pool(P0, white_mana(3));
+
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), shield, Zone::Hand, &mut events);
+
+    let cast = runner
+        .cast(shield)
+        .target_object(host)
+        .choose_option("Blue")
+        .resolve();
+    // POSITIVE REACH-GUARD (a): the Aura is really on the battlefield,
+    // attached to its cast target.
+    cast.assert_zone(&[shield], Zone::Battlefield);
+    assert_eq!(
+        runner.state().objects[&shield].attached_to,
+        Some(host.into()),
+        "CR 608.3c: the Aura must attach to its cast target"
+    );
+    // POSITIVE REACH-GUARD (b): the linked STATIC reads the same choice, so
+    // the suppression did not strand the enchanted creature's protection.
     assert!(
         has_protection_from(&runner.state().objects[&host], ManaColor::Blue),
         "the enchanted creature must have protection from the as-enters colour: {:?}",
         runner.state().objects[&host].keywords
     );
 
-    // Resolve the activation with NO colour declared.
+    // Resolve the sacrifice activation with NO colour declared.
     let outcome = runner
         .activate(shield, 0)
         .target_object(recipient)
         .resolve();
 
-    // THE ASSERTION THAT FLIPS if U0 is reverted: no second prompt was raised.
+    // POSITIVE REACH-GUARD (c) — moved ABOVE the flip: the sacrifice cost was
+    // really paid, which is what proves the ACTIVATION under test actually
+    // happened rather than never having started.
+    outcome.assert_zone(&[shield], Zone::Graveyard);
+
+    // THE ASSERTION THAT FLIPS.
     assert!(
         matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
         "the linked grant must raise NO colour prompt of its own, got {:?}",
         outcome.final_waiting_for()
     );
-    // POSITIVE REACH-GUARD (b): the sacrifice cost was actually paid
-    // (CR 400.7j — the effect still finds the source in its public zone).
-    outcome.assert_zone(&[shield], Zone::Graveyard);
-    // THE POSITIVE DELTA: the target really gained protection, from the
-    // as-enters colour. With U1 and without U0 the Aura would hold the
-    // activation's own second answer instead.
+
+    // Downstream claims — NOT reach-guards for the flip; not evaluated on the
+    // tree where the linked-choice relation is withheld (the run parks before
+    // reaching either of these).
     assert!(
         has_protection_from(&runner.state().objects[&recipient], ManaColor::Blue),
         "the sacrifice grant must bake the as-enters colour: {:?}",

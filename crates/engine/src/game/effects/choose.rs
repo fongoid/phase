@@ -257,6 +257,8 @@ pub(crate) fn bind_named_choice(
         .as_deref()
         .filter(|source| source.is_exact_object_and_resolution())
         .cloned();
+    let persisting_color_answer =
+        exact_object_source.is_some() && matches!(choice_type, ChoiceType::Color { .. });
     if let Some(pid) = persist_player {
         // CR 607.2d / CR 607.2m (by analogy): per-player anchor. Unlike an
         // object's `chosen_attributes` (which accumulates a history — The
@@ -301,12 +303,14 @@ pub(crate) fn bind_named_choice(
                 // `AddChosenKeyword` plural read would grant every historical
                 // choice. Clear only `ChosenAttribute::Keyword` (Greymond's single
                 // as-enters bind clears nothing, so its behavior is unchanged).
-                // `Color` is replaced by its own arm in `apply_choice_attributes`
-                // for the same CR 607.2d reason — a source holds ONE current
-                // chosen colour and every reader of it is first-match. Every
-                // remaining chosen-attribute kind (Subtype, CardName, Label, …) is
-                // untouched so RemoveChosenKeyword/Urborg and the
-                // anchor-word/Morophon cards keep accumulating per their own rules.
+                // `Color` ACCUMULATES in `apply_choice_attributes` rather than
+                // replacing (CR 607.2d + CR 608.2d): `GameObject::chosen_color()`,
+                // `choose::resolution_chosen_color()` and
+                // `GameObject::current_chosen_color()` each read a different end
+                // of that list. Every remaining chosen-attribute kind (Subtype,
+                // CardName, Label, …) is untouched so RemoveChosenKeyword/Urborg
+                // and the anchor-word/Morophon cards keep accumulating per their
+                // own rules.
                 apply_choice_attributes(&mut obj.chosen_attributes, choice_type, choice);
                 // CR 607.2d + CR 613.1: Persisted ETB/modal choices (card name,
                 // creature type, card type, color, etc.) can gate
@@ -339,8 +343,42 @@ pub(crate) fn bind_named_choice(
         }
     }
 
+    // CR 608.2d (@2799) then CR 607.2d (@2748): record the colour THIS
+    // resolution announced, for `resolution_chosen_color`'s primary read.
+    // Gated on the exact-object binding captured above, so a `persist: false`
+    // printed `Choose a color.` (the F1 class) still writes nothing here and
+    // still falls through to `resolution_chosen_color`'s fallback.
+    if persisting_color_answer {
+        state.chosen_color_this_resolution = ChoiceValue::from_choice(choice_type, choice)
+            .and_then(|value| match value {
+                ChoiceValue::Color(color) => Some(color),
+                _ => None,
+            });
+    }
+
     state.last_named_choice = ChoiceValue::from_choice(choice_type, choice);
     updated_context
+}
+
+/// CR 608.2d (@2799) then CR 607.2d (@2748), in that order: the colour a grant
+/// created by THIS resolution must use.
+///
+/// The resolution slot answers "what did the effect being applied announce"; the
+/// fallback answers "what did this object's linked supplier choose". A grant
+/// whose own chain announced no colour — a CR 607.2d anaphoric reader whose
+/// chooser was suppressed by `LinkedColorChoice` — falls through to the linked
+/// answer and is therefore immune to any later independent choice on the same
+/// object.
+pub(crate) fn resolution_chosen_color(
+    state: &GameState,
+    source_id: crate::types::identifiers::ObjectId,
+) -> Option<ManaColor> {
+    state.chosen_color_this_resolution.or_else(|| {
+        state
+            .objects
+            .get(&source_id)
+            .and_then(|src| src.chosen_color())
+    })
 }
 
 pub(crate) fn named_choice_authority(
@@ -508,39 +546,40 @@ fn apply_choice_attributes(
     if matches!(choice_type, ChoiceType::CounterKind { .. }) {
         destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Counter(_)));
     }
-    // CR 607.2d + CR 400.7 + CR 608.2d: A source holds ONE current chosen colour,
-    // not a history. CR 607.2d links "choose a [value]" to "the chosen [value]" /
-    // "the last chosen [value]", so a source that chooses again (Mother of Runes
-    // or Knight of Dawn re-activating, Sanctuary Blade re-equipping) must REPLACE
-    // its prior answer. CR 400.7 covers the other half: a spell recast after
-    // returning from the graveyard (Wash Out via Regrowth, Prismatic Strands via
-    // flashback) is a NEW object, and `chosen_attributes` is cleared only by
-    // `reset_for_battlefield_entry` (game/game_object.rs), which a spell never
-    // reaches. Every reader of `ChosenAttribute::Color` is FIRST-match
-    // (`GameObject::chosen_color`, both `FilterProp::IsChosenColor` arms in
-    // game/filter.rs, `DevotionColors::ChosenColor` in game/quantity.rs), so
-    // accumulating binds the OLDEST answer. This is the same rule the
-    // produced-colour write in `game/mana_abilities.rs` already applies to this
-    // attribute.
+    // CR 607.2d + CR 608.2d + CR 400.7: A source's chosen colours now ACCUMULATE
+    // rather than replace, because three distinct rules concepts read this list
+    // and each is entitled to a different end of it:
     //
-    // Deliberately Color-only: CardName / CreatureType are LAST-match (`.rev()`)
-    // reads that keep their history, `chosen_keywords()` is a plural read, and a
+    //   - `GameObject::chosen_color()` — CR 607.2d, the LINKED read: "what did
+    //     this object's supplier choose". Oldest-since-entry (first match).
+    //   - `choose::resolution_chosen_color()` — CR 608.2d, "what did THIS
+    //     resolution announce". Reads `state.chosen_color_this_resolution`
+    //     (written below by the exact-object binding path), falling back to
+    //     `chosen_color()` for a linked anaphoric reader whose own chooser was
+    //     suppressed.
+    //   - `GameObject::current_chosen_color()` — "the current answer". Newest
+    //     (last match): `game/filter.rs`'s two `IsChosenColor` arms and
+    //     `game/effects/prevent_damage.rs`'s prevention-shield read all want the
+    //     most recent choice, not the historical one.
+    //
+    // CR 400.7 covers why the list can hold more than one entry at all: a spell
+    // recast after returning from the graveyard (Wash Out via Regrowth,
+    // Prismatic Strands via flashback) is a NEW object, and `chosen_attributes`
+    // is cleared only by `reset_for_battlefield_entry` (game/game_object.rs),
+    // which a spell never reaches — so a second `Choose a color.` on the same
+    // permanent (Mother of Runes or Knight of Dawn re-activating) and a second
+    // cast of the same spell both add a second entry rather than overwrite the
+    // first.
+    //
+    // Deliberately Color-only: `Keyword` (the arm above) and `CounterKind` stay
+    // current-only replace-on-rechoose because their only readers want the
+    // current answer and gain nothing from a history; `CardName` / `CreatureType`
+    // are LAST-match (`.rev()`) reads that already keep their history; and a
     // `NumberDistinctness::DistinctFromSourceHistory` number MUST accumulate so
-    // prior picks stay illegal options (CR 608.2d).
-    //
-    // KNOWN RESIDUAL (CR 611.2c + CR 613.7b), the same trade the `Keyword` arm
-    // above made and the same one `game/layers.rs`'s `RemoveChosenKeyword`
-    // pre-read already documents ("Same limitation applies to `chosen_color`"):
-    // two SIMULTANEOUSLY-LIVE grants from one source (Cartel Aristocrat, Jareth,
-    // Resilient Wanderer, Knight of Dawn activated twice in one turn) both bake
-    // from the source's CURRENT colour at layer-apply time — the oldest before
-    // this change, the newest after. Both grants agree with each other either
-    // way, so there is no net regression; locking each continuous effect to its
-    // own answer at creation needs the colour baked into the `AddKeyword`
-    // payload. Follow-up F10.
-    if matches!(choice_type, ChoiceType::Color { .. }) {
-        destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Color(_)));
-    }
+    // prior picks stay illegal options (CR 608.2d). Color is the one kind with
+    // three readers wanting three different ends of the same list, which is why
+    // it alone gets the accumulate-and-split treatment. Follow-up F10 is closed
+    // by this change — see `docs/parser-misparse-backlog.md`.
     if attrs
         .iter()
         .any(|attribute| matches!(attribute, ChosenAttribute::Direction(_)))
@@ -904,28 +943,34 @@ mod tests {
         )
     }
 
-    /// T4 (BUILDING BLOCK) — CR 607.2d + CR 400.7 + CR 608.2d. `Color` REPLACES
-    /// on re-choose; the kinds whose readers depend on history still accumulate.
+    /// T9a (BUILDING BLOCK) — CR 607.2d + CR 400.7 + CR 608.2d. `Color`
+    /// ACCUMULATES on re-choose, like the kinds whose readers depend on
+    /// history; the `Keyword` arm above (current-only) is the one that still
+    /// replaces.
     ///
-    /// This is the invariant the four first-match readers of
-    /// `ChosenAttribute::Color` (`GameObject::chosen_color`, both
-    /// `FilterProp::IsChosenColor` arms in `game/filter.rs`, and
-    /// `DevotionColors::ChosenColor` in `game/quantity.rs`) rest on: a source
-    /// holds AT MOST ONE `Color`, so "the chosen color" is unambiguous. The
-    /// accumulating rows are the paired positives — without them a `retain` that
-    /// cleared everything would pass the first row alone.
+    /// This is the invariant the three accessors over `ChosenAttribute::Color`
+    /// rest on: `GameObject::chosen_color` (CR 607.2d, oldest-since-entry),
+    /// `choose::resolution_chosen_color` (CR 608.2d, this resolution), and
+    /// `GameObject::current_chosen_color` (the current answer, newest) each
+    /// read a different end of the SAME list — which requires the list to be
+    /// a history, not a single slot. The accumulating rows below are the
+    /// paired positives — without them a `retain` that cleared everything
+    /// would pass the first row alone.
     #[test]
-    fn apply_choice_attributes_replaces_color_and_preserves_the_accumulating_kinds() {
-        // THE ROW THAT FLIPS if the `Color` arm is reverted: the second answer
-        // supersedes the first, rather than being appended behind it.
+    fn apply_choice_attributes_accumulates_color_and_preserves_the_accumulating_kinds() {
+        // THE ROW THAT FLIPS if the accumulate-on-Color change is reverted:
+        // the second answer is appended behind the first, not replacing it.
         let mut colors = Vec::new();
         apply_choice_attributes(&mut colors, &ChoiceType::color(), "Blue");
         assert_eq!(colors, vec![ChosenAttribute::Color(ManaColor::Blue)]);
         apply_choice_attributes(&mut colors, &ChoiceType::color(), "Red");
         assert_eq!(
             colors,
-            vec![ChosenAttribute::Color(ManaColor::Red)],
-            "a second colour choice must REPLACE the first, not accumulate"
+            vec![
+                ChosenAttribute::Color(ManaColor::Blue),
+                ChosenAttribute::Color(ManaColor::Red),
+            ],
+            "CR 607.2d + CR 608.2d: a second colour choice must ACCUMULATE behind the first, not replace it"
         );
 
         // POSITIVE: a `Color` write leaves a DIFFERENT chosen-attribute kind on

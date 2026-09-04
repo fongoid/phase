@@ -5088,8 +5088,12 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 ## Named follow-ups — the chosen-colour class
 
 Filed by the Wash Out / chosen-colour work. F7 (chosen-colour anaphor bound the
-earlier choice on a reused source) was closed by the replace-on-rechoose arm in
-`crates/engine/src/game/effects/choose.rs::apply_choice_attributes`, regressed by
+earlier choice on a reused source) is CLOSED — not by the replace-on-rechoose
+arm (deleted; a source's chosen colours now ACCUMULATE), but by the accessor
+split: `crates/engine/src/game/game_object.rs::GameObject::chosen_color`
+(CR 607.2d, oldest-since-entry) is the read a linked anaphor uses, so a reused
+source's LINKED reader still binds the earlier choice regardless of how many
+later colours the source has since accumulated. Regressed by
 `crates/engine/tests/integration/chosen_color_rechoose_same_source.rs`.
 
 **F1 — `persist: false` colour choosers write nothing.** `ChoiceType::Color` is
@@ -5105,8 +5109,12 @@ radius: 51 cards carry a `persist: false` colour chooser. The natural hazard —
 flipping 51 choosers to persisted makes them WRITE to their source, and eight of
 them (Akroma's Blessing, Brave the Elements, Bathe in Light, Reverent Mantra,
 Prismatic Boon, Glory, Aven Warcraft, Kabira Evangel) can choose repeatedly — is
-already removed: replace-on-rechoose means a source holds one current colour, so
-F1's writes are unambiguous by construction.
+removed by the accessor split, not by a single-current-colour invariant: each of
+the three accessors over `ChosenAttribute::Color`
+(`GameObject::chosen_color` / `choose::resolution_chosen_color` /
+`GameObject::current_chosen_color`) reads a well-defined end of the
+accumulated list regardless of how many prior choices the source holds, so a
+newly-persisted repeated chooser's writes stay unambiguous by construction.
 
 **F6 — wrap the printed colour choice at the CARRYING clause's own node.**
 `inject_printed_color_choice_filter`
@@ -5138,17 +5146,53 @@ phrasing, so **Sanctuary Blade** lowers to
 `Protection(CardType("the last chosen color"))` and its equipped creature's
 protection reads no colour at all — silently, with no `Effect::Unimplemented`.
 
-**F10 — CR 611.2c + CR 613.7b per-grant colour latching.** Two continuous grants
-created by two activations of the SAME source that are simultaneously live both
-bake from the source's CURRENT chosen colour at layer-apply time
-(`crates/engine/src/game/layers.rs`'s `chosen_color` pre-read), rather than each
-locking the answer its own resolution produced. Common by design: Cartel
-Aristocrat, Jareth, Leonine Titan, Resilient Wanderer and Knight of Dawn all
-grant to themselves and are built for repeated activation in one turn. Both
-grants agree with each other either way, so there is no net wrong answer today;
-strict correctness needs the colour baked into the `AddKeyword` payload at
-creation. `game/layers.rs` already documents the same limitation for
-`RemoveChosenKeyword`.
+**F10 — CLOSED. CR 608.2h + CR 611.2d per-grant colour latching.** Two
+continuous grants created by two activations of the SAME source that are
+simultaneously live used to both bake from the source's CURRENT chosen colour
+at layer-apply time (`crates/engine/src/game/layers.rs`'s `chosen_color`
+pre-read), rather than each locking the answer its own resolution produced.
+Common by design: Cartel Aristocrat, Jareth, Leonine Titan, Resilient Wanderer
+and Knight of Dawn all grant to themselves and are built for repeated
+activation in one turn.
+
+Fixed by latching the colour into the `ContinuousModification::AddKeyword`
+payload at resolution time
+(`crates/engine/src/game/effects/effect.rs::snapshot_transient_modifications`),
+CR 608.2h's "the answer is determined only once, when the effect is applied"
+plus CR 611.2d, scoped by CR 611.3a so a printed STATIC ability's grant (which
+is never "locked in") keeps reading live. Regressed by
+`knight_of_dawn_two_live_grants_keep_their_own_colors` (T1),
+`armored_guardian_two_recipients_keep_their_own_colors` (T2), and
+`armored_guardian_grants_gate_aura_attachment_per_grant_color` (T3) in
+`crates/engine/tests/integration/chosen_color_rechoose_same_source.rs`.
+
+**Reopening rider.** The fix is scoped to `ContinuousModification::AddKeyword`
+carrying `Protection(ChosenColor)` / `HexproofFrom(ChosenColor)`. The same
+"two simultaneously live grants both read the CURRENT answer" residual is
+STILL LIVE on two sibling axes that were deliberately left unlatched this
+round because the pool has no constructible two-simultaneously-live-grants
+member for either: `ProtectionTarget::ChosenCardType` (Serra's Emissary and
+True-Name Nemesis carry the grant on `statics`, so CR 611.3a exempts them;
+Guardian Archon is activate-once) and `ProtectionTarget::ChosenPlayer`. A
+future printing that repeats either grant in one turn reopens F10 for that
+axis specifically.
+
+**F14 — `mana_abilities.rs`'s own `ChosenAttribute::Color` retain is
+NARROWER than its comment claims, and must not be read as bounding the
+general list.** `grep -rn "ChosenAttribute::Color(_)" crates/engine/src/ |
+grep retain` finds exactly two retain sites:
+`game/effects/choose.rs::apply_choice_attributes` (deleted by this phase —
+colours now accumulate there) and `game/mana_abilities.rs:777`. The latter is
+untouched and still retain-then-pushes, but it fires only inside its own gate
+(`chain_references_chosen_color(...)` + `sole_produced_color(...)`), which
+bounds exactly the `ContinuousModification::AddChosenColor` "becomes that
+colour" class — Foraging Wickermaw, Mondo Gecko, Puca's Eye. Its own comment
+citing "`chosen_color()` returns the FIRST match" is still TRUE for that one
+accessor (`chosen_color()` is unchanged, still oldest-since-entry), but must
+not be cited as evidence that any OTHER `ChosenAttribute::Color` reader in the
+crate sees at most one entry — that invariant no longer holds anywhere else.
+Filed so a future reader of `mana_abilities.rs:777` does not generalize its
+local retain into a crate-wide assumption the accessor split just removed.
 
 **Avacyn, Guardian Angel — `by sources of the color of your choice` is dropped.**
 Both activated abilities export `Effect::PreventDamage` with NO

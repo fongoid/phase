@@ -10563,6 +10563,9 @@ pub fn resolve_ability_chain(
         // every instruction, and a new top-level resolution cannot inherit a
         // prior resolution's "that kind" if no such instruction is reached.
         state.chosen_counter_kind_this_resolution = None;
+        // CR 608.2d (@2799): same reasoning, one axis over — a new top-level
+        // resolution cannot inherit a prior resolution's announced colour.
+        state.chosen_color_this_resolution = None;
         // CR 401.5 + CR 608.2c + CR 609.3 + issue #4950: Defense in depth —
         // `apply_parent_chain_context` already consumes this at the very next
         // parent->child hand-off after a Dig/ChooseFromZone/RevealHand sets

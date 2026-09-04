@@ -4685,18 +4685,16 @@ fn spell_object_matches_property(
                 })
         }),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
+        // CR 608.2d (@2799): "the chosen color" for this filter form wants the
+        // CURRENT answer, not the CR 607.2d linked one — mirrors
+        // `GameObject::current_chosen_color`.
         FilterProp::IsChosenColor => context.is_some_and(|context| {
             context
                 .state
                 .objects
                 .get(&context.source_id)
-                .and_then(|source| {
-                    source.chosen_attributes.iter().find_map(|attr| match attr {
-                        ChosenAttribute::Color(color) => Some(color),
-                        _ => None,
-                    })
-                })
-                .is_some_and(|color| record.colors.contains(color))
+                .and_then(|source| source.current_chosen_color())
+                .is_some_and(|color| record.colors.contains(&color))
         }),
         FilterProp::IsChosenCardType => context.is_some_and(|context| {
             // CR 205.2a: `chosen_card_type()` resolves both the `CardType`
@@ -6076,11 +6074,17 @@ fn matches_filter_prop(
                     )
                 })
         }
-        // CR 105.4: Match objects whose colors include the source's chosen color.
-        // Used for "of the chosen color" (Hall of Triumph, Prismatic Strands).
+        // CR 105.4 + CR 608.2d: Match objects whose colors include the source's
+        // CURRENT chosen color. Used for "of the chosen color" (Hall of
+        // Triumph, Prismatic Strands). Mirrors `GameObject::current_chosen_color`
+        // (newest / last-match) — this arm cannot call that accessor directly
+        // because `source` here is a `SourceContext`, which carries its own
+        // `chosen_attributes: Vec<ChosenAttribute>` rather than a `GameObject`,
+        // so the newest-match scan is inlined instead.
         FilterProp::IsChosenColor => source
             .chosen_attributes
             .iter()
+            .rev()
             .find_map(|a| match a {
                 crate::types::ability::ChosenAttribute::Color(c) => Some(c),
                 _ => None,
