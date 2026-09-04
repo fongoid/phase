@@ -26,6 +26,7 @@ import type { DraftMatchDeckPayload, DraftMatchLaunch, DraftMatchSettlement, Dra
 import { MAX_MATERIALIZED_VIRTUAL_BASICS } from "../components/draft/workspace/types";
 import type { DraftCardPlacement, DraftWorkspaceState } from "../components/draft/workspace/types";
 import {
+  appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
   reconcileWorkspaceState,
@@ -43,7 +44,9 @@ import {
 import type { AISeatBinding } from "../game/controllers/aiController";
 import { createGameLoopController, type GameLoopController } from "../game/controllers/gameLoopController";
 import { processRemoteUpdate } from "../game/dispatch";
+import { debugLog } from "../game/debugLog";
 import { reportStructuredActionRejection } from "../game/actionRejectionReporter";
+import { resyncFromAdapterSafely } from "../game/staleStateWatchdog";
 import { DRAFT_DECK_SESSION_KEY } from "./draftStore";
 import { useGameStore } from "./gameStore";
 import {
@@ -62,10 +65,11 @@ import type { DraftGuestRecoveryFailure } from "../adapter/p2p-draft-guest";
 import {
   clearActiveDraftPod,
   clearActiveDraftGuest,
+  clearActiveDraftGuestIfCurrent,
   clearDraftSettlementOutbox,
   loadDraftIntergameCommands,
   loadActiveDraftPod,
-  loadActiveDraftGuest,
+  inspectActiveDraftGuest,
   loadDraftGuestSession,
   loadDraftSettlementOutbox,
   saveActiveDraftPod,
@@ -74,6 +78,7 @@ import {
   type ActiveDraftPodMeta,
   type ActiveDraftPodPhase,
 } from "../services/draftPersistence";
+import { getEffectiveOffline } from "./connectivityStore";
 import {
   commandAcknowledgement,
   consumeIntergamePermit,
@@ -96,7 +101,9 @@ import { FORMAT_DEFAULTS } from "./multiplayerStore";
 
 export type DraftRole = "host" | "guest";
 
-export type GuestDraftResumeOutcome = "resumed" | "absent" | "invalid" | "failed" | "superseded";
+export const DRAFT_OFFLINE_ERROR = "offline.startUnavailable";
+
+export type GuestDraftResumeOutcome = "resumed" | "absent" | "invalid" | "failed" | "offline" | "superseded";
 
 /**
  * The pod SESSION's phase.
@@ -122,6 +129,21 @@ export type MultiplayerDraftPhase =
   | "error"
   | "kicked"
   | "hostLeft";
+
+/** True only while a connected pod role has a live draft-session phase. */
+export function isMultiplayerDraftPodLive(
+  state: { role: DraftRole | null; phase: MultiplayerDraftPhase },
+): boolean {
+  return state.role !== null && (
+    state.phase === "connecting"
+    || state.phase === "lobby"
+    || state.phase === "drafting"
+    || state.phase === "deckbuilding"
+    || state.phase === "pairing"
+    || state.phase === "matchInProgress"
+    || state.phase === "roundComplete"
+  );
+}
 
 /**
  * The screen the pod UI shows.
@@ -274,7 +296,7 @@ interface MultiplayerDraftActions {
   /** `true` only after the current adapter initialized and remains owned. */
   hostDraft: (config: DraftPodHostConfig) => Promise<boolean>;
   /** Guest: join an existing draft pod by room code. */
-  joinDraft: (config: DraftPodGuestConfig) => Promise<void>;
+  joinDraft: (config: DraftPodGuestConfig) => Promise<boolean>;
   /** Reconnect exclusively through the persisted capability, never `draft_join`. */
   resumeDraft: (options?: { routeToken?: number; signal?: AbortSignal }) => Promise<GuestDraftResumeOutcome>;
   /** Host: start the draft once the pod is ready. */
@@ -305,8 +327,9 @@ interface MultiplayerDraftActions {
   requestPause: () => void;
   /** Host: resume the draft. */
   requestResume: () => void;
-  /** Both: tear down the connection and reset state. */
-  leave: (preserveSession?: boolean) => Promise<void>;
+  /** Both: tear down the connection and reset state. Lifecycle callers retain
+   * recovery; an explicit leave revokes it only after host acknowledgement. */
+  leave: (preserveRecovery?: boolean) => Promise<void>;
   /** Reset store to initial state (without network cleanup). */
   reset: () => void;
   /** Both: start the match for the current pairing. */
@@ -465,8 +488,7 @@ function applyDestination(
   for (const instanceId of instanceIds) {
     const placement = next.placements[instanceId];
     if (!placement) continue;
-    next = updateWorkspacePlacement(next, pool, instanceId, {
-      ...placement,
+    next = appendWorkspaceInstanceToResolvedDestination(next, pool, instanceId, {
       zone: destination,
       column: placementHint?.column ?? placement.column,
       row: placementHint?.row ?? placement.row,
@@ -1135,6 +1157,10 @@ export const useMultiplayerDraftStore = create<
   clearError: () => set({ error: null }),
 
   hostDraft: async (config) => {
+    if (getEffectiveOffline()) {
+      set({ error: DRAFT_OFFLINE_ERROR });
+      return false;
+    }
     const epoch = ++draftAdapterEpoch;
     const previous = detachDraftAdapters();
     const previousTeardown = disposeDetachedDraftAdapters(previous, true);
@@ -1142,6 +1168,13 @@ export const useMultiplayerDraftStore = create<
     if (previous.host || previous.guest) await previousTeardown;
     if (config.persistenceId) await claimDraftSessionOwner(config.persistenceId);
     if (epoch !== draftAdapterEpoch || config.signal?.aborted) return false;
+    if (getEffectiveOffline()) {
+      // Replacement teardown was authorized before connectivity changed. This
+      // epoch now owns the detached lifecycle, so it must not leave the prior
+      // role/phase live after declining to construct its successor.
+      set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
+      return false;
+    }
 
     const generation = beginDraftLifecycle();
     const adapter = new DraftPodHostAdapter();
@@ -1215,18 +1248,32 @@ export const useMultiplayerDraftStore = create<
         config.signal?.removeEventListener("abort", abortOwner);
         activeHostRouteAbortListener = null;
         await disposeHostAdapter(adapter, true);
+        if (epoch === draftAdapterEpoch && getEffectiveOffline()) {
+          set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
+        }
       }
     }
     return false;
   },
 
   joinDraft: async (config) => {
+    if (getEffectiveOffline()) {
+      set({ error: DRAFT_OFFLINE_ERROR });
+      return false;
+    }
     const epoch = ++draftAdapterEpoch;
     const previous = detachDraftAdapters();
     const previousTeardown = disposeDetachedDraftAdapters(previous, true);
     retainDraftSessionTeardown(previous.hostPersistenceId, previousTeardown);
     if (previous.host || previous.guest) await previousTeardown;
-    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return;
+    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return false;
+    if (getEffectiveOffline()) {
+      // See hostDraft: this current replacement owns the already-detached
+      // lifecycle and must publish an idle offline state rather than a phantom
+      // connecting/lobby owner with no adapter.
+      set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
+      return false;
+    }
 
     const generation = beginDraftLifecycle();
     const adapter = new DraftPodGuestAdapter();
@@ -1264,6 +1311,7 @@ export const useMultiplayerDraftStore = create<
     try {
       await adapter.initialize({ ...config, signal: lifecycleSignal(controller) });
       initialized = true;
+      if (activeGuestAdapter === adapter && epoch === draftAdapterEpoch) return true;
     } catch {
       // See hostDraft: only the current owner is allowed to project errors.
     } finally {
@@ -1278,11 +1326,19 @@ export const useMultiplayerDraftStore = create<
         config.signal?.removeEventListener("abort", abortOwner);
         activeGuestRouteAbortListener = null;
         await disposeGuestAdapter(adapter);
+        if (epoch === draftAdapterEpoch && getEffectiveOffline()) {
+          set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
+        }
       }
     }
+    return false;
   },
 
   resumeDraft: async (options = {}) => {
+    if (getEffectiveOffline()) {
+      set({ error: DRAFT_OFFLINE_ERROR });
+      return "offline";
+    }
     const routeToken = options.routeToken ?? 0;
     if (
       resumeGuestDraftAttempt
@@ -1300,16 +1356,50 @@ export const useMultiplayerDraftStore = create<
     const isCurrent = () => resumeGuestDraftAttempt === attempt && !options.signal?.aborted;
     attempt.promise = (async (): Promise<GuestDraftResumeOutcome> => {
       if (options.signal?.aborted) return "superseded";
-      const locator = loadActiveDraftGuest();
-      if (!locator) return "absent";
-      const session = await loadDraftGuestSession(locator.hostPeerId, locator);
-      if (!isCurrent()) return "superseded";
+      const active = inspectActiveDraftGuest();
+      if (active.type === "absent") return "absent";
+      if (active.type === "invalid") {
+        if (active.capture) clearActiveDraftGuestIfCurrent(active.capture);
+        else clearActiveDraftGuest();
+        return "invalid";
+      }
+      const { meta: locator, capture } = active;
+      const startingEpoch = draftAdapterEpoch;
+      const locatorIsCurrent = () => {
+        const current = inspectActiveDraftGuest();
+        return current.type === "present"
+          && current.capture.roomCode === capture.roomCode
+          && current.capture.displayName === capture.displayName
+          && current.capture.hostPeerId === capture.hostPeerId
+          && current.capture.timestamp === capture.timestamp;
+      };
+        let session: Awaited<ReturnType<typeof loadDraftGuestSession>>;
+      try {
+        session = await loadDraftGuestSession(locator.hostPeerId, locator);
+      } catch {
+        if (!isCurrent() || draftAdapterEpoch !== startingEpoch || !locatorIsCurrent()) return "superseded";
+        if (getEffectiveOffline()) {
+          set({ error: DRAFT_OFFLINE_ERROR });
+          return "offline";
+        }
+        return "failed";
+      }
+      if (!isCurrent() || draftAdapterEpoch !== startingEpoch || !locatorIsCurrent()) return "superseded";
+      if (getEffectiveOffline()) {
+        set({ error: DRAFT_OFFLINE_ERROR });
+        return "offline";
+      }
       if (!session) {
-        clearActiveDraftGuest();
+        clearActiveDraftGuestIfCurrent(capture);
         return "invalid";
       }
 
-      await get().joinDraft({
+      if (!isCurrent() || draftAdapterEpoch !== startingEpoch || !locatorIsCurrent()) return "superseded";
+      if (getEffectiveOffline()) {
+        set({ error: DRAFT_OFFLINE_ERROR });
+        return "offline";
+      }
+      const joined = await get().joinDraft({
         kind: "reconnect",
         roomCode: locator.roomCode,
         displayName: locator.displayName,
@@ -1318,9 +1408,13 @@ export const useMultiplayerDraftStore = create<
         signal: options.signal,
       });
       if (!isCurrent()) return "superseded";
-      if (activeGuestAdapter) return "resumed";
+      if (joined) return "resumed";
+      if (getEffectiveOffline()) {
+        set({ error: DRAFT_OFFLINE_ERROR });
+        return "offline";
+      }
       if (get().guestRecoveryFailure?.kind === "invalid") {
-        clearActiveDraftGuest();
+        clearActiveDraftGuestIfCurrent(capture);
         return "invalid";
       }
       return "failed";
@@ -1335,6 +1429,10 @@ export const useMultiplayerDraftStore = create<
 
   startDraft: async (botFillEmptySeats = true) => {
     if (!activeHostAdapter) return;
+    if (getEffectiveOffline()) {
+      set({ error: DRAFT_OFFLINE_ERROR });
+      return;
+    }
     await activeHostAdapter.startDraft(botFillEmptySeats);
   },
 
@@ -1363,6 +1461,7 @@ export const useMultiplayerDraftStore = create<
   }),
 
   selectCard: (cardInstanceId) => {
+    if (get().pickInteractionLocked) return;
     set({ selectedCard: cardInstanceId });
   },
 
@@ -1488,7 +1587,7 @@ export const useMultiplayerDraftStore = create<
     if (
       role !== "host" ||
       !view ||
-      view.kind !== "CommanderDraft" ||
+      view.launch_capability !== "CommanderMultiplayer" ||
       view.status !== "Complete" ||
       seatIndex === null ||
       !activeHostAdapter
@@ -1567,7 +1666,12 @@ export const useMultiplayerDraftStore = create<
             resolveRoomFull();
           }
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              // A rejected delivery is otherwise gone and the screen freezes
+              // on the previous state — surface it and re-sync immediately.
+              debugLog(`draft-match remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "stateChanged") {
             const wf = event.snapshot.state?.waiting_for;
@@ -1653,7 +1757,12 @@ export const useMultiplayerDraftStore = create<
 
         matchAdapter.onEvent((event) => {
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              // A rejected delivery is otherwise gone and the screen freezes
+              // on the previous state — surface it and re-sync immediately.
+              debugLog(`draft-match remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "stateChanged") {
             const wf = event.snapshot.state?.waiting_for;
@@ -1897,20 +2006,31 @@ export const useMultiplayerDraftStore = create<
     });
   },
 
-  leave: async (preserveSession = false) => {
+  leave: async (preserveRecovery = false) => {
+    const host = activeHostAdapter;
+    const guest = activeGuestAdapter;
+
+    // An explicit guest leave is host-acknowledged. Until that completes, the
+    // live adapter remains the recovery owner; tearing down the lifecycle here
+    // would discard the session that must reconnect after a dropped ACK.
+    if (host) {
+      await host.dispose({ preserveSession: preserveRecovery });
+    }
+    if (guest) {
+      await guest.dispose({ preserveRecovery });
+    }
+
     beginDraftLifecycle();
-    // Dispose match adapter first (game P2P connection)
+    // The pod session has now ended, so its game transport can follow it.
     disposeMatchAdapter(set);
 
-    if (activeHostAdapter) {
-      await activeHostAdapter.dispose({ preserveSession });
+    if (activeHostAdapter === host) {
       activeHostAdapter = null;
-      if (!preserveSession) {
+      if (!preserveRecovery) {
         clearActiveDraftPod();
       }
     }
-    if (activeGuestAdapter) {
-      await activeGuestAdapter.dispose();
+    if (activeGuestAdapter === guest) {
       activeGuestAdapter = null;
     }
     set({ ...initialState, interactionGeneration: lifecycleGeneration });

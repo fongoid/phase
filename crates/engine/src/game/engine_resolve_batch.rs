@@ -488,6 +488,27 @@ pub fn classify_restored_stack_automation(state: &GameState) -> RestoredStackAut
             RestoredStackAutomation::Repair
         };
     }
+    // A pending consent prompt is a live decision, not automation to resume, so
+    // a coherent one classifies as `None` like any ordinary prompt. An
+    // incoherent one is the third unanswerable saved authorization, alongside a
+    // stale session and a run-less Ready latch: its representative can neither
+    // Grant nor Decline, and `WaitingFor::ResolveAllConsent` has no consumer
+    // entry point of its own that could repair it later. `repair_restored_stack_automation`
+    // already routes a consent wait to `rebase_invalid_resolve_all_consent`;
+    // only this classification was missing.
+    if let WaitingFor::ResolveAllConsent {
+        epoch,
+        representative,
+    } = &state.waiting_for
+    {
+        if !state
+            .resolve_all_consent_run
+            .as_ref()
+            .is_some_and(|run| run.accepts_response_from(*epoch, *representative))
+        {
+            return RestoredStackAutomation::Repair;
+        }
+    }
     RestoredStackAutomation::None
 }
 
@@ -978,7 +999,7 @@ mod tests {
         AbilityCost, AbilityDefinition, AbilityKind, CopyRetargetPermission, Effect,
         ManaContribution, ManaProduction, QuantityExpr, ResolvedAbility, TargetFilter,
     };
-    use crate::types::actions::ResolveAllConsentDecision;
+    use crate::types::actions::{ResolveAllConsentDecision, ResolveAllScope};
     use crate::types::card_type::{CardType, CoreType};
     use crate::types::format::FormatConfig;
     use crate::types::game_state::{
@@ -1375,7 +1396,10 @@ mod tests {
         super::super::engine::apply(
             &mut state,
             PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 0 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 0,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("priority holder begins the consent run");
         let epoch = match &state.waiting_for {
@@ -1428,7 +1452,10 @@ mod tests {
         super::super::engine::apply(
             &mut state,
             PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 0 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 0,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("priority holder begins the consent run");
         let epoch = match &state.waiting_for {

@@ -1,5 +1,5 @@
-import { Suspense, useState } from "react";
-import { Link, Outlet } from "react-router";
+import { Suspense, useRef, useState } from "react";
+import { Link, Outlet, useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
 
 import { useChangelog } from "../../hooks/useChangelog";
@@ -11,6 +11,7 @@ import { ChromeControls } from "./ChromeControls";
 import { Rail } from "./Rail";
 import { DraftShellChromeProvider, ShellProvider, type DraftShellChromeConfig } from "./ShellContext";
 import { SocialBar } from "./SocialBar";
+import { StatusBanner } from "./StatusBanner";
 import { TabBar } from "./TabBar";
 import { HomeIcon } from "./navIcons";
 
@@ -28,17 +29,27 @@ export function AppShell() {
   // The shell owns settings-modal state so the rail's Settings button and the
   // (controlled) ChromeControls cog share one PreferencesModal instance.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsReturnFocusRef = useRef<HTMLButtonElement>(null);
 
   // "What's New": the unread dot lives on the rail, the modal is shell-owned.
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [draftChromeConfig, setDraftChromeConfig] = useState<DraftShellChromeConfig>({ mode: "default" });
-  const { mode: draftChromeMode, phoneAction, showProgress = true } = draftChromeConfig;
+  const { mode: draftChromeMode, phoneAction, showProgress = true, topActions = [] } = draftChromeConfig;
   const phoneDraftChrome = draftChromeMode === "phone-drafting" || draftChromeMode === "phone-deckbuilding";
+  const draftTopRowChrome = phoneDraftChrome || draftChromeMode === "tablet-drafting";
   const responsiveDraftChrome = draftChromeMode !== "default";
   const shellDraftPhase = draftChromeMode === "phone-deckbuilding" || draftChromeMode === "tablet-deckbuilding"
     ? "deckbuilding"
     : "drafting";
   const changelog = useChangelog();
+  // The operator status banner targets exactly the landing surface and the
+  // online lobby, so the shell owns the route gate rather than the (propless)
+  // banner: keeping it here means the banner's fetch + poll never start on any
+  // other shell route. The gate is also load-bearing for layout — the deck
+  // builder shell is sized with a hard calc(100dvh - …) that a block-level
+  // banner would silently overflow — so widening it is not free.
+  const { pathname } = useLocation();
+  const showStatusBanner = pathname === "/" || pathname === "/multiplayer";
   const openWhatsNew = () => {
     setWhatsNewOpen(true);
     changelog.openAndLoad();
@@ -73,7 +84,10 @@ export function AppShell() {
         <div className={`relative z-10 flex ${responsiveDraftChrome ? "h-full min-h-0" : "min-h-screen"}`}>
           {!phoneDraftChrome && (
             <Rail
-              onSettings={() => setSettingsOpen(true)}
+              onSettings={(launcher) => {
+                settingsReturnFocusRef.current = launcher;
+                setSettingsOpen(true);
+              }}
               onWhatsNew={openWhatsNew}
               hasUnread={changelog.hasUnread}
             />
@@ -86,7 +100,7 @@ export function AppShell() {
               ? "sticky top-0 z-30 flex min-h-[calc(env(safe-area-inset-top)+52px)] items-center gap-2 px-2 pb-1 pt-[calc(env(safe-area-inset-top)+1rem)]"
               : "sticky top-0 z-30 flex min-h-[calc(env(safe-area-inset-top)+44px)] items-center px-2 pb-1 pt-[calc(env(safe-area-inset-top)+0.5rem)] min-[820px]:min-h-[calc(env(safe-area-inset-top)+56px)] min-[820px]:px-4 min-[820px]:pt-[calc(env(safe-area-inset-top)+0.75rem)]"}
             >
-              {phoneDraftChrome && (
+              {draftTopRowChrome && (
                 <>
                   <Link
                     to="/"
@@ -108,6 +122,24 @@ export function AppShell() {
                       {phoneAction.icon}
                     </button>
                   )}
+                  {topActions.map((action) => (
+                    <button
+                      key={action.id}
+                      type="button"
+                      data-draft-top-action={action.id}
+                      onClick={action.onClick}
+                      disabled={action.disabled}
+                      aria-label={action.label}
+                      title={action.label}
+                      className={`relative z-10 flex min-h-11 shrink-0 items-center justify-center rounded-[8px] border px-2 text-[10px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${action.tone === "danger"
+                        ? "border-rose-400/35 bg-rose-950/45 text-rose-200 hover:border-rose-300/55"
+                        : action.tone === "emerald"
+                          ? "border-emerald-400/35 bg-emerald-950/45 text-emerald-200 hover:border-emerald-300/55"
+                          : "border-hairline bg-black/45 text-fg-muted hover:border-white/15 hover:bg-slate-950"}`}
+                    >
+                      {action.label}
+                    </button>
+                  ))}
                 </>
               )}
               {responsiveDraftChrome && showProgress ? (
@@ -129,6 +161,10 @@ export function AppShell() {
             {/* Inner Suspense so a lazy route's load swaps ONLY the content area —
                 the rail/scene persist (true SPA feel). */}
             <main className={`shell-content min-h-0 min-w-0 flex-1 ${responsiveDraftChrome ? "overflow-hidden" : "max-[820px]:pb-[76px]"}`}>
+              {/* Above the Suspense boundary, not inside it: a banner mounted
+                  inside would be swapped out for the route spinner on every
+                  lazy-chunk load and blink away on each navigation. */}
+              {showStatusBanner && <StatusBanner />}
               <Suspense
                 fallback={
                   <div className="flex min-h-full items-center justify-center py-24">
@@ -146,6 +182,7 @@ export function AppShell() {
         <ChromeControls
           settingsOpen={settingsOpen}
           onSettingsOpenChange={setSettingsOpen}
+          settingsReturnFocusRef={settingsReturnFocusRef}
           hideVolume={phoneDraftChrome}
           hideLanguage={phoneDraftChrome}
         />

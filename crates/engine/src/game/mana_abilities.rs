@@ -6539,6 +6539,7 @@ mod tests {
         let exile_with_alt_cost = |graveyard_replacement: Option<
             SpellStackToGraveyardReplacement,
         >| CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::generic(0),
             cast_transformed: false,
@@ -6561,7 +6562,7 @@ mod tests {
         let free_cast =
             |zones: Vec<Zone>, graveyard_replacement: Option<SpellStackToGraveyardReplacement>| {
                 Effect::FreeCastFromZones {
-                    count: 1,
+                    count: Some(1),
                     max_total_mv: None,
                     filter: TargetFilter::Any,
                     zones,

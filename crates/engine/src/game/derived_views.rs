@@ -728,6 +728,12 @@ pub struct DerivedViews {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
 
+    /// CR 702.40a: the public number of copies the current Storm trigger will
+    /// create, or that a newly cast Storm spell would create when no Storm
+    /// trigger is pending. It is table-wide; spell copies never increment it.
+    #[serde(default)]
+    pub storm_count: u32,
+
     /// CR 702.40a: copy counts for Storm spells in the viewing player's hand.
     /// Keyed only by that viewer's hand object ids so hidden opponents' card
     /// abilities and the table-wide spell ledger cannot leak through the view.
@@ -754,6 +760,20 @@ pub struct DerivedViews {
     /// no granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
+
+    /// CR 709.5b + CR 709.5e + CR 707.2: both halves of each battlefield Room,
+    /// resolved through `room::effective_room_halves` so a permanent that is a
+    /// COPY of a Room reports the halves it COPIED. The unlock special action
+    /// names a half and costs that half's mana cost, and for a copy neither is
+    /// on the recipient's own printed card — its `back_face` is empty and its
+    /// printed name is its own. Deriving printed order is engine work besides
+    /// (`room::live_face_door` reads `modal_back_face`, the CR 709.5d mapping),
+    /// so the frontend is handed the resolved pair and only formats it.
+    ///
+    /// Face-down permanents are excluded: CR 708.2a gives them no name or mana
+    /// cost to publish.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub room_half_identities: HashMap<ObjectId, crate::types::ability::RoomCopiableHalves>,
 
     /// Player-affecting continuous conditions (CR 104.2b / 119.7 / 119.8 /
     /// 118.3 / 101.2 / 702.50b) the HUD renders as status icons. Aggregates
@@ -1038,10 +1058,22 @@ impl<'a> ClientGameStateRef<'a> {
     }
 }
 
-/// Owned counterpart for deserialize paths (round-trip tests, any future
-/// state-restore flow that ingests the wire format). The JSON shape matches
+/// Owned counterpart for deserialize paths. The JSON shape matches
 /// `ClientGameStateRef` exactly — fields named identically, no
 /// `#[serde(flatten)]` — so serialize/deserialize round-trip is lossless.
+///
+/// A [`ClientGameStateRef::wrap_filtered`] payload is a VIEWER PROJECTION: its
+/// `state` half carries `viewer_projection: Some(..)`. That decodes fine here —
+/// displaying a projection is exactly what this type is for.
+///
+/// What a projection may NOT do is come back as a saved game. A state-restore
+/// flow must ingest an authoritative snapshot through the
+/// `TrustedGameStateEnvelope` / `PersistedGameState` route, where
+/// `reject_viewer_projection_as_authority` refuses a marked projection. That is
+/// deliberate: a projection has had the RNG seed zeroed, the rules journal
+/// cleared and every private resume cursor blanked while its public
+/// `waiting_for` survives, so installing one leaves a prompt no player can
+/// answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientGameState {
     pub state: GameState,
@@ -1390,6 +1422,7 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         debug_library_cards: debug_library_cards(state, viewer),
         current_target_kind: current_target_kind(state),
         dungeon_rooms: dungeon_rooms(state),
+        storm_count: storm_count(state),
         ..DerivedViews::default()
     };
 
@@ -1427,6 +1460,14 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         }
         if let Some(source_id) = temporary_cant_be_blocked_source(state, obj_id) {
             views.temporary_cant_be_blocked.insert(obj_id, source_id);
+        }
+        // CR 709.5b + CR 708.2a: publish a Room's two halves for the unlock
+        // offer. Room-ness is this caller's gate — `effective_room_halves` is a
+        // pure projection and does not check it (see its doc).
+        if !obj.face_down && obj.card_types.subtypes.iter().any(|s| s == "Room") {
+            views
+                .room_half_identities
+                .insert(obj_id, crate::game::room::effective_room_halves(obj));
         }
         if obj.card_types.core_types.contains(&CoreType::Creature)
             && crate::game::combat::has_cant_be_blocked_static_from_precomputed(
@@ -1542,13 +1583,8 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
                             .iter()
                             .any(|keyword| matches!(keyword, Keyword::Storm)))
                 {
-                    let copy_count = *copy_count.get_or_insert_with(|| {
-                        state
-                            .spells_cast_this_turn_by_player
-                            .values()
-                            .map(|records| records.len())
-                            .sum::<usize>() as u32
-                    });
+                    let copy_count =
+                        *copy_count.get_or_insert_with(|| spells_cast_this_turn(state));
                     views.prospective_storm_counts.insert(hand_id, copy_count);
                 }
             }
@@ -1976,6 +2012,41 @@ pub fn derive_filtered_views(
     // combat records unrelated to rendering.
     views.blocker_assignment_pairs = blocker_assignment_pairs(authoritative_state);
     views
+}
+
+/// CR 702.40a: Storm counts each other spell cast before it this turn. A
+/// pending Storm trigger carries the cast-time snapshot that the production
+/// trigger uses, so it excludes its own spell even though that spell is already
+/// in the cast ledger. With no pending Storm trigger, the ledger total is the
+/// number a newly cast Storm spell would snapshot.
+fn storm_count(state: &GameState) -> u32 {
+    state
+        .stack
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count }),
+                ..
+            } => Some(*copy_count),
+            StackEntryKind::Spell { .. }
+            | StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::TriggeredAbility { .. }
+            | StackEntryKind::KeywordAction { .. } => None,
+        })
+        .unwrap_or_else(|| spells_cast_this_turn(state))
+}
+
+/// The table-wide count of spells actually cast this turn. This is intentionally
+/// private: public Storm presentation must use [`storm_count`] so an active
+/// Storm trigger uses its cast-time snapshot rather than including itself.
+fn spells_cast_this_turn(state: &GameState) -> u32 {
+    state
+        .spells_cast_this_turn_by_player
+        .values()
+        .fold(0, |count, records| {
+            count.saturating_add(records.len() as u32)
+        })
 }
 
 fn visible_exile_object_ids(state: &GameState) -> BTreeMap<PlayerId, Vec<ObjectId>> {
@@ -3523,10 +3594,15 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered client state");
-        let client: ClientGameState =
-            serde_json::from_str(&json).expect("deserialize filtered client state");
+        // A `wrap_filtered` payload is a viewer projection, which
+        // `reject_viewer_projection_as_authority` refuses at decode — so decode the
+        // `derived` half alone, which is what this test asserts on anyway.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
         assert_eq!(
-            client.derived.blocker_assignment_pairs,
+            derived.blocker_assignment_pairs,
             vec![(blocker, attacker)],
             "the authoritative public blocking pair survives the filtered viewer wire path"
         );
@@ -3594,19 +3670,27 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered debug viewer state");
-        let client: ClientGameState =
-            serde_json::from_str(&wire).expect("deserialize filtered debug viewer state");
+        // A `wrap_filtered` payload is a viewer projection and no longer decodes as a
+        // whole `ClientGameState`. Neither claim below needs a `GameState` to exist: the
+        // redaction claim is about the WIRE, so read it off the wire directly (the idiom
+        // `temporary_cant_be_blocked_view.rs` already uses), and decode only `derived`.
+        let wire: serde_json::Value =
+            serde_json::from_str(&wire).expect("inspect filtered debug viewer wire");
 
         assert_eq!(
-            client.state.objects[&own].name, "Hidden Card",
+            wire["state"]["objects"][own.0.to_string()]["name"],
+            "Hidden Card",
             "normal filtered library objects must remain hidden"
         );
         assert_eq!(
-            client.state.objects[&opponent].name, "Hidden Card",
+            wire["state"]["objects"][opponent.0.to_string()]["name"],
+            "Hidden Card",
             "an opponent's library must remain hidden"
         );
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered debug derived views");
         assert_eq!(
-            client.derived.debug_library_cards,
+            derived.debug_library_cards,
             vec![
                 DebugLibraryCardView {
                     object_id: own,
@@ -3627,7 +3711,7 @@ mod tests {
             serde_json::from_str(&local_wire).expect("deserialize local debug viewer state");
         assert_eq!(
             local.derived.debug_library_cards,
-            client.derived.debug_library_cards
+            derived.debug_library_cards
         );
 
         let unauthorized = derive_views(&state, Some(PlayerId(1)));
@@ -3779,7 +3863,7 @@ mod tests {
         let values = crate::game::printed_cards::intrinsic_copiable_values(
             state.objects.get(&target).unwrap(),
         );
-        let tce_id = state.add_transient_continuous_effect(
+        let tce_id = state.add_transient_continuous_effect_with_bindings(
             source,
             PlayerId(0),
             Duration::ForAsLongAs {
@@ -3795,10 +3879,19 @@ mod tests {
                 token_image_ref: None,
             }],
             None,
+            crate::types::game_state::TransientContinuousEffectBindings {
+                affected_recipient: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&source],
+                    ),
+                ),
+                duration_subject: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&target],
+                    ),
+                ),
+            },
         );
-        // CR 611.2b: the duration tracks the copy TARGET's tap state, not the
-        // source's — the same binding the layer engine uses.
-        state.set_transient_duration_subject(tce_id, target);
 
         assert_eq!(
             derive_views(&state, None).copied_permanents,
@@ -4438,6 +4531,104 @@ mod tests {
     }
 
     #[test]
+    fn storm_count_uses_the_current_storm_trigger_snapshot_table_wide() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let p0_prior = scenario
+            .add_spell_to_hand(P0, "P0 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let p1_prior = scenario
+            .add_spell_to_hand(P1, "P1 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let storm_spell = scenario
+            .add_spell_to_hand(P0, "Storm spell", true)
+            .with_keyword(Keyword::Storm)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+
+        runner.cast(p0_prior).resolve();
+        runner.state_mut().priority_player = P1;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+        runner.cast(p1_prior).resolve();
+        runner.state_mut().priority_player = P0;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+
+        // This exercises the full cast pipeline: the current Storm spell is
+        // already in the ledger when its production trigger snapshots the two
+        // earlier table-wide casts.
+        let committed = runner.cast(storm_spell).commit();
+        let state = committed.state();
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P0)
+                .map_or(0, im::Vector::len),
+            2,
+            "the current Storm spell is recorded alongside P0's earlier cast"
+        );
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P1)
+                .map_or(0, im::Vector::len),
+            1,
+            "an opponent's earlier cast contributes to Storm"
+        );
+        assert!(state.stack.iter().any(|entry| matches!(
+            &entry.kind,
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+                ..
+            }
+        )));
+        for viewer in [P0, P1, PlayerId(2)] {
+            assert_eq!(derive_views(state, Some(viewer)).storm_count, 2);
+        }
+        assert_eq!(
+            serde_json::to_value(derive_views(state, Some(PlayerId(2))))
+                .expect("serialize public storm projection")["storm_count"],
+            2,
+        );
+
+        let outcome = committed.resolve();
+        assert_eq!(
+            outcome
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::SpellCopied { original_id, .. } if *original_id == storm_spell
+                ))
+                .count(),
+            2,
+            "the production Storm trigger creates one copy for each prior spell"
+        );
+        assert_eq!(
+            outcome
+                .state()
+                .spells_cast_this_turn_by_player
+                .values()
+                .map(im::Vector::len)
+                .sum::<usize>(),
+            3,
+            "the generated spell copies do not enter the cast ledger"
+        );
+
+        // The turn-transition authority clears the table-wide cast ledger.
+        crate::game::turns::start_next_turn(runner.state_mut(), &mut Vec::new());
+        assert!(runner.state().spells_cast_this_turn_by_player.is_empty());
+        assert_eq!(
+            derive_views(runner.state(), Some(PlayerId(2))).storm_count,
+            0
+        );
+    }
+
+    #[test]
     fn prospective_storm_counts_include_effectively_granted_storm() {
         use crate::types::ability::{ControllerRef, StaticDefinition, TypeFilter, TypedFilter};
 
@@ -4772,9 +4963,13 @@ mod tests {
             Some(PlayerId(1)),
         ))
         .expect("serialize filtered opponent view");
-        let client: ClientGameState = serde_json::from_str(&json).expect("deserialize client view");
-        let details = client
-            .derived
+        // A `wrap_filtered` payload is a viewer projection; decode only the `derived`
+        // half, which is the half this test asserts on.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
+        let details = derived
             .stack_entry_details
             .get(&spell)
             .expect("public pending spell has stack details");
@@ -5079,6 +5274,12 @@ mod tests {
         ))
         .expect("serialize filtered client state");
 
+        // BOTH wires are refused for the SAME reason: client redaction drops
+        // `pending_trigger_firing` while `pending_trigger` stands. The
+        // `viewer_projection` marker rides along on the filtered wire but does NOT
+        // refuse here — this is the transport decode path, which carries projections
+        // on purpose. The marker only refuses on the persistence ingress; see
+        // `tests/integration/viewer_projection_ingest_gate.rs`.
         for client_state in [&client["state"], &filtered_client["state"]] {
             let error = serde_json::from_value::<GameState>(client_state.clone())
                 .expect_err("redacted client state must not restore as trusted authority");
@@ -5086,7 +5287,8 @@ mod tests {
                 error
                     .to_string()
                     .contains("pending trigger has no firing carrier"),
-                "client redaction must fail only because it removes private trigger authority: {error}"
+                "client redaction must fail only because it removes private trigger \
+                 authority: {error}"
             );
             for private_field in [
                 "next_delayed_trigger_token",
@@ -5319,6 +5521,98 @@ mod tests {
         assert!(
             afflicted.contains(&PlayerId(0)) && afflicted.contains(&PlayerId(2)),
             "both opponents (P0, P2) should be cast-locked",
+        );
+    }
+
+    /// CR 709.5b + CR 707.2 + CR 708.2a: the published halves come from the
+    /// EFFECTIVE form. A permanent that copies a Room has no `back_face` of its
+    /// own, so a projection off its printed shape would report a single half
+    /// named after the recipient — the copied pair is the only correct answer.
+    /// A face-down permanent publishes nothing, and a non-Room is absent.
+    ///
+    /// Revert-failing assertions: the copy's two halves (drop
+    /// `effective_room_halves` for `own_room_halves` and both names are wrong)
+    /// and the face-down absence (drop the `face_down` guard and it appears).
+    #[test]
+    fn room_half_identities_report_the_copied_halves_and_skip_face_down() {
+        use crate::types::ability::{RoomCopiableHalves, RoomHalfIdentity};
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new(FormatConfig::standard(), 2, 7);
+
+        let halves = RoomCopiableHalves {
+            left: RoomHalfIdentity {
+                name: "Greenhouse".to_string(),
+                mana_cost: ManaCost::default(),
+            },
+            right: Some(RoomHalfIdentity {
+                name: "Rickety Gazebo".to_string(),
+                mana_cost: ManaCost::default(),
+            }),
+        };
+
+        // A Copy Enchantment that entered as a copy of a two-halved Room: its
+        // OWN printed shape is a single-faced enchantment.
+        let copy = create_object(
+            &mut state,
+            CardId(9100),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&copy).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves.clone());
+        }
+
+        // Same shape, but face down (CR 708.2a).
+        let hidden = create_object(
+            &mut state,
+            CardId(9101),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&hidden).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves);
+            obj.face_down = true;
+        }
+
+        // An ordinary permanent that is not a Room at all.
+        let bear = create_object(
+            &mut state,
+            CardId(9102),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+
+        let published = views
+            .room_half_identities
+            .get(&copy)
+            .expect("a battlefield Room publishes its halves");
+        assert_eq!(published.left.name, "Greenhouse");
+        assert_eq!(
+            published.right.as_ref().map(|half| half.name.as_str()),
+            Some("Rickety Gazebo"),
+            "the right door exists through the COPIED halves, not through the \
+             recipient's own (absent) back face"
+        );
+
+        assert!(
+            !views.room_half_identities.contains_key(&hidden),
+            "CR 708.2a: a face-down permanent has no name or mana cost to publish"
+        );
+        assert!(
+            !views.room_half_identities.contains_key(&bear),
+            "a non-Room permanent has no halves"
         );
     }
 

@@ -37,6 +37,8 @@ import { AI_DECK_RANDOM, usePreferencesStore } from "../stores/preferencesStore"
 import { effectiveAiDifficulty } from "../services/cedhLock";
 import { createGameLoopController } from "../game/controllers/gameLoopController";
 import { dispatchAction, processRemoteUpdate } from "../game/dispatch";
+import { resyncFromAdapterSafely } from "../game/staleStateWatchdog";
+import { debugLog } from "../game/debugLog";
 import { clearPromptOverlayState } from "../game/sessionCleanup";
 import { useGameplayPreferencesSync } from "../hooks/useGameplayPreferencesSync";
 import { hostRoom, joinRoom } from "../network/connection";
@@ -522,6 +524,12 @@ export interface GameProviderProps {
   roomName?: string;
   source?: string;
   draftId?: string;
+  /**
+   * The lobby authority this join or spectate was launched from, carried by
+   * the route (`/game?...&server=`). Absent for flows with no explicit
+   * origin, which fall back to the hosting server via `detectServerUrl()`.
+   */
+  serverUrl?: string;
   onWsEvent?: (event: WsAdapterEvent) => void;
   onP2PEvent?: (event: P2PAdapterEvent) => void;
   onReady?: () => void;
@@ -549,6 +557,7 @@ export function GameProvider({
   roomName,
   source,
   draftId,
+  serverUrl: originUrl,
   onWsEvent,
   onP2PEvent,
   onReady,
@@ -745,7 +754,10 @@ export function GameProvider({
             }
           }
           if (event.type === "stateChanged") {
-            processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              debugLog(`p2p remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "guestConnected") {
             notifyOpponentJoined(tRef.current);
@@ -1176,7 +1188,15 @@ export function GameProvider({
             return;
           }
         }
-        const serverUrl = import.meta.env.VITE_WS_URL ?? await detectServerUrl();
+        // Origin precedence: an explicit build override wins; then the
+        // server a resumable session was recorded on (that server holds the
+        // session); then the origin the route carried; and only with none of
+        // those, this client's hosting server.
+        const serverUrl =
+          import.meta.env.VITE_WS_URL
+          ?? reconnectSession?.serverUrl
+          ?? originUrl
+          ?? await detectServerUrl();
         if (cancelled) return;
 
         wsAdapter = new WebSocketAdapter(
@@ -1221,7 +1241,10 @@ export function GameProvider({
             if (needAdapter) {
               useGameStore.setState({ adapter: wsAdapter });
             }
-            processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets).catch((err) => {
+              debugLog(`remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
             useMultiplayerStore.getState().setConnectionStatus("connected");
             const wsState = event.snapshot.state;
             if (
@@ -1662,7 +1685,10 @@ export function GameProvider({
               if (!useGameStore.getState().adapter && adapter) {
                 useGameStore.setState({ adapter });
               }
-              processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets);
+              processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets).catch((err) => {
+                debugLog(`remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+                resyncFromAdapterSafely("delivery rejected");
+              });
             }
             if (event.type === "gameOver") {
               useGameStore.setState({
@@ -1858,7 +1884,7 @@ export function GameProvider({
         scheduleStoreReset(reset);
       }
     };
-  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId]);
+  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId, originUrl]);
 
   return (
     <GameDispatchContext.Provider value={dispatchAction}>

@@ -21,6 +21,13 @@ vi.mock("../../services/draftPersistence", () => ({
 }));
 
 import { P2PDraftHost } from "../p2p-draft-host";
+import type { DraftPlayerView } from "../draft-adapter";
+import {
+  DRAFT_PROTOCOL_VERSION, DraftPauseReason, decodeDraftWireMessage, encodeDraftWireMessage,
+  type DraftMatchBinding, type DraftP2PMessage,
+} from "../../network/draftProtocol";
+import type { DraftPeerSession } from "../../network/draftPeerSession";
+import { FakeDraftDataConnection } from "../../network/__tests__/fakeDraftDataConnection";
 
 type PersistenceHost = {
   adapter: { exportSession: () => Promise<string> };
@@ -35,6 +42,11 @@ type AdmissionHost = PersistenceHost & {
   handleReconnect: (session: unknown, draftToken: string) => Promise<void>;
   guestSessions: Map<number, unknown>;
   seatTokens: Map<number, string>;
+};
+
+type BackupHost = {
+  draftCode: string;
+  uploadBackupSnapshot: (snapshot: unknown) => Promise<void>;
 };
 
 function recoveredHost(hostDisplayName: string): P2PDraftHost {
@@ -69,6 +81,109 @@ function ephemeralHost(hostDisplayName: string): P2PDraftHost {
 describe("P2PDraftHost persistence disposal", () => {
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("redacts canonical Chaos DraftSource assignments before public backup upload", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response("", { status: 200 }));
+    globalThis.fetch = fetchMock;
+
+    try {
+      const host = new P2PDraftHost(
+        { id: "host-peer" } as never,
+        () => () => {},
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
+        "Premier",
+        8,
+        "Host",
+        "Swiss",
+        "Casual",
+        undefined,
+        undefined,
+        undefined,
+        "https://phase.example",
+      );
+      const privateHost = host as unknown as BackupHost;
+      privateHost.draftCode = "ABC123";
+      const snapshot = {
+        draftSessionJson: JSON.stringify({
+          config: {
+            source: {
+              type: "Set",
+              data: {
+                candidate_codes: ["TST", "ALT"],
+                assignments: [["TST", "ALT"], ["ALT", "TST"]],
+              },
+            },
+          },
+        }),
+      };
+
+      await privateHost.uploadBackupSnapshot(snapshot);
+
+      const [, requestInit] = fetchMock.mock.calls[0]!;
+      const request = JSON.parse(requestInit?.body as string);
+      const publicSnapshot = JSON.parse(request.snapshot_json);
+      const publicSession = JSON.parse(publicSnapshot.draftSessionJson);
+      expect(publicSession.config.source).toEqual({
+        type: "Set",
+        data: { candidate_codes: ["TST", "ALT"] },
+      });
+      expect(JSON.parse(snapshot.draftSessionJson).config.source.data.assignments).toEqual([
+        ["TST", "ALT"],
+        ["ALT", "TST"],
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("uploads a canonical Cube DraftSource unchanged", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response("", { status: 200 }));
+    globalThis.fetch = fetchMock;
+
+    try {
+      const host = new P2PDraftHost(
+        { id: "host-peer" } as never,
+        () => () => {},
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
+        "Premier",
+        8,
+        "Host",
+        "Swiss",
+        "Casual",
+        undefined,
+        undefined,
+        undefined,
+        "https://phase.example",
+      );
+      const privateHost = host as unknown as BackupHost;
+      privateHost.draftCode = "ABC123";
+      const snapshot = {
+        draftSessionJson: JSON.stringify({
+          config: {
+            source: {
+              type: "Cube",
+              data: { id: "my-cube", name: "My Cube" },
+            },
+          },
+        }),
+      };
+
+      await privateHost.uploadBackupSnapshot(snapshot);
+
+      const [, requestInit] = fetchMock.mock.calls[0]!;
+      const request = JSON.parse(requestInit?.body as string);
+      const publicSnapshot = JSON.parse(request.snapshot_json);
+      const publicSession = JSON.parse(publicSnapshot.draftSessionJson);
+      expect(publicSession.config.source).toEqual({
+        type: "Cube",
+        data: { id: "my-cube", name: "My Cube" },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("fences a disposed recovery's queued save before a newer recovery can persist", async () => {
@@ -106,6 +221,136 @@ describe("P2PDraftHost persistence disposal", () => {
     await current.dispose();
   });
 
+  it("finishes draft termination after a guest notification send fails", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as PersistenceHost & {
+      hostPeer: { destroy: ReturnType<typeof vi.fn> };
+      hostConnectionUnsub: ReturnType<typeof vi.fn>;
+      guestSessions: Map<number, unknown>;
+      persistenceClosed: boolean;
+    };
+    const failure = new Error("guest transport closed");
+    const failedSession = { send: vi.fn(async () => { throw failure; }), close: vi.fn() };
+    const liveSession = { send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.guestSessions.set(1, failedSession);
+    privateHost.guestSessions.set(2, liveSession);
+    privateHost.hostPeer.destroy = vi.fn();
+    privateHost.hostConnectionUnsub = vi.fn();
+    privateHost.persistSession();
+    await privateHost.persistQueue;
+    expect(saveDraftHostSession).toHaveBeenCalledWith("shared-recovery", expect.any(Object));
+
+    const dispose = vi.spyOn(host, "dispose");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const termination = host.terminateDraft();
+      expect(privateHost.persistenceClosed).toBe(true);
+      await expect(termination).resolves.toBeUndefined();
+
+      const notification = { type: "draft_host_left", reason: "Host left the draft" };
+      expect(failedSession.send).toHaveBeenCalledWith(notification);
+      expect(liveSession.send).toHaveBeenCalledWith(notification);
+      expect(warn).toHaveBeenCalledWith("[P2PDraftHost] termination notification failed:", failure);
+      expect(clearDraftHostSession).toHaveBeenCalledExactlyOnceWith("shared-recovery");
+      expect(liveSession.send).toHaveBeenCalledBefore(clearDraftHostSession);
+      expect(clearDraftHostSession).toHaveBeenCalledBefore(dispose);
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(privateHost.hostConnectionUnsub).toHaveBeenCalledOnce();
+      expect(failedSession.close).toHaveBeenCalledOnce();
+      expect(liveSession.close).toHaveBeenCalledOnce();
+      expect(privateHost.guestSessions.size).toBe(0);
+      expect(privateHost.hostPeer.destroy).toHaveBeenCalledOnce();
+      expect(liveSession.close).toHaveBeenCalledBefore(privateHost.hostPeer.destroy);
+    } finally {
+      warn.mockRestore();
+      dispose.mockRestore();
+      await host.dispose();
+    }
+  });
+
+  it.each(["fresh", "duplicate"] as const)(
+    "retains a %s settlement receipt after acknowledgement send failure and accepts an exact retry once",
+    async (attempt) => {
+      const host = recoveredHost("Host");
+      const privateHost = host as unknown as {
+        adapter: {
+          reportMatchResult: ReturnType<typeof vi.fn>;
+          getViewForSeat: ReturnType<typeof vi.fn>;
+          exportSession: ReturnType<typeof vi.fn>;
+        };
+        draftStarted: boolean;
+        guestSessions: Map<number, unknown>;
+        matchBindings: Map<string, DraftMatchBinding>;
+        settlementReceipts: Map<string, { receiptId: string; revision: number }>;
+        settlementOutbox: Map<string, unknown>;
+        handleGuestMessage: (seat: number, message: DraftP2PMessage) => Promise<void>;
+      };
+      const binding: DraftMatchBinding = {
+        podId: "draft-1", matchId: "match-12", round: 1,
+        sessionKey: "session-1", lease: "lease-1", nonce: "nonce-1", revision: 0,
+        matchAuthoritySeat: 1,
+      };
+      const view = {
+        status: "MatchInProgress",
+        current_round: 1,
+        pairings: [{ match_id: binding.matchId, round: 1, seat_a: 1, seat_b: 2 }],
+      };
+      privateHost.draftStarted = true;
+      privateHost.adapter.reportMatchResult = vi.fn(async () => view);
+      privateHost.adapter.getViewForSeat = vi.fn(async () => view);
+      privateHost.adapter.exportSession = vi.fn(async () => JSON.stringify(view));
+      privateHost.matchBindings.set(binding.matchId, binding);
+      const sendAck = vi.fn<(message: DraftP2PMessage) => Promise<void>>(async () => {});
+      privateHost.guestSessions.set(1, {
+        send: async (message: DraftP2PMessage) => {
+          if (message.type === "draft_match_settlement_ack") await sendAck(message);
+        },
+        close: vi.fn(),
+      });
+      const settlement: DraftP2PMessage = {
+        type: "draft_match_settlement",
+        settlement: { binding, receiptId: "receipt-1", winnerSeat: 1 },
+      };
+      const acknowledgement = {
+        type: "draft_match_settlement_ack", matchId: binding.matchId, receiptId: "receipt-1", revision: 0,
+      };
+      const failure = new Error("acknowledgement transport closed");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        if (attempt === "duplicate") {
+          await privateHost.handleGuestMessage(1, settlement);
+          expect(sendAck).toHaveBeenCalledExactlyOnceWith(acknowledgement);
+          sendAck.mockClear();
+        }
+        sendAck.mockRejectedValueOnce(failure);
+
+        await privateHost.handleGuestMessage(1, settlement);
+
+        await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(
+          "[P2PDraftHost] settlement acknowledgement failed:", failure,
+        ));
+        expect(sendAck).toHaveBeenCalledExactlyOnceWith(acknowledgement);
+        expect(privateHost.settlementReceipts.get(binding.matchId)).toEqual({ receiptId: "receipt-1", revision: 0 });
+        expect(privateHost.settlementOutbox.size).toBe(0);
+        expect(saveDraftHostSession).toHaveBeenLastCalledWith("shared-recovery", expect.objectContaining({
+          settlementReceipts: [{ matchId: binding.matchId, receiptId: "receipt-1", revision: 0 }],
+          settlementOutbox: [],
+        }));
+        expect(saveDraftHostSession).toHaveBeenCalledBefore(sendAck);
+
+        await privateHost.handleGuestMessage(1, settlement);
+
+        expect(sendAck).toHaveBeenCalledTimes(2);
+        expect(sendAck).toHaveBeenLastCalledWith(acknowledgement);
+        expect(privateHost.adapter.reportMatchResult).toHaveBeenCalledExactlyOnceWith(binding.matchId, 1);
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        warn.mockRestore();
+        await host.dispose();
+      }
+    },
+  );
+
   it("releases pause and reconnect state when a disconnected seat becomes a bot or is kicked", async () => {
     const host = ephemeralHost("Host");
     const privateHost = host as unknown as {
@@ -138,6 +383,23 @@ describe("P2PDraftHost persistence disposal", () => {
     privateHost.paused = true;
     await privateHost.kickPlayerDurably(2, "Kicked");
     expect(privateHost.paused).toBe(false);
+    await host.dispose();
+  });
+
+  it("refuses to start a lobby while a retained guest is reconnecting", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: { createMultiplayerDraft: ReturnType<typeof vi.fn> };
+      disconnectedSeats: Map<number, { deadlineAt: number; timer: ReturnType<typeof setTimeout> | null }>;
+      draftStarted: boolean;
+    };
+    privateHost.adapter.createMultiplayerDraft = vi.fn(async () => {});
+    privateHost.disconnectedSeats.set(1, { deadlineAt: Date.now() + 60_000, timer: null });
+
+    await expect(host.startDraft()).rejects.toThrow("Cannot start draft while a player is reconnecting");
+
+    expect(privateHost.adapter.createMultiplayerDraft).not.toHaveBeenCalled();
+    expect(privateHost.draftStarted).toBe(false);
     await host.dispose();
   });
 
@@ -364,7 +626,7 @@ describe("P2PDraftHost persistence disposal", () => {
         adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
         draftStarted: boolean;
         seatTokens: Map<number, string>;
-        armRecoveredGuestGrace: () => void;
+        armRecoveredGuestGrace: (deadlines: Record<number, number>) => boolean;
         expiredDisconnectedSeats: Set<number>;
         disconnectedSeats: Map<number, unknown>;
       };
@@ -372,7 +634,7 @@ describe("P2PDraftHost persistence disposal", () => {
       privateHost.seatTokens.set(1, "guest-token");
       privateHost.adapter.setSeatConnected = vi.fn(async () => {});
       privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
-      privateHost.armRecoveredGuestGrace();
+      privateHost.armRecoveredGuestGrace({ 1: Date.now() + 5 * 60_000 });
 
       await vi.advanceTimersByTimeAsync(5 * 60_000);
       expect(privateHost.expiredDisconnectedSeats.has(1)).toBe(true);
@@ -408,6 +670,596 @@ describe("P2PDraftHost persistence disposal", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("durably revokes a lobby seat before acknowledging its explicit leave", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+
+    await privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session);
+
+    expect(saveDraftHostSession).toHaveBeenCalledBefore(session.send);
+    expect(session.send).toHaveBeenCalledWith({
+      type: "draft_leave_ack", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    });
+    expect(privateHost.seatTokens.has(1)).toBe(false);
+    expect(privateHost.seatNames.has(1)).toBe(false);
+  });
+
+  it.each(["lobby", "started draft"] as const)(
+    "publishes a durable %s leave when the departing connection closes before its acknowledgement",
+    async (phase) => {
+      vi.useFakeTimers();
+      let acceptConnection!: Parameters<ConstructorParameters<typeof P2PDraftHost>[1]>[0];
+      const host = new P2PDraftHost(
+        { id: "host" } as never,
+        (handler) => { acceptConnection = handler; return () => {}; },
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
+        "Premier", 3, "Host", "Swiss", "Competitive", undefined, "shared-recovery", "ABCDE",
+      );
+      const privateHost = host as unknown as {
+        adapter: {
+          draftProcedure: ReturnType<typeof vi.fn>;
+          createMultiplayerDraft: ReturnType<typeof vi.fn>;
+          setSeatConnected: ReturnType<typeof vi.fn>;
+          getViewForSeat: ReturnType<typeof vi.fn>;
+          exportSession: ReturnType<typeof vi.fn>;
+        };
+        guestSessions: Map<number, DraftPeerSession>;
+        mutationQueue: Promise<void>;
+        persistQueue: Promise<void>;
+        timerContext: string | null;
+        timerInterval: ReturnType<typeof setInterval> | null;
+        frozenTimer: { context: string; remainingMs: number } | null;
+        paused: boolean;
+      };
+      let draftView: DraftPlayerView;
+      privateHost.adapter.draftProcedure = vi.fn(async () => ({
+        packs_per_player: 3, min_deck_size: 40, launch_capability: "None",
+        pick_selection_mode: "Direct", match_config: { match_type: "Bo1" },
+      }));
+      privateHost.adapter.createMultiplayerDraft = vi.fn(async () => {});
+      privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+      privateHost.adapter.getViewForSeat = vi.fn(async () => draftView);
+      privateHost.adapter.exportSession = vi.fn(async () => JSON.stringify(draftView));
+      const departing = new FakeDraftDataConnection();
+      const remaining = new FakeDraftDataConnection();
+      const events = vi.fn();
+      host.onEvent(events);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      let finishSave: (() => void) | undefined;
+      try {
+        await host.initialize();
+        await privateHost.persistQueue;
+        for (const [connection, displayName] of [[departing, "Alice"], [remaining, "Bea"]] as const) {
+          acceptConnection(connection as never);
+          await connection.receiveRaw(await encodeDraftWireMessage({
+            type: "draft_join", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, displayName,
+          }));
+          await privateHost.mutationQueue;
+        }
+        const welcome = (await Promise.all(departing.sentRaw.map(decodeDraftWireMessage)))
+          .find((message) => message.type === "draft_welcome");
+        if (!welcome || welcome.type !== "draft_welcome") throw new Error("Guest was not admitted");
+        expect(welcome.seatIndex).toBe(1);
+        expect(events).toHaveBeenCalledWith({ type: "seatJoined", seatIndex: 2, displayName: "Bea" });
+        const session = privateHost.guestSessions.get(1);
+        if (!session) throw new Error("Admitted guest has no session");
+        const close = vi.spyOn(session, "close");
+
+        if (phase === "started draft") {
+          draftView = { ...await host.getHostView(), status: "Drafting" };
+          await host.startDraft(false);
+          expect(privateHost.adapter.createMultiplayerDraft).toHaveBeenCalledOnce();
+          expect(privateHost.timerContext).toBe("pick");
+          expect(privateHost.timerInterval).not.toBeNull();
+          expect(privateHost.paused).toBe(false);
+        }
+        await vi.waitFor(async () => {
+          const messages = await Promise.all(remaining.sentRaw.map(decodeDraftWireMessage));
+          expect(messages).toContainEqual(expect.objectContaining(phase === "lobby"
+            ? { type: "draft_lobby_update", joined: 3 }
+            : { type: "draft_state_update", view: draftView }));
+        });
+        remaining.sentRaw.length = 0;
+        events.mockClear();
+
+        let snapshot: unknown;
+        let saving!: () => void;
+        const saveStarted = new Promise<void>((resolve) => { saving = resolve; });
+        const saveGate = new Promise<void>((resolve) => { finishSave = resolve; });
+        const committed = vi.fn();
+        saveDraftHostSession.mockImplementationOnce(async (_id, saved) => {
+          snapshot = saved;
+          saving();
+          await saveGate;
+          committed();
+        });
+        await departing.receiveRaw(await encodeDraftWireMessage({
+          type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: welcome.draftToken,
+        }));
+        await saveStarted;
+        expect(privateHost.guestSessions.has(1)).toBe(false);
+        expect(snapshot).toEqual(expect.objectContaining({
+          seatTokens: { 2: expect.any(String) },
+          kickedTokens: phase === "lobby" ? [] : [welcome.draftToken],
+          expiredDisconnectedSeats: phase === "lobby" ? [] : [1],
+        }));
+        expect(committed).not.toHaveBeenCalled();
+        expect(close).not.toHaveBeenCalled();
+        departing.simulateClose();
+        expect(departing.open).toBe(false);
+        if (!finishSave) throw new Error("Persistence gate was not initialized");
+        finishSave();
+        await privateHost.mutationQueue;
+
+        expect(committed).toHaveBeenCalledOnce();
+        expect(close).toHaveBeenCalledExactlyOnceWith("Participant left draft");
+        expect(warn).toHaveBeenCalledWith(
+          "[P2PDraftHost] leave acknowledgement failed:", new Error("Draft connection is not open"),
+        );
+        expect(committed).toHaveBeenCalledBefore(close);
+        expect(events).toHaveBeenCalledWith({ type: "seatDisconnected", seatIndex: 1 });
+        expect(error).not.toHaveBeenCalled();
+        await vi.waitFor(async () => {
+          const messages = await Promise.all(remaining.sentRaw.map(decodeDraftWireMessage));
+          if (phase === "lobby") {
+            expect(messages).toContainEqual(expect.objectContaining({ type: "draft_lobby_update", joined: 2 }));
+            expect(events).toHaveBeenCalledWith({ type: "lobbyUpdate", seats: expect.any(Array), joined: 2, total: 3 });
+            expect((await host.getHostView()).seats[1]?.display_name).not.toBe("Alice");
+          } else {
+            expect(messages).toContainEqual({ type: "draft_state_update", view: draftView });
+            expect(messages).toContainEqual({ type: "draft_paused", reason: DraftPauseReason.PlayerDisconnected });
+            expect(events).toHaveBeenCalledWith({ type: "draftPaused", reason: DraftPauseReason.PlayerDisconnected });
+            expect(privateHost.adapter.setSeatConnected).toHaveBeenCalledExactlyOnceWith(1, false);
+            expect(privateHost.paused).toBe(true);
+            expect(privateHost.timerInterval).toBeNull();
+            expect(privateHost.timerContext).toBeNull();
+            expect(privateHost.frozenTimer).toEqual(expect.objectContaining({ context: "pick", remainingMs: expect.any(Number) }));
+            expect(privateHost.frozenTimer!.remainingMs).toBeGreaterThan(0);
+          }
+        });
+      } finally {
+        finishSave?.();
+        await host.dispose();
+        warn.mockRestore();
+        error.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("restores a leave's live recovery state when its durability fence fails", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
+      draftStarted: boolean;
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      perSeatWorkspaceSnapshots: Map<number, unknown>;
+      expiredDisconnectedSeats: Set<number>;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    const workspace = { schemaVersion: 1, placements: {}, virtualBasics: [] };
+    privateHost.draftStarted = true;
+    privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+    privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+    privateHost.perSeatWorkspaceSnapshots.set(1, workspace);
+    saveDraftHostSession.mockRejectedValueOnce(new Error("IDB unavailable"));
+
+    await expect(privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session)).rejects.toThrow("IDB unavailable");
+
+    expect(privateHost.guestSessions.get(1)).toBe(session);
+    expect(privateHost.seatTokens.get(1)).toBe("leave-token");
+    expect(privateHost.seatNames.get(1)).toBe("Guest");
+    expect(privateHost.perSeatWorkspaceSnapshots.get(1)).toBe(workspace);
+    expect(privateHost.expiredDisconnectedSeats.has(1)).toBe(false);
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(1, 1, false);
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(2, 1, true);
+    expect(session.send).not.toHaveBeenCalled();
+    expect(session.close).not.toHaveBeenCalled();
+  });
+
+  it("opens reconnect grace when the guest closes during a failed leave save", async () => {
+    vi.useFakeTimers();
+    try {
+      const host = recoveredHost("Host");
+      const privateHost = host as unknown as {
+        adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
+        draftStarted: boolean;
+        paused: boolean;
+        guestSessions: Map<number, unknown>;
+        seatTokens: Map<number, string>;
+        seatNames: Map<number, string>;
+        perSeatWorkspaceSnapshots: Map<number, unknown>;
+        disconnectedSeats: Map<number, { deadlineAt: number }>;
+        reconnectDeadlines: Map<number, number>;
+        handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+      };
+      let disconnect!: () => void;
+      const session = {
+        onDisconnect: vi.fn((handler: () => void) => {
+          disconnect = handler;
+          return vi.fn();
+        }),
+        send: vi.fn(async () => {}),
+        close: vi.fn(),
+      };
+      const workspace = { schemaVersion: 1, placements: {}, virtualBasics: [] };
+      privateHost.draftStarted = true;
+      privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+      privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+      privateHost.guestSessions.set(1, session);
+      privateHost.seatTokens.set(1, "leave-token");
+      privateHost.seatNames.set(1, "Guest");
+      privateHost.perSeatWorkspaceSnapshots.set(1, workspace);
+      saveDraftHostSession.mockImplementationOnce(() => {
+        disconnect();
+        return Promise.reject(new Error("IDB unavailable"));
+      });
+
+      await expect(privateHost.handleGuestMessage(1, {
+        type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+      }, session)).rejects.toThrow("IDB unavailable");
+
+      const deadlineAt = privateHost.disconnectedSeats.get(1)?.deadlineAt;
+      expect(deadlineAt).toBe(Date.now() + 60_000);
+      expect(privateHost.reconnectDeadlines.get(1)).toBe(deadlineAt);
+      expect(privateHost.guestSessions.has(1)).toBe(false);
+      expect(privateHost.seatTokens.get(1)).toBe("leave-token");
+      expect(privateHost.seatNames.get(1)).toBe("Guest");
+      expect(privateHost.perSeatWorkspaceSnapshots.get(1)).toBe(workspace);
+      expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(1, 1, false);
+      expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(2, 1, false);
+      expect(privateHost.paused).toBe(true);
+      expect(session.send).not.toHaveBeenCalled();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("pauses a started draft when leave recovery's follow-up save also fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const host = recoveredHost("Host");
+      const privateHost = host as unknown as {
+        adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
+        draftStarted: boolean;
+        paused: boolean;
+        guestSessions: Map<number, unknown>;
+        seatTokens: Map<number, string>;
+        seatNames: Map<number, string>;
+        perSeatWorkspaceSnapshots: Map<number, unknown>;
+        disconnectedSeats: Map<number, { deadlineAt: number }>;
+        handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+      };
+      let disconnect!: () => void;
+      const session = {
+        onDisconnect: vi.fn((handler: () => void) => {
+          disconnect = handler;
+          return vi.fn();
+        }),
+        send: vi.fn(async () => {}),
+        close: vi.fn(),
+      };
+      privateHost.draftStarted = true;
+      privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+      privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+      privateHost.guestSessions.set(1, session);
+      privateHost.seatTokens.set(1, "leave-token");
+      privateHost.seatNames.set(1, "Guest");
+      privateHost.perSeatWorkspaceSnapshots.set(1, { schemaVersion: 1, placements: {}, virtualBasics: [] });
+      saveDraftHostSession
+        .mockImplementationOnce(() => {
+          disconnect();
+          return Promise.reject(new Error("IDB unavailable"));
+        })
+        .mockRejectedValueOnce(new Error("IDB still unavailable"));
+
+      await expect(privateHost.handleGuestMessage(1, {
+        type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+      }, session)).rejects.toThrow("IDB unavailable");
+
+      expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(1, 1, false);
+      expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(2, 1, false);
+      expect(privateHost.paused).toBe(true);
+      expect(privateHost.disconnectedSeats.has(1)).toBe(true);
+      expect(privateHost.guestSessions.has(1)).toBe(false);
+      expect(session.send).not.toHaveBeenCalled();
+      expect(session.close).not.toHaveBeenCalled();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains an existing reconnect deadline when a failed leave session closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const host = recoveredHost("Host");
+      const privateHost = host as unknown as {
+        guestSessions: Map<number, unknown>;
+        seatTokens: Map<number, string>;
+        seatNames: Map<number, string>;
+        disconnectedSeats: Map<number, { deadlineAt: number }>;
+        reconnectDeadlines: Map<number, number>;
+        handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+      };
+      let disconnect!: () => void;
+      const session = {
+        onDisconnect: vi.fn((handler: () => void) => {
+          disconnect = handler;
+          return vi.fn();
+        }),
+        send: vi.fn(async () => {}),
+        close: vi.fn(),
+      };
+      const existingDeadline = Date.now() + 15_000;
+      privateHost.guestSessions.set(1, session);
+      privateHost.seatTokens.set(1, "leave-token");
+      privateHost.seatNames.set(1, "Guest");
+      privateHost.reconnectDeadlines.set(1, existingDeadline);
+      saveDraftHostSession.mockImplementationOnce(() => {
+        disconnect();
+        return Promise.reject(new Error("IDB unavailable"));
+      });
+
+      await expect(privateHost.handleGuestMessage(1, {
+        type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+      }, session)).rejects.toThrow("IDB unavailable");
+
+      expect(privateHost.disconnectedSeats.get(1)?.deadlineAt).toBe(existingDeadline);
+      expect(privateHost.reconnectDeadlines.get(1)).toBe(existingDeadline);
+      expect(privateHost.guestSessions.has(1)).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not replay a rolled-back leave snapshot on the next save", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
+      draftStarted: boolean;
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      expiredDisconnectedSeats: Set<number>;
+      persistQueue: Promise<void>;
+      persistSession: () => void;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.draftStarted = true;
+    privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+    privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+    saveDraftHostSession.mockRejectedValueOnce(new Error("IDB unavailable"));
+
+    await expect(privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session)).rejects.toThrow("IDB unavailable");
+
+    expect(saveDraftHostSession).toHaveBeenCalledWith("shared-recovery", expect.objectContaining({
+      seatTokens: {},
+      kickedTokens: ["leave-token"],
+      expiredDisconnectedSeats: [1],
+    }));
+
+    privateHost.persistSession();
+    await privateHost.persistQueue;
+
+    // The failed leave was compensated, so the next durable snapshot must be
+    // the recovered pre-leave state, not a retry of the revoked capability.
+    expect(saveDraftHostSession).toHaveBeenCalledTimes(2);
+    expect(saveDraftHostSession).toHaveBeenLastCalledWith("shared-recovery", expect.objectContaining({
+      seatTokens: { 1: "leave-token" },
+      seatNames: expect.objectContaining({ 1: "Guest" }),
+      kickedTokens: [],
+      expiredDisconnectedSeats: [],
+    }));
+  });
+
+  it("compensates an engine disconnect rejection without revoking recovery", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: { setSeatConnected: ReturnType<typeof vi.fn> };
+      draftStarted: boolean;
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      expiredDisconnectedSeats: Set<number>;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.draftStarted = true;
+    privateHost.adapter.setSeatConnected = vi.fn()
+      .mockRejectedValueOnce(new Error("disconnect rejected"))
+      .mockResolvedValueOnce(undefined);
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+
+    await expect(privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session)).rejects.toThrow("disconnect rejected");
+
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(1, 1, false);
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(2, 1, true);
+    expect(privateHost.guestSessions.get(1)).toBe(session);
+    expect(privateHost.seatTokens.get(1)).toBe("leave-token");
+    expect(privateHost.seatNames.get(1)).toBe("Guest");
+    expect(privateHost.expiredDisconnectedSeats.has(1)).toBe(false);
+  });
+
+  it("retains recovery state and reports a rejected engine rollback", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: { setSeatConnected: ReturnType<typeof vi.fn>; exportSession: ReturnType<typeof vi.fn> };
+      draftStarted: boolean;
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      expiredDisconnectedSeats: Set<number>;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    const events = vi.fn();
+    host.onEvent(events);
+    privateHost.draftStarted = true;
+    privateHost.adapter.setSeatConnected = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("reconnect rejected"));
+    privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+    saveDraftHostSession.mockRejectedValueOnce(new Error("IDB unavailable"));
+
+    await expect(privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session)).rejects.toThrow("IDB unavailable");
+
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(1, 1, false);
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenNthCalledWith(2, 1, true);
+    expect(privateHost.guestSessions.get(1)).toBe(session);
+    expect(privateHost.seatTokens.get(1)).toBe("leave-token");
+    expect(privateHost.seatNames.get(1)).toBe("Guest");
+    expect(privateHost.expiredDisconnectedSeats.has(1)).toBe(false);
+    expect(events).toHaveBeenCalledWith({
+      type: "error",
+      message: "leave rollback connectivity failed: reconnect rejected",
+    });
+  });
+
+  it("does not extend a reconnect deadline across repeated reconnect drops", async () => {
+    vi.useFakeTimers();
+    try {
+      const host = recoveredHost("Host");
+      const privateHost = host as unknown as {
+        adapter: {
+          setSeatConnected: ReturnType<typeof vi.fn>;
+          exportSession: ReturnType<typeof vi.fn>;
+          getViewForSeat: ReturnType<typeof vi.fn>;
+        };
+        draftStarted: boolean;
+        guestSessions: Map<number, unknown>;
+        seatTokens: Map<number, string>;
+        disconnectedSeats: Map<number, { deadlineAt: number }>;
+        mutationQueue: Promise<void>;
+        handleGuestDisconnect: (seat: number) => void;
+        handleReconnect: (session: unknown, token: string) => Promise<void>;
+      };
+      const view = { status: "Drafting", pool: [], seats: [] };
+      privateHost.draftStarted = true;
+      privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+      privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+      privateHost.adapter.getViewForSeat = vi.fn(async () => view);
+      privateHost.seatTokens.set(1, "guest-token");
+      privateHost.guestSessions.set(1, { send: vi.fn(async () => {}), close: vi.fn() });
+
+      privateHost.handleGuestDisconnect(1);
+      await privateHost.mutationQueue;
+      const deadlineAt = privateHost.disconnectedSeats.get(1)?.deadlineAt;
+      expect(deadlineAt).toBeDefined();
+
+      const firstReconnect = { onMessage: vi.fn(), send: vi.fn(async () => {}), close: vi.fn() };
+      await privateHost.handleReconnect(firstReconnect, "guest-token");
+      await vi.advanceTimersByTimeAsync(5_000);
+      privateHost.handleGuestDisconnect(1);
+      expect(privateHost.disconnectedSeats.get(1)?.deadlineAt).toBe(deadlineAt);
+      await privateHost.mutationQueue;
+
+      const secondReconnect = { onMessage: vi.fn(), send: vi.fn(async () => {}), close: vi.fn() };
+      await privateHost.handleReconnect(secondReconnect, "guest-token");
+      await vi.advanceTimersByTimeAsync(5_000);
+      privateHost.handleGuestDisconnect(1);
+      expect(privateHost.disconnectedSeats.get(1)?.deadlineAt).toBe(deadlineAt);
+      await host.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("makes a stale prior session inert after the seat reconnects", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+    };
+    const current = { send: vi.fn(async () => {}), close: vi.fn() };
+    const stale = { send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.guestSessions.set(1, current);
+    privateHost.seatTokens.set(1, "leave-token");
+
+    await privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, stale);
+
+    expect(privateHost.seatTokens.get(1)).toBe("leave-token");
+    expect(current.send).not.toHaveBeenCalled();
+  });
+
+  it("turns a post-start leave into a terminal paused human seat without a bot", async () => {
+    const host = recoveredHost("Host");
+    const privateHost = host as unknown as {
+      adapter: {
+        setSeatConnected: ReturnType<typeof vi.fn>;
+        exportSession: ReturnType<typeof vi.fn>;
+        getViewForSeat: ReturnType<typeof vi.fn>;
+      };
+      draftStarted: boolean;
+      guestSessions: Map<number, unknown>;
+      seatTokens: Map<number, string>;
+      seatNames: Map<number, string>;
+      expiredDisconnectedSeats: Set<number>;
+      paused: boolean;
+      handleGuestMessage: (seat: number, message: unknown, session: unknown) => Promise<void>;
+      isBotSeat: (seat: number) => boolean;
+    };
+    const session = { onDisconnect: vi.fn(() => vi.fn()), send: vi.fn(async () => {}), close: vi.fn() };
+    privateHost.draftStarted = true;
+    privateHost.adapter.setSeatConnected = vi.fn(async () => {});
+    privateHost.adapter.exportSession = vi.fn(async () => "{\"status\":\"Drafting\"}");
+    privateHost.adapter.getViewForSeat = vi.fn(async () => ({ status: "Drafting", seats: [] }));
+    privateHost.guestSessions.set(1, session);
+    privateHost.seatTokens.set(1, "leave-token");
+    privateHost.seatNames.set(1, "Guest");
+
+    await privateHost.handleGuestMessage(1, {
+      type: "draft_leave", draftProtocolVersion: DRAFT_PROTOCOL_VERSION, draftToken: "leave-token",
+    }, session);
+
+    expect(privateHost.adapter.setSeatConnected).toHaveBeenCalledWith(1, false);
+    expect(privateHost.expiredDisconnectedSeats.has(1)).toBe(true);
+    expect(privateHost.seatTokens.has(1)).toBe(false);
+    expect(privateHost.seatNames.get(1)).toBe("Guest");
+    expect(privateHost.isBotSeat(1)).toBe(false);
+    expect(privateHost.paused).toBe(true);
   });
 
   it("commits a joining guest's token before welcome and preserves it for recovery", async () => {

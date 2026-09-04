@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::game::ability_utils::{choose_target_for_ability, TargetSelectionAdvance};
 use crate::game::casting;
 use crate::game::casting_costs;
 use crate::game::layers;
@@ -37,9 +38,15 @@ use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
+/// The engine owns copy-source enumeration: which zone the filter names
+/// (`FilterProp::InZone`, battlefield by default), the `ExiledCardByIndex`
+/// resolution, the source exclusion, and the mana-value ceiling. Surfaced here
+/// beside the other copy accessors so AI policies ask that single authority
+/// instead of re-deriving a battlefield scan.
+pub use crate::game::engine_replacement::find_copy_targets;
 pub(crate) use candidates::power_threshold_witness;
 pub use candidates::{
-    candidate_actions, candidate_actions_broad, candidate_actions_exact,
+    balanced_pile_partition, candidate_actions, candidate_actions_broad, candidate_actions_exact,
     candidate_actions_with_probe, retarget_actions, ActionMetadata, CandidateAction, TacticalClass,
 };
 pub use combat_withdrawal::{
@@ -60,9 +67,15 @@ pub use filter::{
     BasicLegalityFilter, CandidateFilter, FilterCost, FilterPipeline, SimulationFilter,
 };
 pub use payment_continuation::{
-    classify_payment_continuation, witness_payment_continuation, AcceptedPaymentSuccessor,
-    PaymentContinuationRoot, PaymentContinuationState, PaymentContinuationUnsupported,
-    PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
+    classify_payment_continuation, witness_payment_continuation, witness_payment_continuations,
+    AcceptedPaymentSuccessor, PaymentContinuationBatch, PaymentContinuationBatchStatus,
+    PaymentContinuationIndeterminate, PaymentContinuationRoot, PaymentContinuationState,
+    PaymentContinuationUnsupported, PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
+    PAYMENT_CONTINUATION_MAX_ROOTS,
+};
+#[cfg(feature = "test-support")]
+pub use payment_continuation::{
+    witness_payment_continuations_with_counters, PaymentContinuationWitnessCounters,
 };
 pub use prospective_mana::{
     certify_fetch_then_cast, certify_pact_plan, is_pact_payment_ability, is_pact_payment_cast,
@@ -1913,6 +1926,17 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
         return false;
     }
 
+    // CR 117.1: Full Control is a standing refusal to give up ANY window, so no
+    // recommendation is ever issued. Deliberately ABOVE the CR 117.3d yield rung
+    // below — that rung is the one other place this function can answer `true`
+    // over a hold, and the engine-side gates in `game::engine` (which cover
+    // passes that never reach a frontend) do not consult yields. Ordering Full
+    // Control first is what keeps the recommendation and the authoritative loop
+    // from disagreeing about the same window.
+    if state.priority_passing_mode(mode_owner) == PriorityPassingMode::FullControl {
+        return false;
+    }
+
     // CR 117.3d: A standing priority yield for the top-of-stack trigger is an
     // explicit pre-commitment to pass. It deliberately overrides the castability
     // and meaningful-action holds below (including the issue #4388 opponent-turn
@@ -2186,6 +2210,46 @@ fn target_selection_actions_without_simulation(state: &GameState) -> Option<Vec<
     Some(actions)
 }
 
+/// Returns target choices that cannot complete target declaration without
+/// cloning the game state. Terminal choices and cancellation remain on the
+/// validation pipeline because they can immediately advance into cost payment.
+fn target_selection_actions_with_nonterminal_fast_path(
+    state: &GameState,
+) -> Option<Vec<GameAction>> {
+    let WaitingFor::TargetSelection {
+        pending_cast,
+        target_slots,
+        selection,
+        ..
+    } = &state.waiting_for
+    else {
+        return None;
+    };
+
+    let pipeline = FilterPipeline::default_pipeline();
+    let mut actions = Vec::new();
+    for candidate in candidate_actions(state) {
+        let advances_without_completion = match &candidate.action {
+            GameAction::ChooseTarget { target } => matches!(
+                choose_target_for_ability(
+                    state,
+                    &pending_cast.ability,
+                    target_slots,
+                    &pending_cast.target_constraints,
+                    selection,
+                    target.clone(),
+                ),
+                Ok(TargetSelectionAdvance::InProgress(_))
+            ),
+            _ => false,
+        };
+        if advances_without_completion || pipeline.accepts(state, &candidate) {
+            actions.push(candidate.action);
+        }
+    }
+    Some(actions)
+}
+
 /// The flat priority-action list: validated candidate actions minus mana
 /// abilities. This is the single authority for the non-target-selection action
 /// body so the auto-pass probe (`priority_player_has_meaningful_action`) and
@@ -2245,10 +2309,12 @@ pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
 
     let mut actions: Vec<GameAction> =
         if context::target_selection_requires_reducer_validation(state) {
-            validated_candidate_actions(state)
-                .into_iter()
-                .map(|candidate| candidate.action)
-                .collect()
+            target_selection_actions_with_nonterminal_fast_path(state).unwrap_or_else(|| {
+                validated_candidate_actions(state)
+                    .into_iter()
+                    .map(|candidate| candidate.action)
+                    .collect()
+            })
         } else {
             target_selection_actions_without_simulation(state)
                 .unwrap_or_else(|| flat_priority_actions_with_probe(state, priority_probe))

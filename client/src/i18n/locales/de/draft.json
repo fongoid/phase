@@ -5,22 +5,44 @@
     "commanderTitle": "Commander Draft",
     "subtitle": "So funktioniert es",
     "startDrafting": "Mit dem Draften beginnen",
+    "quantity": {
+      "packsOpened_one": "{{count, number}} Booster",
+      "packsOpened_few": "{{count, number}} Booster",
+      "packsOpened_many": "{{count, number}} Booster",
+      "packsOpened_other": "{{count, number}} Booster",
+      "cardsContained_one": "{{count, number}} Karte",
+      "cardsContained_few": "{{count, number}} Karten",
+      "cardsContained_many": "{{count, number}} Karten",
+      "cardsContained_other": "{{count, number}} Karten",
+      "packSizeEntry_one": "{{count, number}} Karte",
+      "packSizeEntry_few": "{{count, number}} Karten",
+      "packSizeEntry_many": "{{count, number}} Karten",
+      "packSizeEntry_other": "{{count, number}} Karten",
+      "minimumDeckCards_one": "{{count, number}} Karte",
+      "minimumDeckCards_few": "{{count, number}} Karten",
+      "minimumDeckCards_many": "{{count, number}} Karten",
+      "minimumDeckCards_other": "{{count, number}} Karten"
+    },
+    "packPassing_one": "Dieser Draft hat nur eine Boosterrunde, daher wechselt die Weitergaberichtung nicht",
+    "packPassing_few": "Die Weitergaberichtung wechselt in jeder Runde",
+    "packPassing_many": "Die Weitergaberichtung wechselt in jeder Runde",
+    "packPassing_other": "Die Weitergaberichtung wechselt in jeder Runde",
     "quick": {
-      "step1": "Du öffnest 3 Booster mit je 14 Karten",
+      "step1": "Du öffnest {{packs}}; jeder Booster enthält {{cardsPerPack}}",
       "step2": "Wähle pro Booster eine Karte und gib den Rest an KI-Drafter weiter",
-      "step3": "Booster wechseln jede Runde die Richtung — links, rechts, links",
-      "step4": "Baue nach allen Picks ein 40-Karten-Deck und spiele eine Partie",
-      "step1Mixed": "Du öffnest {{packCount}} Booster unterschiedlicher Größe — {{packSizes}} Karten, in dieser Reihenfolge"
+      "step4": "Baue nach allen Picks ein Deck mit mindestens {{minimumDeckCards}} und spiele eine Partie",
+      "step1Mixed": "Du öffnest {{packs}} unterschiedlicher Größe, in dieser Reihenfolge: {{packSizes, list}}"
     },
     "pod": {
       "step1": "Du draftest mit {{count}} Spielern in einem Pod",
-      "step2": "Öffne 3 Booster mit 14 Karten — wähle eine, gib den Rest weiter",
-      "step3": "Booster wechseln jede Runde die Richtung — links, rechts, links",
-      "step4": "Baue nach dem Draften ein 40-Karten-Deck und spiele Turnierpartien"
+      "step2": "Öffne {{packs}}; jeder Booster enthält {{cardsPerPack}} — wähle eine Karte, gib den Rest weiter",
+      "step2Mixed": "Öffne {{packs}} unterschiedlicher Größe, in dieser Reihenfolge: {{packSizes, list}} — wähle eine Karte, gib den Rest weiter",
+      "step4": "Baue nach dem Draften ein Deck mit mindestens {{minimumDeckCards}} und spiele Turnierpartien"
     },
     "commander": {
-      "step2": "Wähle zwei Karten aus jedem Booster und gib den Rest weiter",
-      "step4": "Baue nach dem Draften ein Commander-Deck mit 60 Karten und spiele eine Mehrspielerpartie"
+      "step2": "Öffne {{packs}}; jeder Booster enthält {{cardsPerPack}} — wähle zwei Karten, gib den Rest weiter",
+      "step2Mixed": "Öffne {{packs}} unterschiedlicher Größe, in dieser Reihenfolge: {{packSizes, list}} — wähle zwei Karten, gib den Rest weiter",
+      "step4": "Baue nach dem Draften ein Commander-Deck mit mindestens {{minimumDeckCards}} und spiele eine Mehrspielerpartie"
     }
   },
   "steps": {
@@ -66,7 +88,11 @@
     "passingRight": "← Nach rechts geben ←",
     "connected": "Connected",
     "disconnected": "Disconnected",
-    "faceUpDraftCards": "Aufgedeckt: {{cards}}"
+    "faceUpDraftCards": "Aufgedeckt: {{cards}}",
+    "activePackCount_one": "{{count}} Booster bei {{player}}",
+    "activePackCount_few": "{{count}} Booster bei {{player}}",
+    "activePackCount_many": "{{count}} Booster bei {{player}}",
+    "activePackCount_other": "{{count}} Booster bei {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Bot-Schwierigkeit",
@@ -81,16 +107,21 @@
     "setIconAlt": "{{name}} Set-Symbol",
     "loadFailed": "Sets konnten nicht geladen werden",
     "packOrder": "Booster-Reihenfolge",
+    "candidateSets": "Kandidaten-Sets",
     "clearPacks": "Leeren",
     "emptyPacks_one": "Wähle ein Set für jeden Booster. Ein Draft öffnet standardmäßig {{count}} Booster — wiederhole ein Set oder mische mehrere.",
     "emptyPacks_other": "Wähle ein Set für jeden Booster. Ein Draft öffnet standardmäßig {{count}} Booster — wiederhole ein Set oder mische mehrere für einen Block-Draft.",
     "emptyPacksFixed_one": "Sealed öffnet genau {{count}} Booster. Wähle ein Set dafür.",
     "emptyPacksFixed_other": "Sealed öffnet genau {{count}} Booster. Wähle für jeden ein Set — wiederhole eins oder mische mehrere.",
+    "emptyCandidates": "Wähle ein oder mehrere Kandidaten-Sets. Die Booster jedes Spielers werden zufällig daraus zugewiesen.",
     "packCountFixed": "{{selected}} von {{required}} Boostern gewählt",
     "packCountFlexible": "{{selected}} Booster gewählt — bis zu {{max}}",
+    "candidateCount": "{{selected}} Kandidaten-Sets gewählt",
     "addPackFromSet": "Booster hinzufügen",
+    "addCandidateSet": "Kandidaten-Set hinzufügen",
     "packsFull": "Booster-Liste ist voll",
     "addPackOf": "Booster aus {{name}} hinzufügen",
+    "addCandidate": "{{name}} als Kandidat hinzufügen",
     "movePackEarlier": "Booster {{number}} nach vorne",
     "movePackLater": "Booster {{number}} nach hinten",
     "removePack": "Booster {{number}} entfernen",
@@ -122,7 +153,10 @@
   },
   "sealedOpening": {
     "title": "Öffne deinen Sealed-Pool",
-    "subtitle": "Öffne sechs Booster, einen nach dem anderen.",
+    "subtitle_one": "Öffne {{count}} Booster.",
+    "subtitle_few": "Öffne {{count}} Booster, einen nach dem anderen.",
+    "subtitle_many": "Öffne {{count}} Booster, einen nach dem anderen.",
+    "subtitle_other": "Öffne {{count}} Booster, einen nach dem anderen.",
     "packProgress": "Booster {{current}} von {{total}}",
     "openPack": "Booster öffnen",
     "openPackArt": "Booster-Artwork öffnen",
@@ -350,6 +384,12 @@
     "viewResults": "Ergebnisse anzeigen",
     "setIconAlt": "{{code}} Symbol"
   },
+  "offline": {
+    "unavailableTitle": "Mehrspieler-Draft ist offline nicht verfügbar.",
+    "unavailableDescription": "Stelle die Verbindung wieder her oder deaktiviere den Offline-Modus, um einen Mehrspieler-Draft zu hosten, ihm beizutreten, ihn zu starten oder anzusehen.",
+    "startUnavailable": "Ein Mehrspieler-Draft kann offline nicht gestartet werden. Stelle die Verbindung wieder her oder deaktiviere den Offline-Modus, um fortzufahren.",
+    "watchUnavailable": "Ein Mehrspieler-Draft kann offline nicht angesehen werden. Stelle die Verbindung wieder her oder deaktiviere den Offline-Modus, um fortzufahren."
+  },
   "podPhase": {
     "lobby": "Lobby",
     "drafting": "Draften",
@@ -384,6 +424,7 @@
     "exportUrl": "CubeCobra-Export-URL",
     "exportUrlPlaceholder": "Füge eine rohe Export-URL ein oder füge die Liste unten ein",
     "loadUrl": "URL laden",
+    "offlineUrlUnavailable": "Das Laden von Cube-Listen per URL ist offline nicht verfügbar.",
     "deckAddables": "Hinzufügbare Deck-Karten",
     "addablesStandardBasics": "Standard-Standardländer",
     "addablesBasicsPlusCustom": "Standardländer plus eigene",
@@ -485,6 +526,11 @@
     "podSizeDesc": "{{count}} Plätze insgesamt. Leere Plätze können vor dem Draft-Start aus der Lobby mit Bots gefüllt werden.",
     "playerCount": "{{count}} Spieler",
     "setSelectorHint": "Ordne die Sets deines Pods an — eines pro Booster, in der Reihenfolge, in der sie geöffnet werden. Nenne ein Set, um damit jeden Booster zu füllen. Beim Erstellen des Pods werden die Pools geladen.",
+    "setDraftMode": "Set-Draft-Modus",
+    "uniformPacks": "Bestimmte Reihenfolge",
+    "chaosPacks": "Chaos-Draft",
+    "chaosSelectorHint": "Wähle die Kandidaten-Sets. Der Host weist die Booster jedes Spielers beim Start zufällig und privat zu.",
+    "chaosSelectorDetail": "Jeder Spieler erhält für jeden Booster ein zufälliges Set aus diesen Kandidaten. Die genaue Zuweisung bleibt verborgen, bis der Spieler einen Booster öffnet.",
     "createPod": "Pod erstellen",
     "loadingPool": "Set-Pool-Daten werden geladen...",
     "roomCode": "Raumcode",

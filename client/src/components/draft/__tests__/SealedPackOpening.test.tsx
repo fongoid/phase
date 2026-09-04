@@ -11,11 +11,13 @@ vi.mock("../../../hooks/useCardImage", () => ({
 const VIEW: DraftPlayerView = {
   status: "Deckbuilding",
   kind: "Sealed",
+  launch_capability: "None",
   current_pack_number: 0,
   pick_number: 0,
   pass_direction: "Left",
   current_pack: null,
   required_pick_count: 0,
+  pick_selection_mode: "Direct",
   pool: [
     {
       instance_id: "creature",
@@ -106,6 +108,7 @@ describe("SealedPackOpening", () => {
       />,
     );
 
+    expect(screen.getByText("Open 2 packs, one at a time.")).toBeInTheDocument();
     expect(screen.getByText("Pack 1 of 2")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open pack" }));
     expect(await screen.findAllByText("Silvercoat Lion")).toHaveLength(2);
@@ -122,5 +125,16 @@ describe("SealedPackOpening", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Build deck" }));
     expect(onComplete).toHaveBeenCalledOnce();
+  });
+
+  it("uses singular copy for one engine-provided pack", () => {
+    render(
+      <SealedPackOpening
+        view={{ ...VIEW, pack_count: 1, sealed_packs: [[VIEW.pool[0]]] }}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Open 1 pack.")).toBeInTheDocument();
   });
 });

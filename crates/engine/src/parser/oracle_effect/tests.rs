@@ -7604,7 +7604,7 @@ fn opportunistic_dragon_loses_all_abilities_sibling_preserved() {
                 for modification in &static_def.modifications {
                     match modification {
                         ContinuousModification::RemoveAllAbilities
-                            if ability.duration == Some(Duration::UntilHostLeavesPlay) =>
+                            if ability.duration == Some(Duration::WhileHostOnBattlefield) =>
                         {
                             remove_all_abilities_with_host_duration = true;
                         }
@@ -7628,7 +7628,7 @@ fn opportunistic_dragon_loses_all_abilities_sibling_preserved() {
     assert!(has_gain_control, "expected GainControl in chain: {def:#?}");
     assert!(
             remove_all_abilities_with_host_duration,
-            "expected RemoveAllAbilities GenericEffect with UntilHostLeavesPlay (middle sibling dropped?): {def:#?}"
+            "expected RemoveAllAbilities GenericEffect with WhileHostOnBattlefield (middle sibling dropped?): {def:#?}"
         );
     assert!(
         has_cant_attack && has_cant_block,
@@ -10455,6 +10455,453 @@ fn same_chain_put_exiled_card_keeps_tracked_set() {
     );
 }
 
+// ── Singular battlefield-recall anaphor ──
+//
+// "Exile <self>, then return it to the battlefield" binds the recall leg to
+// `TargetFilter::SelfRef` (CR 608.2c English anaphora + CR 400.7j public-zone
+// findability) instead of the chain tracked set, whose membership picks up
+// unrelated riders (Shiva's Cold Snap tap leg). Plural / chosen-target /
+// delayed / first-clause recalls keep the sentinel binding.
+
+/// B1 — positive: Shiva's chapter III (verbatim FIN back-face Oracle) lowers
+/// to [broadcast tap of opponents' lands, self-exile, self-return front face
+/// up]. Every hostile test below (B4–B8) asserts its full positive chain shape
+/// first, so a parse failure cannot satisfy its negative vacuously.
+#[test]
+fn singular_battlefield_recall_shiva_chapter_iii_binds_self() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I, II — Mesmerize — Target creature can't be blocked this turn.\n\
+         III — Cold Snap — Tap all lands your opponents control. Exile Shiva, then return it to the battlefield (front face up).",
+        "Shiva, Warden of Ice",
+        &[],
+        &["Enchantment".to_string(), "Creature".to_string()],
+        &["Saga".to_string(), "Elemental".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("Cold Snap must parse as the chapter III trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 3, "tap/exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::SetTapState {
+                scope: EffectScope::All,
+                state: TapStateChange::Tap,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the broadcast tap of opponents' lands: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[1] must be the self-exile: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: false,
+                ..
+            }
+        ),
+        "leg[2] must return the source itself front face up: {:?}",
+        legs[2]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B2 — positive contrast case: Jill's activated ability (verbatim FIN
+/// front-face Oracle) binds the transformed return to SelfRef. This is the
+/// shape the runtime repro exercises end-to-end.
+#[test]
+fn singular_battlefield_recall_jill_activation_binds_self_transformed() {
+    let parsed = parse_oracle_text(
+        "When Jill enters, return up to one other target nonland permanent to its owner's hand.\n\
+         {3}{U}{U}, {T}: Exile Jill, then return it to the battlefield transformed under its owner's control. Activate only as a sorcery.",
+        "Jill, Shiva's Dominant",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Human".to_string(), "Noble".to_string(), "Warrior".to_string()],
+    );
+    let activated = parsed
+        .abilities
+        .iter()
+        .find(|a| a.kind == AbilityKind::Activated)
+        .expect("Jill's exile-and-return must parse as an activated ability");
+    let legs = chain_effects(activated);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: true,
+                ..
+            }
+        ),
+        "leg[1] must return Jill transformed: {:?}",
+        legs[1]
+    );
+    assert!(!tree_has_unimplemented(activated));
+}
+
+/// B3 — positive: Fable of the Mirror-Breaker's chapter III (verbatim Oracle)
+/// "Exile this Saga, then return it to the battlefield transformed" binds
+/// SelfRef + enter_transformed.
+#[test]
+fn singular_battlefield_recall_fable_chapter_iii_binds_self_transformed() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I — Create a 2/2 red Goblin Shaman creature token with \"Whenever this token attacks, create a Treasure token.\"\n\
+         II — You may discard up to two cards. If you do, draw that many cards.\n\
+         III — Exile this Saga, then return it to the battlefield transformed under your control.",
+        "Fable of the Mirror-Breaker",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("Fable chapter III must parse as a trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: true,
+                ..
+            }
+        ),
+        "leg[1] must return the Saga transformed: {:?}",
+        legs[1]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B4 — hostile, plural: "return them" after a mass publisher keeps the
+/// chain-set binding on the recall leg. The "Exile them" clause keeps its
+/// ParentTarget (no pronoun detector fires for it; the gate never touches it).
+#[test]
+fn singular_battlefield_recall_plural_after_mass_exile_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile all creatures you control. Exile them, then return them to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(
+        legs.len(),
+        3,
+        "mass-exile/their-exile/return legs: {legs:?}"
+    );
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZoneAll {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the mass exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "leg[1] must re-exile the exiled set: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "plural recall must keep TrackedSet(0): {:?}",
+        legs[2]
+    );
+}
+
+/// B5 — hostile, chosen antecedent: after "Exile target creature" (a
+/// chosen-target publisher, not a self-move) the singular recall keeps the
+/// chain tracked set.
+#[test]
+fn singular_battlefield_recall_after_chosen_target_exile_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile target creature, then return it to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the chosen-target exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "recall after a chosen-target publisher must keep TrackedSet(0): {:?}",
+        legs[1]
+    );
+}
+
+/// B6 — hostile, delayed: the rewriter never descends into
+/// CreateDelayedTrigger, so the payload keeps its CR 603.7c ParentTarget
+/// referent with origin pinned to Exile at delayed-trigger creation
+/// (CR 603.7a; Aetherling / Otherworldly Journey shapes).
+#[test]
+fn singular_battlefield_recall_delayed_keeps_parent_target_payload() {
+    let def = parse_effect_chain(
+        "Exile ~, then return it to the battlefield at the beginning of the next end step.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 2, "exile/delayed-return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    let Effect::CreateDelayedTrigger {
+        effect,
+        uses_tracked_set,
+        ..
+    } = &legs[1]
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", legs[1]);
+    };
+    let Effect::ChangeZone {
+        origin: Some(Zone::Exile),
+        destination: Zone::Battlefield,
+        target: TargetFilter::ParentTarget,
+        ..
+    } = &*effect.effect
+    else {
+        panic!(
+            "delayed payload must keep ParentTarget with origin Exile, got {:?}",
+            effect.effect
+        );
+    };
+    assert!(*uses_tracked_set);
+}
+
+/// B7 — positive, nearest-publisher axis: The Great Work's chapter III
+/// (verbatim) has an earlier targeted exile, but the NEAREST publisher before
+/// the recall is the self-exile, so the recall binds SelfRef.
+#[test]
+fn singular_battlefield_recall_nearest_publisher_self_move_binds_self() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I — This Saga deals 3 damage to target opponent and each creature they control.\n\
+         II — Create three Treasure tokens.\n\
+         III — Until end of turn, you may cast instant and sorcery spells from any graveyard. If a spell cast this way would be put into a graveyard, exile it instead. Exile this Saga, then return it to the battlefield (front face up).",
+        "The Great Work",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("The Great Work chapter III must parse as a trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 4, "cast/exile/self-exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[2] must be the self-exile publisher: {:?}",
+        legs[2]
+    );
+    assert!(
+        matches!(
+            &legs[3],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "nearest publisher is the self-exile, so the recall binds SelfRef: {:?}",
+        legs[3]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B7-negative — with a typed-target leg as the NEAREST publisher, the
+/// singular recall keeps the chain tracked set (nearest-first scan does not
+/// see the earlier self-exile).
+#[test]
+fn singular_battlefield_recall_nearest_publisher_typed_target_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile ~. Exile target creature, then return it to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(
+        legs.len(),
+        3,
+        "self-exile/typed-exile/return legs: {legs:?}"
+    );
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[1] must be the chosen-target exile: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "nearest publisher is the typed exile, so recall keeps TrackedSet(0): {:?}",
+        legs[2]
+    );
+}
+
+/// B8 — hostile, first clause: with no prior publisher the gate never fires
+/// and the recall keeps its unbound ParentTarget.
+#[test]
+fn singular_battlefield_recall_first_clause_without_publisher_stays_parent_target() {
+    let def = parse_effect_chain("Return it to the battlefield.", AbilityKind::Spell);
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 1, "single leg: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "unbound first-clause recall must stay ParentTarget: {:?}",
+        legs[0]
+    );
+}
+
 #[test]
 fn effect_draw() {
     let e = parse_effect("Draw two cards");
@@ -10600,6 +11047,7 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
         Effect::Amass {
             ref subtype,
             ref count,
+            ..
         } => {
             assert_eq!(subtype, "Zombie");
             assert!(
@@ -10609,6 +11057,20 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
         }
         other => panic!("expected chained Amass{{Zombie, 1}}, got {other:?}"),
     }
+}
+
+#[test]
+fn effect_target_player_amasses_surfaces_the_player_target() {
+    let effect = parse_effect("target player amasses Goblins 2");
+    assert_eq!(
+        effect,
+        Effect::Amass {
+            subtype: "Goblin".to_string(),
+            count: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Player,
+        }
+    );
+    assert_eq!(effect.target_filter(), Some(&TargetFilter::Player));
 }
 
 // CR 701.63: Endure — every printed card prefixes a self-referential
@@ -23925,6 +24387,7 @@ fn parse_play_from_exile_this_turn() {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     duration: Duration::UntilEndOfTurn,
+                    mode: Play,
                     ..
                 },
                 ..
@@ -23985,6 +24448,7 @@ fn parse_impulse_play_that_card_this_turn_stays_play_from_exile() {
             permission:
                 CastingPermission::PlayFromExile {
                     duration: Duration::UntilEndOfTurn,
+                    mode: Play,
                     ..
                 },
             target,
@@ -24023,7 +24487,7 @@ fn parse_exile_until_nonland_play_that_card_stays_play_from_exile() {
         .expect("exile-until chain must produce a permission sub-ability");
     match &*sub.effect {
         Effect::GrantCastingPermission {
-            permission: CastingPermission::PlayFromExile { .. },
+            permission: CastingPermission::PlayFromExile { mode: Cast, .. },
             target,
             ..
         } => {
@@ -24061,6 +24525,7 @@ fn parse_play_the_exiled_card_this_turn_targets_tracked_set() {
         permission,
         CastingPermission::PlayFromExile {
             duration: Duration::UntilEndOfTurn,
+            mode: Play,
             ..
         }
     ));
@@ -24348,6 +24813,7 @@ fn parse_daxos_shape_emits_play_from_exile_with_tracked_set() {
                     permission,
                     CastingPermission::PlayFromExile {
                         duration: Duration::UntilEndOfTurn,
+                        mode: Cast,
                         ..
                     }
                 ),
@@ -24390,6 +24856,7 @@ fn parse_act_on_impulse_targets_tracked_set() {
                     permission,
                     CastingPermission::PlayFromExile {
                         duration: Duration::UntilEndOfTurn,
+                        mode: Play,
                         ..
                     }
                 ),
@@ -28896,19 +29363,24 @@ fn for_as_long_as_remains_tapped() {
     );
 }
 
+/// CR 611.2b: the clause stripper keeps the host-lifetime wordings apart,
+/// because they end at different moments — continued control ends on a control
+/// change (CR 611.2b's own Master Thief example), continued presence does not,
+/// and both end on a phase-out (CR 702.26f) while the "until ~ leaves the
+/// battlefield" event deadline does not (CR 702.26d).
 #[test]
-fn for_as_long_as_you_control_maps_to_until_host_leaves() {
+fn for_as_long_as_you_control_is_the_control_bound_duration() {
     let (rest, dur) =
         strip_trailing_duration("target creature gets +2/+2 for as long as you control ~");
     assert_eq!(rest, "target creature gets +2/+2");
-    assert_eq!(dur, Some(Duration::UntilHostLeavesPlay));
+    assert_eq!(dur, Some(Duration::WhileControllingHost));
 }
 
 #[test]
-fn for_as_long_as_remains_on_battlefield_maps_to_until_host_leaves() {
+fn for_as_long_as_remains_on_battlefield_is_the_presence_bound_duration() {
     let (_, dur) =
         strip_trailing_duration("target gets +1/+1 for as long as ~ remains on the battlefield");
-    assert_eq!(dur, Some(Duration::UntilHostLeavesPlay));
+    assert_eq!(dur, Some(Duration::WhileHostOnBattlefield));
 }
 
 #[test]
@@ -30759,6 +31231,167 @@ fn effect_exchange_control_self_ref_slot() {
                 ),
                 "target_b should carry Non(Land) for 'nonland', got {:?}",
                 tf_b.type_filters
+            );
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
+// =============================================================================
+// Cross-slot object-relative target binding (backlog root cause #27), Unit A —
+// T6a/T6b/T6c and T8's parser half.
+// =============================================================================
+
+#[test]
+fn t6a_puca_mischief_compound_rebinds_slot_b_referent_to_prior_target() {
+    // Puca's Mischief, verbatim Oracle text.
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "exchange control of target nonland permanent you control and target nonland \
+         permanent an opponent controls with equal or lesser mana value",
+    );
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            let tf_a = match &target_a {
+                TargetFilter::Typed(tf) => tf,
+                _ => panic!("target_a should be Typed, got {target_a:?}"),
+            };
+            assert!(
+                tf_a.properties.is_empty(),
+                "target_a must carry NO Cmc prop — proves only slot B moved: {:?}",
+                tf_a.properties
+            );
+            let tf_b = match &target_b {
+                TargetFilter::Typed(tf) => tf,
+                _ => panic!("target_b should be Typed, got {target_b:?}"),
+            };
+            assert_eq!(
+                tf_b.properties,
+                vec![crate::types::ability::FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectManaValue {
+                            scope: ObjectScope::Target,
+                        },
+                    },
+                }],
+                "target_b must carry Cmc{{LE, ObjectManaValue{{Target}}}} — the compound-slot \
+                 rebind — not the single-referent CostPaidObject default"
+            );
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
+#[test]
+fn t6b_single_referent_relative_mana_value_outside_exchange_family_unaffected() {
+    // The dominant single-referent trigger/cost class (CR 608.2k) — NOT part
+    // of the exchange-control family — must keep defaulting to
+    // ObjectScope::CostPaidObject. Unit A's rebind is scoped to the compound
+    // exchange-control call site only.
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "return another target creature card with lesser mana value from your graveyard to the \
+         battlefield",
+    );
+    // Reach-guard (foot-gun #6): the effect must actually be the targeted
+    // ChangeZone, not a swallowed Unimplemented — otherwise the CostPaidObject
+    // assertion below would pass vacuously.
+    let Effect::ChangeZone {
+        target,
+        destination,
+        ..
+    } = &e
+    else {
+        panic!(
+            "expected Effect::ChangeZone, got {e:?} (parse likely fell through to Unimplemented)"
+        );
+    };
+    assert_eq!(*destination, crate::types::zones::Zone::Battlefield);
+    let TargetFilter::Typed(tf) = target else {
+        panic!("expected a Typed target filter, got {target:?}");
+    };
+    assert!(
+        tf.properties.iter().any(|p| matches!(
+            p,
+            crate::types::ability::FilterProp::Cmc {
+                comparator: Comparator::LT,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::CostPaidObject,
+                    },
+                },
+            }
+        )),
+        "single-referent class must still default to ObjectScope::CostPaidObject, got {:?}",
+        tf.properties
+    );
+}
+
+#[test]
+fn t6c_quantified_exchange_control_branch_does_not_rebind() {
+    // The quantified "two target Xs" branch clones ONE parsed filter for both
+    // slots; Unit A's rebind call site sits ONLY in the compound branch, so
+    // this shape must carry no Cmc prop introduced by the rebind machinery.
+    let e = parse_effect("exchange control of two target creatures");
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            assert_eq!(
+                target_a, target_b,
+                "quantified shape: both filters identical"
+            );
+            let TargetFilter::Typed(tf) = &target_a else {
+                panic!("target_a should be Typed, got {target_a:?}");
+            };
+            assert!(
+                tf.properties.is_empty(),
+                "the quantified branch must introduce no Cmc/threshold prop: {:?}",
+                tf.properties
+            );
+            assert_ne!(target_a, TargetFilter::Any);
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
+#[test]
+fn t8_self_ref_slot_a_guard_suppresses_the_compound_rebind() {
+    // Volatile Stormdrake / Avarice Totem shape with an explicit
+    // relative-mana-value suffix on slot B: "exchange control of this
+    // artifact and target nonland permanent with equal or lesser mana value".
+    // Slot A is SelfRef (no declared object target exists to bind to), so
+    // Unit A's guard must leave slot B's default CostPaidObject scope alone —
+    // rebinding it to ObjectScope::Target would make it resolve to slot B
+    // ITSELF (a self-referential, always-true-or-nonsensical comparison).
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "exchange control of this artifact and target nonland permanent with equal or lesser \
+         mana value",
+    );
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            assert!(
+                matches!(target_a, TargetFilter::SelfRef),
+                "target_a (this artifact) should be SelfRef, got {target_a:?}"
+            );
+            let TargetFilter::Typed(tf_b) = &target_b else {
+                panic!("target_b should be Typed, got {target_b:?}");
+            };
+            assert!(
+                tf_b.properties.iter().any(|p| matches!(
+                    p,
+                    crate::types::ability::FilterProp::Cmc {
+                        comparator: Comparator::LE,
+                        value: QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectManaValue {
+                                scope: ObjectScope::CostPaidObject,
+                            },
+                        },
+                    }
+                )),
+                "with a SelfRef slot A, target_b must stay at the CostPaidObject default \
+                 (never rebound to Target), got {:?}",
+                tf_b.properties
             );
         }
         other => panic!("Expected ExchangeControl, got {other:?}"),
@@ -45168,10 +45801,21 @@ fn chaos_wand_lowers_to_targeted_exile_until_optional_cast_and_cleanup() {
 /// cast from among them, then puts the rest on the bottom in random order.
 /// The cleanup clause must bind to `ExiledBySource` (cards in exile), not a
 /// `TrackedSet` of library cards — issue #3267.
+///
+/// The head noun is PLURALIZED from Sanwell's printed "a … spell", and nothing
+/// else is changed. Sanwell's own clause is a PAID batch cast printing a cap of
+/// ONE over a batch of six, which no mechanism this engine has can enforce, so
+/// it is now refused outright (`CastFromZoneDriver::for_batch_bounds` →
+/// `unrepresentable_cast_cap`; see
+/// `real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused` in
+/// `tests/integration/kiora_self_library_peek_cast.rs`). Issue #3267 is about
+/// the CLEANUP clause's target binding, which is orthogonal to the cap — the cap
+/// is read from the head noun's grammatical number alone — so pluralizing that
+/// one token keeps the #3267 binding under test on a clause that still lowers.
 #[test]
 fn sanwell_exile_top_optional_cast_and_rest_on_bottom() {
     let def = parse_effect_chain(
-            "exile the top six cards of your library. You may cast a Vehicle or artifact creature spell from among them. Then put the rest on the bottom of your library in a random order.",
+            "exile the top six cards of your library. You may cast Vehicle or artifact creature spells from among them. Then put the rest on the bottom of your library in a random order.",
             AbilityKind::Spell,
         );
 
@@ -45392,7 +46036,8 @@ fn plargg_and_nassari_full_trigger_chain_choose_then_cast_others() {
         panic!("expected FreeCastFromZones tail, got {:?}", cast.effect);
     };
     assert_eq!(
-        cast_count, 2,
+        cast_count,
+        Some(2),
         "CR 601.2 + ruling 2021-04-16: the \"up to two\" bound must be carried"
     );
     assert_eq!(*zones, vec![Zone::Exile]);
@@ -45529,12 +46174,14 @@ fn parser_shape_evelyn_exiles_each_library_with_collection_counter_and_permissio
     let CastingPermission::PlayFromExile {
         frequency,
         mana_spend_permission,
+        mode,
         ..
     } = permission
     else {
         panic!("expected PlayFromExile permission, got {permission:?}");
     };
     assert_eq!(*frequency, CastFrequency::OncePerTurn);
+    assert_eq!(*mode, CardPlayMode::Play);
     assert_eq!(
         *mana_spend_permission,
         Some(ManaSpendPermission::AnyTypeOrColor)
@@ -45901,6 +46548,729 @@ fn cast_from_among_the_instant_or_sorcery_cards_exiled_this_way_binds_to_exiled_
         )),
         "expected AnyOf[Instant, Sorcery], got {:?}",
         typed.type_filters
+    );
+}
+
+/// The strict-refusal shape, asserted EXACTLY.
+///
+/// A printed cast cap this engine cannot carry (`0`, anything past `u8::MAX`, or
+/// a non-literal `X`) refuses the whole clause and lowers to the honest gap node
+/// named by the shared `UNREPRESENTABLE_CAST_CAP_GAP` constant, carrying the
+/// refused clause text as its fragment. Asserting the exact effect — rather than
+/// "it isn't a window" — is what makes the regressions below non-vacuous: an
+/// upstream parse loss, a `TargetFilter::Any` permission fallback, a
+/// differently-named gap, or a dropped fragment each fail here, and only the
+/// intended refusal passes.
+fn assert_cast_cap_refused(text: &str, expected_fragment: &str) {
+    let effect = parse_effect(text);
+    let Effect::Unimplemented { name, description } = &effect else {
+        panic!("expected the strict cast-cap refusal for {text:?}, got {effect:?}");
+    };
+    assert_eq!(
+        name, UNREPRESENTABLE_CAST_CAP_GAP,
+        "the refusal must be the shared cast-cap gap, not some other parse loss"
+    );
+    assert_eq!(
+        description.as_deref(),
+        Some(expected_fragment),
+        "the gap must carry the refused clause verbatim so coverage stays honest"
+    );
+}
+
+/// A printed cast cap the resolution window cannot represent is REFUSED, not
+/// downgraded to an uncapped permission.
+///
+/// These fixtures are deliberately synthetic — the largest printed
+/// `"cast up to N"` in the entire card corpus is THREE (Ashiok, Nightmare Muse)
+/// and the largest `"up to N"` of any kind is TEN (Reshape the Earth), so this
+/// is a representation-boundary hostile fixture, not a card surface. No CR
+/// citation belongs on the fixture itself: which literals a `u8` can hold is an
+/// engine representation limit, not a rule.
+///
+/// Two successive defects are locked here. First, `u8::try_from(count).ok()`
+/// made `"up to 300"` decay into the `None` "any number of spells" sentinel.
+/// Second — the shape this test now pins — the resulting `Unrepresentable`
+/// reading was mapped to `CastFromZoneDriver::LingeringPermission`, whose
+/// resolver records per-object permissions with NO shared cast count
+/// (`game/effects/cast_from_zone.rs`). That is still an uncapped grant, merely a
+/// delayed one. CR 608.2c: the printed "up to N" is part of the instruction the
+/// controller follows, so the only honest options are to carry the bound or to
+/// refuse the clause.
+///
+/// The paired positive controls prove the fixtures reach the real
+/// resolution-window arm rather than dying in some upstream anchor, so the
+/// refusals are not vacuous.
+#[test]
+fn from_among_cast_cap_the_window_cannot_represent_is_refused() {
+    // Positive control: an in-range cap on the identical surface DOES lower to a
+    // bounded resolution window. If this stops holding, the refusals below prove
+    // nothing.
+    let control =
+        parse_effect("cast up to two spells from among them without paying their mana costs");
+    let Effect::CastFromZone {
+        driver: CastFromZoneDriver::ResolutionWindow { bounds },
+        ..
+    } = &control
+    else {
+        panic!("in-range cap must lower to a resolution window, got {control:?}");
+    };
+    assert_eq!(
+        bounds.max_casts,
+        Some(2),
+        "the printed in-range bound must be carried losslessly"
+    );
+
+    // And the genuinely unbounded surface is what `None` is reserved for.
+    let unbounded =
+        parse_effect("cast any number of spells from among them without paying their mana costs");
+    let Effect::CastFromZone {
+        driver: CastFromZoneDriver::ResolutionWindow { bounds },
+        ..
+    } = &unbounded
+    else {
+        panic!("\"any number of\" must lower to a resolution window, got {unbounded:?}");
+    };
+    assert_eq!(
+        bounds.max_casts, None,
+        "\"any number of spells\" is the one surface that means unbounded"
+    );
+
+    // Every unrepresentable printed cap — over `u8::MAX`, the degenerate zero,
+    // and the non-literal `X` — refuses to the SAME exact gap node.
+    for cap in ["256", "300", "0", "x"] {
+        let text =
+            format!("cast up to {cap} spells from among them without paying their mana costs");
+        assert_cast_cap_refused(
+            &text,
+            &format!("up to {cap} spells from among them without paying their mana costs"),
+        );
+    }
+}
+
+/// The direct graveyard/hand free-cast route refuses the same caps, through the
+/// same gap node.
+///
+/// This is the second, independent lowering route the maintainer flagged, and it
+/// had two successive defects of its own. First a bare `parse_number` followed
+/// by `count as u8` WRAPPED `"up to 300"` to 44. Then, once the shared
+/// `parse_representable_cast_count` rejected the literal, the rejection was
+/// treated as "not my shape": the clause fell out of
+/// `try_parse_free_cast_from_zones` straight into `try_parse_cast_effect`'s
+/// Branch-2 filter permission — an uncapped `CastFromZone` over the
+/// graveyard/hand pool, which is the same uncapped grant by another name.
+/// CR 608.2c: the printed bound is part of the instruction, so the route must
+/// refuse rather than silently widen.
+#[test]
+fn free_cast_from_zones_cap_the_window_cannot_represent_is_refused() {
+    // Positive control: Invoke Calamity's real, in-range surface still lowers.
+    let control = parse_effect(
+        "you may cast up to two instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs",
+    );
+    let Effect::FreeCastFromZones { count, .. } = &control else {
+        panic!("in-range cap must lower to FreeCastFromZones, got {control:?}");
+    };
+    assert_eq!(
+        *count,
+        Some(2),
+        "the printed in-range bound must be carried losslessly"
+    );
+
+    for cap in ["256", "300", "0", "x"] {
+        let text = format!(
+            "you may cast up to {cap} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
+        );
+        assert_cast_cap_refused(
+            &text,
+            &format!(
+                "up to {cap} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
+            ),
+        );
+    }
+}
+
+/// The counted exiled-this-way route shares the same cap authority and the same
+/// refusal.
+///
+/// This route already rejected out-of-range literals inside
+/// `try_parse_counted_free_cast_from_exiled_this_way`, but the rejection merely
+/// fell through to the `from among … exiled this way` arm, which built an
+/// uncapped `CastFromZone`. The refusal is now terminal for this route too.
+#[test]
+fn counted_exiled_this_way_cast_cap_the_window_cannot_represent_is_refused() {
+    let control = parse_effect(
+        "cast up to two spells from among the cards exiled this way without paying their mana costs",
+    );
+    assert!(
+        matches!(&control, Effect::FreeCastFromZones { count: Some(2), .. }),
+        "reach guard: the in-range cap must still lower to the counted free-cast \
+         window carrying exactly the printed bound, got {control:?}"
+    );
+
+    for cap in ["256", "300", "0", "x"] {
+        let text = format!(
+            "cast up to {cap} spells from among the cards exiled this way without paying their mana costs"
+        );
+        assert_cast_cap_refused(
+            &text,
+            &format!(
+                "up to {cap} spells from among the cards exiled this way without paying their mana costs"
+            ),
+        );
+    }
+}
+
+/// The refusal is STRUCTURAL at the construction seam, not only at the door.
+///
+/// `from_among_batch_cast_driver` is the shared driver authority for all four
+/// `from among` arms. It must answer `None` for an unrepresentable printed cap
+/// on EVERY driver axis — free/`Cast` (which would otherwise pick
+/// `ResolutionWindow`), paid, land-play, and duration-bearing (which would
+/// otherwise pick `LingeringPermission`) — so that no reordering of the arms,
+/// and no future caller that bypasses `refuse_unrepresentable_cast_cap`, can
+/// rebuild the downgrade. The paired unbounded rows prove each axis still
+/// produces its intended driver, so the refusals are not vacuous.
+#[test]
+fn from_among_batch_cast_driver_refuses_an_unrepresentable_cap_on_every_axis() {
+    let free = "up to 300 spells from among them without paying their mana costs";
+    let free_ok = "up to two spells from among them without paying their mana costs";
+    let durational = "up to 300 spells from among them this turn without paying their mana costs";
+    let durational_ok = "spells from among them this turn without paying their mana costs";
+    let paid = "up to 300 spells from among them";
+    let paid_ok = "spells from among them";
+
+    // Representable bounds still pick their established drivers.
+    assert!(
+        matches!(
+            from_among_batch_cast_driver(Cast, true, free_ok),
+            Some(CastFromZoneDriver::ResolutionWindow { bounds })
+                if bounds.max_casts == Some(2)
+        ),
+        "reach guard: the free, no-duration axis must still build a bounded window"
+    );
+    assert_eq!(
+        from_among_batch_cast_driver(Cast, true, durational_ok),
+        Some(LingeringPermission),
+        "reach guard: a stated duration over an UNBOUNDED batch must still keep \
+         the lingering grant"
+    );
+    assert_eq!(
+        from_among_batch_cast_driver(Cast, false, paid_ok),
+        Some(LingeringPermission),
+        "reach guard: a paid UNBOUNDED batch cast must still keep the lingering grant"
+    );
+
+    // The same axes refuse an unrepresentable printed cap.
+    for (label, rest, mode, without_paying) in [
+        ("free/no-duration", free, Cast, true),
+        ("duration-bearing", durational, Cast, true),
+        ("paid", paid, Cast, false),
+        ("land play", paid, Play, false),
+    ] {
+        assert_eq!(
+            from_among_batch_cast_driver(mode, without_paying, rest),
+            None,
+            "{label}: an unrepresentable printed cap must refuse, never downgrade \
+             to a driver with no count channel"
+        );
+    }
+}
+
+/// CR 608.2c: a printed `"up to N"` that reaches the TAIL branches — the ones
+/// with no count channel at all — is refused rather than dropped.
+///
+/// The four `from among` batch arms pair their bound with a mechanism through
+/// `CastFromZoneDriver::for_batch_bounds`. Everything after them (the persistent
+/// exile-link anaphor, the Triple Triad grant, the Branch-2 filter form, the
+/// Branch-3 bare fallback) builds a countless `CastFromZone`, and three real
+/// cards fell through to exactly that — all three onto `TargetFilter::Any`, the
+/// most permissive grant the engine can express.
+///
+/// The `"up to N target …"` rows are the mandatory paired negatives: there the
+/// quantifier is CR 115.1d target cardinality, not a cast budget, and those
+/// clauses must keep lowering. Without them this guard would silently swallow
+/// Diluvian Primordial, Finale of Promise and Gale, Waterdeep Prodigy.
+#[test]
+fn a_printed_cap_reaching_the_tail_branches_is_refused() {
+    for (name, text, fragment) in [
+        // Ashiok, Nightmare Muse (verbatim minus the loyalty prefix).
+        (
+            "Ashiok, Nightmare Muse",
+            "you may cast up to three spells from among face-up cards your opponents own from exile without paying their mana costs",
+            "up to three spells from among face-up cards your opponents own from exile without paying their mana costs",
+        ),
+        // Power Without Equal (verbatim clause body).
+        (
+            "Power Without Equal",
+            "you may cast up to three spells from your hand without paying their mana costs",
+            "up to three spells from your hand without paying their mana costs",
+        ),
+        // March of Reckless Joy (verbatim clause body) — CR 305.1 play mode.
+        // The trailing duration is stripped by `strip_trailing_duration` before
+        // the cast body is lowered, so the refused fragment is the body alone;
+        // the refusal is therefore reached at the tail guard, not at the
+        // trailing-duration reconciliation seam.
+        (
+            "March of Reckless Joy",
+            "you may play up to two of those cards until the end of your next turn",
+            "up to two of those cards",
+        ),
+    ] {
+        let effect = parse_effect(text);
+        let Effect::Unimplemented { name: gap, description } = &effect else {
+            panic!("{name}: expected the tail-branch cap refusal, got {effect:?}");
+        };
+        assert_eq!(
+            gap, UNREPRESENTABLE_CAST_CAP_GAP,
+            "{name}: the refusal must be the shared cast-cap gap, not some other parse loss"
+        );
+        assert_eq!(
+            description.as_deref(),
+            Some(fragment),
+            "{name}: the gap must carry the refused clause verbatim"
+        );
+    }
+
+    // MANDATORY PAIRED NEGATIVES. CR 115.1d: "up to one TARGET …" is target
+    // cardinality, carried by `MultiTargetSpec`, not a cast budget. These cards
+    // cast one card per chosen target and must keep lowering to a real
+    // `CastFromZone`.
+    for (name, text) in [
+        (
+            "Diluvian Primordial",
+            "you may cast up to one target instant or sorcery card from that player's graveyard without paying its mana cost",
+        ),
+        (
+            "Gale, Waterdeep Prodigy",
+            "you may cast up to one target card of the other type from your graveyard",
+        ),
+    ] {
+        let effect = parse_effect(text);
+        assert!(
+            matches!(&effect, Effect::CastFromZone { .. }),
+            "{name}: a CR 115.1d target quantifier is not a cast cap and must not \
+             be refused, got {effect:?}"
+        );
+    }
+}
+
+/// CR 608.2c: a REPRESENTABLE printed cap is refused just as strictly when the
+/// mechanism the grammar selects has no count channel.
+///
+/// This is the general form of the defect the two rows above used to encode.
+/// `Unrepresentable` was only ever the *loudest* case: a cap of `2` — or of `1`,
+/// or a CR 202.3 running-total budget — is perfectly expressible, and was still
+/// dropped the moment the clause was paid, land-play, or duration-bearing,
+/// because `LingeringPermission` records per-object permissions with no shared
+/// budget (`game/effects/cast_from_zone.rs::record_lingering_permissions`). The
+/// printed bound and the mechanism are now paired in exactly one place
+/// (`CastFromZoneDriver::for_batch_bounds`), which is what makes every row here
+/// answer the same way.
+///
+/// Each refusing row is paired with the SAME axis carrying an unbounded head, so
+/// no row can pass merely because that axis stopped producing a driver at all.
+#[test]
+fn from_among_batch_cast_driver_refuses_a_representable_cap_no_mechanism_can_carry() {
+    // Sanwell, Avenger Ace (verbatim clause body): a PAID batch cast printing a
+    // singular head noun. Six cards are exiled and exactly one may be cast; the
+    // lingering permission granted every matching one of the six.
+    assert_eq!(
+        from_among_batch_cast_driver(
+            Cast,
+            false,
+            "a vehicle or artifact creature spell from among them"
+        ),
+        None,
+        "a paid batch cast printing a cap of one must refuse: the per-object \
+         permission it would select cannot stop the second cast"
+    );
+    // Chiss-Goria, Forge Tyrant (verbatim clause body): paid, capped, and
+    // duration-bearing at once.
+    assert_eq!(
+        from_among_batch_cast_driver(Cast, false, "an artifact spell from among them this turn"),
+        None,
+        "a paid, duration-bearing capped batch cast must refuse"
+    );
+    // The free duration-bearing axis in isolation (Ral, Leyline Prodigy's
+    // mid-clause "this turn" shape, given a printed cap): the duration selects
+    // the lingering mechanism, which still cannot hold the cap.
+    assert_eq!(
+        from_among_batch_cast_driver(
+            Cast,
+            true,
+            "up to two spells from among them this turn without paying their mana costs"
+        ),
+        None,
+        "a free but duration-bearing capped batch cast must refuse"
+    );
+    // CR 202.3: the running-total budget is a bound with no lingering channel
+    // either, and it is a DIFFERENT axis from the cast count — a fix that
+    // threaded only `max_casts` would leave this row granting an unbudgeted
+    // permission.
+    assert_eq!(
+        from_among_batch_cast_driver(
+            Cast,
+            true,
+            "spells with total mana value 10 or less from among them this turn without paying their mana costs"
+        ),
+        None,
+        "a duration-bearing CR 202.3 running-total budget must refuse too"
+    );
+    // CR 305.1: the land-play axis has no during-resolution mechanism at all.
+    assert_eq!(
+        from_among_batch_cast_driver(Play, false, "a land from among them"),
+        None,
+        "a capped land play must refuse"
+    );
+
+    // Paired reach guards: the same four axes with an UNBOUNDED head still
+    // produce their established drivers, so none of the refusals above is a
+    // "this axis is dead" false green.
+    for (label, rest, mode, without_paying) in [
+        (
+            "paid",
+            "vehicle or artifact creature spells from among them",
+            Cast,
+            false,
+        ),
+        (
+            "paid + duration",
+            "artifact spells from among them this turn",
+            Cast,
+            false,
+        ),
+        (
+            "free + duration",
+            "spells from among them this turn without paying their mana costs",
+            Cast,
+            true,
+        ),
+        ("land play", "lands from among them", Play, false),
+    ] {
+        assert_eq!(
+            from_among_batch_cast_driver(mode, without_paying, rest),
+            Some(LingeringPermission),
+            "reach guard ({label}): an unbounded head on this axis must still \
+             build the lingering grant"
+        );
+    }
+}
+
+/// CR 608.2g: the self-library one-card driver is selected ONLY for an exact
+/// single-card cap.
+///
+/// `CastFromZoneDriver::DuringResolution` casts exactly one card. Selecting it
+/// for "any number of" or for `up to two` narrows the printed instruction just
+/// as silently as the lingering downgrade widens it — the same bound-dropping
+/// defect in the under-permissive direction. Every real card on this surface
+/// (Kiora, Aetherworks Marvel, Svella, Cosmic Cube, Perception Bobblehead)
+/// prints the singular head, which the first row pins.
+#[test]
+fn self_library_peek_cast_driver_requires_an_exact_single_card_cap() {
+    // Kiora, Sovereign of the Deep (verbatim clause body).
+    assert_eq!(
+        from_among_self_library_cast_driver(
+            "a spell with mana value less than x from among them without paying its mana cost"
+        ),
+        Some(CastFromZoneDriver::DuringResolution),
+        "reach guard: the real singular surface must still pick the one-card driver"
+    );
+    for (label, rest) in [
+        (
+            "any number of",
+            "any number of spells from among them without paying their mana costs",
+        ),
+        (
+            "bare plural",
+            "spells from among them without paying their mana costs",
+        ),
+        (
+            "up to two",
+            "up to two spells from among them without paying their mana costs",
+        ),
+        (
+            "unrepresentable",
+            "up to 300 spells from among them without paying their mana costs",
+        ),
+    ] {
+        assert_eq!(
+            from_among_self_library_cast_driver(rest),
+            None,
+            "{label}: the one-card driver must not be selected for a bound it \
+             cannot reach"
+        );
+    }
+}
+
+/// CR 608.2c: the pairing authority's capacity table, asserted directly.
+///
+/// The parser rows above exercise this through Oracle grammar; this row states
+/// the invariant itself, so a future mechanism added to `CastMechanism` — or a
+/// future bound axis added to `ResolutionCastWindow` — has to declare its
+/// counting capability here rather than inheriting someone else's by accident.
+#[test]
+fn cast_mechanism_bound_pairing_table_is_exact() {
+    use crate::types::ability::{CastMechanism, ResolutionCastWindow};
+
+    let unbounded = ResolutionCastWindow::UNBOUNDED;
+    let one = ResolutionCastWindow {
+        max_casts: Some(1),
+        max_total_mv: None,
+    };
+    let two = ResolutionCastWindow {
+        max_casts: Some(2),
+        max_total_mv: None,
+    };
+    let budget = ResolutionCastWindow {
+        max_casts: None,
+        max_total_mv: Some(10),
+    };
+
+    // Lingering permissions have no shared budget: unbounded only.
+    assert_eq!(
+        CastFromZoneDriver::for_batch_bounds(CastMechanism::LingeringPermission, unbounded),
+        Some(LingeringPermission)
+    );
+    for bounded in [one, two, budget] {
+        assert_eq!(
+            CastFromZoneDriver::for_batch_bounds(CastMechanism::LingeringPermission, bounded),
+            None,
+            "lingering permissions cannot carry {bounded:?}"
+        );
+    }
+
+    // The two one-card mechanisms accept an exact single-card cap and nothing
+    // else — including not an unbounded clause, which they would narrow.
+    for (mechanism, expected) in [
+        (
+            CastMechanism::SingleCardDuringResolution,
+            CastFromZoneDriver::DuringResolution,
+        ),
+        (
+            CastMechanism::ResolutionTimePrivateZonePick,
+            LingeringPermission,
+        ),
+    ] {
+        assert_eq!(
+            CastFromZoneDriver::for_batch_bounds(mechanism, one),
+            Some(expected),
+            "{mechanism:?} must carry an exact single-card cap"
+        );
+        for rejected in [unbounded, two, budget] {
+            assert_eq!(
+                CastFromZoneDriver::for_batch_bounds(mechanism, rejected),
+                None,
+                "{mechanism:?} cannot carry {rejected:?}"
+            );
+        }
+    }
+
+    // The window is the one mechanism with count and running-total channels.
+    for bounds in [unbounded, one, two, budget] {
+        assert_eq!(
+            CastFromZoneDriver::for_batch_bounds(CastMechanism::ResolutionWindow, bounds),
+            Some(CastFromZoneDriver::ResolutionWindow { bounds }),
+            "the window must carry {bounds:?} losslessly"
+        );
+    }
+}
+
+/// CR 611.2a + CR 608.2c: the three duration-reconciliation seams refuse rather
+/// than drop the bound.
+///
+/// A duration stamped on the grant AFTER the clause body was lowered degrades a
+/// resolution-scoped window back to a lingering permission — correctly, because
+/// the controller then casts at a later priority window. What was NOT correct is
+/// that the degrade silently discarded whatever bound the window carried.
+/// `with_lingering_duration` is now expressed as
+/// `for_batch_bounds(LingeringPermission, …)`, so it refuses exactly when the
+/// selection side does, and its `Option` return is what forces each of the three
+/// seams to face the refusal.
+#[test]
+fn duration_reconciliation_refuses_a_bound_the_lingering_grant_cannot_carry() {
+    use crate::types::ability::ResolutionCastWindow;
+
+    // Reach guard: an unbounded window still degrades cleanly.
+    assert_eq!(
+        CastFromZoneDriver::ResolutionWindow {
+            bounds: ResolutionCastWindow::UNBOUNDED,
+        }
+        .with_lingering_duration(),
+        Some(LingeringPermission),
+        "reach guard: an unbounded window must still degrade to the lingering grant"
+    );
+    // The two single-card mechanisms carry no batch bound and are untouched.
+    assert_eq!(
+        CastFromZoneDriver::DuringResolution.with_lingering_duration(),
+        Some(CastFromZoneDriver::DuringResolution)
+    );
+    assert_eq!(
+        LingeringPermission.with_lingering_duration(),
+        Some(LingeringPermission)
+    );
+
+    for bounds in [
+        ResolutionCastWindow {
+            max_casts: Some(1),
+            max_total_mv: None,
+        },
+        ResolutionCastWindow {
+            max_casts: Some(2),
+            max_total_mv: None,
+        },
+        ResolutionCastWindow {
+            max_casts: None,
+            max_total_mv: Some(10),
+        },
+    ] {
+        assert_eq!(
+            CastFromZoneDriver::ResolutionWindow { bounds }.with_lingering_duration(),
+            None,
+            "a window carrying {bounds:?} must refuse the lingering degrade"
+        );
+    }
+}
+
+/// CR 611.2a: the LEADING-duration seam (`with_clause_duration`) emits the honest
+/// gap for a bound it would otherwise drop.
+///
+/// The clause body is lowered from a fragment with the duration prefix already
+/// stripped, so it builds a bounded resolution window; the prefix is re-attached
+/// afterwards. Aminatou's Augury prints exactly this shape ("Until end of turn,
+/// … you may cast **a** spell of that type from among the exiled cards without
+/// paying its mana cost"), and it is the shape that turned a printed cap of one
+/// into an uncapped end-of-turn free-cast permission over the whole exiled set.
+#[test]
+fn leading_duration_over_a_capped_window_refuses() {
+    // Reach guard: the identical shape with an unbounded head still lowers to a
+    // durational lingering grant, so the refusals below are not "this whole
+    // grammar stopped parsing".
+    let control = parse_effect(
+        "until end of turn, you may cast spells from among them without paying their mana costs",
+    );
+    assert!(
+        matches!(
+            &control,
+            Effect::CastFromZone {
+                driver: LingeringPermission,
+                duration: Some(Duration::UntilEndOfTurn),
+                ..
+            }
+        ),
+        "reach guard: an unbounded leading-duration grant must still lower to a \
+         durational lingering permission, got {control:?}"
+    );
+
+    for text in [
+        "until end of turn, you may cast up to two spells from among them without paying their mana costs",
+        "until end of turn, you may cast a spell from among them without paying its mana cost",
+        "until end of turn, you may cast spells with total mana value 10 or less from among them without paying their mana costs",
+    ] {
+        assert_duration_scoped_bound_refused(text);
+    }
+}
+
+/// CR 611.2a: the TRAILING-duration seam refuses the same way.
+///
+/// `strip_trailing_duration` peels "… this turn" off the end of the chunk before
+/// the body is lowered, so this is a structurally distinct seam from the leading
+/// one (Meeting of the Five's shape) and had its own copy of the silent degrade.
+#[test]
+fn trailing_duration_over_a_capped_window_refuses() {
+    let control = parse_effect(
+        "you may cast spells from among them without paying their mana costs this turn",
+    );
+    assert!(
+        matches!(
+            &control,
+            Effect::CastFromZone {
+                driver: LingeringPermission,
+                ..
+            }
+        ),
+        "reach guard: an unbounded trailing-duration grant must still lower to a \
+         lingering permission, got {control:?}"
+    );
+    assert_duration_scoped_bound_refused(
+        "you may cast up to two spells from among them without paying their mana costs this turn",
+    );
+}
+
+/// The strict duration-reconciliation refusal shape, asserted EXACTLY.
+///
+/// Mirrors `assert_cast_cap_refused`: naming the gap and requiring a description
+/// is what keeps these regressions non-vacuous. The description records the
+/// BOUND rather than an Oracle fragment, because these seams run after lowering
+/// and no longer hold the source text.
+fn assert_duration_scoped_bound_refused(text: &str) {
+    let effect = parse_effect(text);
+    let Effect::Unimplemented { name, description } = &effect else {
+        panic!("expected the duration-scoped bound refusal for {text:?}, got {effect:?}");
+    };
+    assert_eq!(
+        name,
+        crate::types::ability::CAST_BOUND_LOST_TO_DURATION_GAP,
+        "the refusal must be the shared duration-scoped gap, not some other parse loss"
+    );
+    assert!(
+        description
+            .as_deref()
+            .is_some_and(|d| d.contains("cannot carry")),
+        "the gap must name the bound it refused, got {description:?}"
+    );
+}
+
+/// An unquantified PLURAL head noun is unbounded, including the CR 305.1
+/// land-play noun. (Which noun the reader looks at is English grammar, not a
+/// rule; CR 305.1 is cited only because it is what makes "lands" a head noun on
+/// this surface at all.)
+///
+/// The plural reader enumerated "spells" and "cards" only, so The Omenkeel's
+/// "you may play **lands** from among those cards for as long as they remain
+/// exiled" read as a printed cap of ONE. That misread was invisible only because
+/// the land-play arm discarded the cap before anything could act on it — the
+/// moment the pairing authority started honoring caps, it surfaced as a false
+/// refusal of a real card. Reading the plural through one combinator over the
+/// castable/playable noun set is what keeps the three nouns in step.
+#[test]
+fn from_among_plural_head_nouns_are_unbounded_including_lands() {
+    for (label, head) in [
+        ("cast plural", "spells "),
+        ("typed cast plural", "instant and sorcery spells "),
+        ("card plural", "cards "),
+        ("play plural", "lands "),
+    ] {
+        assert_eq!(
+            read_from_among_cast_cap(head),
+            CastCapReading::Unbounded,
+            "{label}: a plural head noun states no cap"
+        );
+    }
+    for (label, head) in [
+        ("cast singular", "a spell "),
+        ("typed cast singular", "an instant or sorcery spell "),
+        ("card singular", "a card "),
+        ("play singular", "a land "),
+    ] {
+        assert_eq!(
+            read_from_among_cast_cap(head),
+            CastCapReading::Capped(1),
+            "{label}: a singular head noun states a cap of one"
+        );
+    }
+
+    // The Omenkeel (verbatim clause body): the real card the misread reached.
+    let effect =
+        parse_effect("you may play lands from among those cards for as long as they remain exiled");
+    assert!(
+        matches!(
+            &effect,
+            Effect::CastFromZone {
+                mode: CardPlayMode::Play,
+                driver: LingeringPermission,
+                ..
+            }
+        ),
+        "The Omenkeel's plural land play must stay a land-play permission, got {effect:?}"
     );
 }
 
@@ -53241,6 +54611,7 @@ fn expose_the_culprit_mode2_lowers_to_choose_shuffle_cloak_chain() {
         filter,
         min,
         max,
+        ..
     } = &*head.effect
     else {
         panic!(
@@ -53309,6 +54680,7 @@ fn duneblast_lowers_choose_survivor_then_destroy_rest() {
         filter,
         min,
         max,
+        ..
     } = def.effect.as_ref()
     else {
         panic!("expected tracked-set survivor choice, got {:?}", def.effect);
@@ -53350,6 +54722,7 @@ fn mount_doom_lowers_choose_two_then_destroy_rest() {
         filter,
         min,
         max,
+        ..
     } = def.effect.as_ref()
     else {
         panic!("expected tracked-set survivor choice, got {:?}", def.effect);
@@ -58679,6 +60052,136 @@ fn linked_color_choice_suppresses_the_injected_chooser() {
             "{name}: no clause may lower to Unimplemented: {parsed:#?}"
         );
     }
+}
+
+/// Inside Information (HOB): "Exile the top X cards of target opponent's
+/// library. You may play those cards this turn. If you cast a spell this
+/// way, pay life equal to its mana value rather than pay its mana cost."
+///
+/// CR 601.2b + CR 115: X is announced as part of the casting cost (the card's
+/// mana cost is `{X}{B}{B}`); the exile source is a TARGETED opponent's
+/// library, not the caster's own. CR 701.18b: "play" (not "cast")
+/// authorizes both spells and lands, so the grant is a plain
+/// `PlayFromExile`, not a spell-only `CastFromZone`. CR 118.9 + CR 119.4: the
+/// trailing "pay life ... rather than pay its mana cost" rider is a
+/// non-mana alternative cost that replaces the mana cost for a spell cast
+/// via the grant; because the grant also authorizes land plays (which have
+/// no mana cost to replace), the rider folds onto a dedicated
+/// `PlayFromExile::alt_ability_cost` field instead of converting the grant
+/// to a spell-only `CastFromZone` — see `attach_alt_ability_cost_to_previous_play_from_exile`.
+#[test]
+fn inside_information_exiles_x_grants_play_with_pay_life_alt_cost() {
+    let parsed = parse_oracle_text(
+        "Exile the top X cards of target opponent's library. You may play those cards this \
+         turn. If you cast a spell this way, pay life equal to its mana value rather than pay \
+         its mana cost.",
+        "Inside Information",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+
+    assert_eq!(
+        parsed.triggers.len(),
+        0,
+        "Inside Information has no triggered abilities, got {:?}",
+        parsed.triggers
+    );
+    assert_eq!(
+        parsed.abilities.len(),
+        1,
+        "Inside Information's spell ability must be a single chain, got {:?}",
+        parsed.abilities
+    );
+    let root = &parsed.abilities[0];
+    crate::parser::test_support::assert_no_unimplemented(root);
+
+    // Head: CR 601.2b + CR 115 — exile X cards from a TARGETED opponent's
+    // library (not `ControllerRef::You`).
+    let Effect::ExileTop {
+        player,
+        count,
+        position,
+        ..
+    } = root.effect.as_ref()
+    else {
+        panic!("head effect must be ExileTop, got {:?}", root.effect);
+    };
+    assert_eq!(
+        *position,
+        LibraryPosition::Top,
+        "\"the top X cards\" must exile from the top of the library"
+    );
+    assert_eq!(
+        *count,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string()
+            }
+        },
+        "count must read the announced X value"
+    );
+    match player {
+        TargetFilter::Typed(typed) => assert_eq!(
+            typed.controller,
+            Some(ControllerRef::Opponent),
+            "\"target opponent's library\" must scope to an opponent, not the caster"
+        ),
+        other => panic!("player filter must be a targeted-opponent Typed filter, got {other:?}"),
+    }
+
+    // Sub-ability: CR 701.18b — a plain `PlayFromExile` grant (not a
+    // spell-only `CastFromZone`), carrying the folded alt-cost rider.
+    let sub = root
+        .sub_ability
+        .as_deref()
+        .expect("must chain a GrantCastingPermission sub-ability");
+    let Effect::GrantCastingPermission {
+        permission, target, ..
+    } = sub.effect.as_ref()
+    else {
+        panic!(
+            "sub-ability effect must be GrantCastingPermission, got {:?}",
+            sub.effect
+        );
+    };
+    assert!(
+        matches!(target, TargetFilter::TrackedSet { .. }),
+        "the grant must target the tracked exile set published by ExileTop, got {target:?}"
+    );
+    match permission {
+        CastingPermission::PlayFromExile {
+            duration,
+            alt_ability_cost,
+            ..
+        } => {
+            assert_eq!(
+                *duration,
+                Duration::UntilEndOfTurn,
+                "\"you may play those cards this turn\" must be an until-end-of-turn grant"
+            );
+            assert_eq!(
+                *alt_ability_cost,
+                Some(AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::SelfManaValue
+                    }
+                }),
+                "the rider must fold onto the grant as pay-life-equal-to-mana-value, not be \
+                 swallowed"
+            );
+        }
+        other => panic!("permission must be PlayFromExile, got {other:?}"),
+    }
+
+    // No further sub-ability: the rider is absorbed into the grant, not
+    // emitted as its own sibling clause.
+    assert!(
+        sub.sub_ability.is_none(),
+        "the alt-cost rider must be folded into the PlayFromExile grant, not emitted as a \
+         separate sibling clause: {:?}",
+        sub.sub_ability
+    );
 }
 
 /// CR 700.4 + CR 701.20a + CR 202.3 + CR 608.2c + CR 603.3b: Part in

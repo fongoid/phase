@@ -95,6 +95,7 @@ const mockGuestSubmitDeck = vi.fn(async () => {});
 const mockGuestUpdateWorkspace = vi.fn(async () => {});
 const mockGuestLeave = vi.fn(async () => {});
 const mockGuestDispose = vi.fn();
+let mockGuestRecoveryRevoked = false;
 
 vi.mock("../p2p-draft-guest", () => ({
   P2PDraftGuest: vi.fn().mockImplementation(function () {
@@ -107,6 +108,7 @@ vi.mock("../p2p-draft-guest", () => ({
       updateWorkspace: mockGuestUpdateWorkspace,
       leave: mockGuestLeave,
       dispose: mockGuestDispose,
+      get isRecoveryRevoked() { return mockGuestRecoveryRevoked; },
       view: null,
       seat: null,
       token: null,
@@ -120,12 +122,14 @@ function mockView(status: string): DraftPlayerView {
   return {
     status: status as DraftPlayerView["status"],
     kind: "Premier",
+    launch_capability: "None",
     current_pack_number: 1,
     pick_number: 1,
     pass_direction: "Left",
     current_pack: null,
     // Premier (CR 905.1a) with no pending pack.
     required_pick_count: 0,
+    pick_selection_mode: "Direct",
     pool: [],
     draft_effects: [],
     pool_groups: {
@@ -246,6 +250,34 @@ describe("DraftPodHostAdapter", () => {
     expect(statusEvents).toContainEqual({ type: "statusChanged", status: "connecting" });
     expect(statusEvents).toContainEqual({ type: "statusChanged", status: "lobby" });
     expect(events).toContainEqual({ type: "roomCreated", roomCode: "ABCDE" });
+  });
+
+  it("passes the configured backup endpoint to the production P2P host", async () => {
+    await adapter.initialize({
+      poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+      kind: "Premier",
+      podSize: 8,
+      hostDisplayName: "Host",
+      tournamentFormat: "Swiss",
+      podPolicy: "Competitive",
+      backupEndpoint: "https://phase.example",
+    });
+
+    const { P2PDraftHost } = await import("../p2p-draft-host");
+    expect(P2PDraftHost).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Function),
+      expect.anything(),
+      "Premier",
+      8,
+      "Host",
+      "Swiss",
+      "Competitive",
+      undefined,
+      undefined,
+      "ABCDE",
+      "https://phase.example",
+    );
   });
 
   it("can suspend without terminating the persisted host draft", async () => {
@@ -820,6 +852,7 @@ describe("DraftPodGuestAdapter", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    mockGuestRecoveryRevoked = false;
     const { joinRoom } = await import("../../network/connection");
     (joinRoom as ReturnType<typeof vi.fn>).mockResolvedValue(mockJoinResult());
 
@@ -952,6 +985,33 @@ describe("DraftPodGuestAdapter", () => {
     await adapter.initialize({ kind: "new", roomCode: "ABCDE", displayName: "Alice" });
     await adapter.dispose({ preserveRecovery: false });
     expect(mockGuestLeave).toHaveBeenCalled();
+  });
+
+  it("retains guest event ownership when an explicit leave is not acknowledged", async () => {
+    await adapter.initialize({ kind: "new", roomCode: "ABCDE", displayName: "Alice" });
+    const guestEventHandler = mockGuestOnEvent.mock.calls[0][0];
+    const guestEventUnsub = mockGuestOnEvent.mock.results[0]!.value as ReturnType<typeof vi.fn>;
+    mockGuestLeave.mockRejectedValueOnce(new Error("Draft host disconnected before acknowledging leave"));
+
+    await expect(adapter.dispose({ preserveRecovery: false })).rejects.toThrow("disconnected before acknowledging leave");
+    expect(guestEventUnsub).not.toHaveBeenCalled();
+
+    guestEventHandler({ type: "reconnecting", attempt: 1 });
+    expect(events).toContainEqual({ type: "reconnecting", attempt: 1 });
+
+    await adapter.dispose({ preserveRecovery: false });
+    expect(guestEventUnsub).toHaveBeenCalledOnce();
+  });
+
+  it("locally disposes an explicitly exited guest after its recovery is revoked", async () => {
+    await adapter.initialize({ kind: "new", roomCode: "ABCDE", displayName: "Alice" });
+    const guestEventHandler = mockGuestOnEvent.mock.calls[0][0];
+    mockGuestRecoveryRevoked = true;
+    guestEventHandler({ type: "hostLeft", reason: "Host left" });
+
+    await expect(adapter.dispose({ preserveRecovery: false })).resolves.toBeUndefined();
+    expect(mockGuestDispose).toHaveBeenCalled();
+    expect(mockGuestLeave).not.toHaveBeenCalled();
   });
 
   it("emits error on connection failure", async () => {

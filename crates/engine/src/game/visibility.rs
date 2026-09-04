@@ -437,6 +437,27 @@ pub(crate) fn identity_projection_for_viewer(
         HashSet::new()
     };
 
+    // CR 701.25a: "To 'surveil N' means to look at the top N cards of your
+    // library, then put any number of them into your graveyard and the rest on
+    // top of your library in any order." Those cards are still in the library
+    // while the choice is pending, so the blanket library redaction below hides
+    // them from the very player instructed to look at them — the surveil prompt
+    // renders "Hidden Card". Mirrors `scry_visible` (CR 701.22a), the identical
+    // look-at-the-top-N prompt.
+    let surveil_visible: HashSet<ObjectId> =
+        if let WaitingFor::SurveilChoice {
+            player, ref cards, ..
+        } = state.waiting_for
+        {
+            if can_view_private_for_player(player) {
+                cards.iter().copied().collect()
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
     let search_visible: HashSet<ObjectId> =
         if let WaitingFor::SearchChoice {
             player, ref cards, ..
@@ -536,6 +557,7 @@ pub(crate) fn identity_projection_for_viewer(
         let visible = manifest_dread_visible.contains(&obj_id)
             || dig_visible.contains(&obj_id)
             || scry_visible.contains(&obj_id)
+            || surveil_visible.contains(&obj_id)
             || private_look_visible.contains(&obj_id)
             || search_visible.contains(&obj_id)
             || effect_zone_library_visible.contains(&obj_id)
@@ -757,6 +779,15 @@ pub(crate) fn proposer_hidden_view(state: &GameState, proposer: PlayerId) -> Gam
 /// viewer is explicitly allowed to see them.
 pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState {
     let mut filtered = state.clone();
+    // This clone is a display snapshot, never rules authority: the ~20 private
+    // carriers blanked below are dropped while the public `waiting_for` that
+    // stands over them is preserved. Record that here so the fact survives
+    // serialization — `reject_viewer_projection_as_authority` refuses it at the
+    // PERSISTENCE ingress, so a projection can never be restored as a saved game.
+    // It is deliberately NOT refused on the transport decode path: the multiplayer
+    // protocol ships projections to viewers on purpose. Last-writer-wins:
+    // re-projecting a projection for another viewer re-latches to that viewer.
+    filtered.viewer_projection = Some(viewer);
     // Analysis provenance is meaningful only to the clone executing a preview;
     // never carry it into a viewer projection.
     filtered.life_safety_probe = Box::default();
@@ -807,6 +838,15 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // itself. Viewer projections are display-only clones; the authoritative
     // state the drain resumes from is never filtered.
     filtered.pending_discard_batch = None;
+    // CR 401.4 + CR 608.2c: Queued owner batches retain exact hidden-card
+    // identities and origins for later private choices. The public current
+    // `EffectZoneChoice` is projected below; its execution-only successor
+    // carrier must never be shipped to any viewer, including a future owner.
+    filtered.pending_mass_library_order_choice = None;
+    // CR 400.2 + CR 616.1: the replacement-suspended exile iterator retains
+    // the exact remaining library order and current-resolution incarnation
+    // pins. The ReplacementChoice prompt is its complete public surface.
+    filtered.pending_exile_from_top_until = None;
     // CR 510.2 + CR 616.1: the parked combat-damage batch is server authority.
     // Its `batch_events` can carry rider-created `ZoneChanged` records and other
     // effect events that `filter_events_for_viewer` would redact in the live
@@ -1311,6 +1351,22 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         }
     }
 
+    // CR 701.25a: the surveilled cards are shown only to the surveilling
+    // player. Redact the id array for every other viewer, mirroring the
+    // `ScryChoice` block above — otherwise an opponent learns exactly which
+    // object ids sit on top of that library.
+    if let WaitingFor::SurveilChoice {
+        player, ref cards, ..
+    } = state.waiting_for
+    {
+        if !can_view_private_for_player(player) {
+            filtered.waiting_for = WaitingFor::SurveilChoice {
+                player,
+                cards: cards.iter().map(|_| ObjectId(0)).collect(),
+            };
+        }
+    }
+
     if let WaitingFor::LearnChoice {
         player,
         ref hand_cards,
@@ -1788,15 +1844,17 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         ref enter_with_counters,
         ref conditional_enter_with_counters,
         count_param,
-        library_position: None,
+        ref library_position,
+        mass_library_order: _,
         is_cost_payment: _,
         enters_modified_if: _,
         ref duration,
     } = state.waiting_for
     {
-        // `open_private_zone_cast_selection` is the sole Library producer and
-        // always writes `library_position: None`, so this pattern redacts every
-        // private library cast-choice payload for non-prompt viewers.
+        // A private-zone choice reveals exactly which cards can be selected,
+        // including a mass library-order prompt whose members still occupy the
+        // battlefield. The placement parameters are public, but the offered
+        // ids and their identity/origin provenance are not.
         if !can_view_private_for_player(player) && matches!(zone, Zone::Hand | Zone::Library) {
             filtered.waiting_for = WaitingFor::EffectZoneChoice {
                 player,
@@ -1820,7 +1878,8 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                 enter_with_counters: enter_with_counters.clone(),
                 conditional_enter_with_counters: conditional_enter_with_counters.clone(),
                 count_param,
-                library_position: None,
+                library_position: library_position.clone(),
+                mass_library_order: None,
                 is_cost_payment: false,
                 enters_modified_if: None,
                 // The bounded-move duration is a public effect parameter, not
@@ -4233,6 +4292,54 @@ mod tests {
         ));
     }
 
+    /// CR 701.25a: surveil is "look at the top N cards of your library" — the
+    /// surveilling player must see those identities while the prompt is open,
+    /// and no one else may. Regression guard for the surveil prompt rendering
+    /// "Hidden Card" to its own player: `visibility.rs` redacts every library
+    /// object and un-redacts through a named allowlist, and `SurveilChoice` was
+    /// missing from it (`scry_visible` had the identical exemption).
+    #[test]
+    fn surveil_choice_is_visible_to_its_player_but_not_an_opponent() {
+        let mut state = GameState::new_two_player(42);
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Surveiled Card".to_string(),
+            Zone::Library,
+        );
+        state.waiting_for = WaitingFor::SurveilChoice {
+            player: PlayerId(0),
+            cards: vec![card],
+        };
+
+        let surveiler_view = filter_state_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            surveiler_view
+                .objects
+                .get(&card)
+                .map(|obj| obj.name.as_str()),
+            Some("Surveiled Card")
+        );
+        assert!(
+            surveiler_view.objects[&card].display_visible_to_viewer,
+            "the client renders the surveil prompt from display_visible_to_viewer"
+        );
+
+        let opponent_view = filter_state_for_viewer(&state, PlayerId(1));
+        assert_eq!(
+            opponent_view
+                .objects
+                .get(&card)
+                .map(|obj| obj.name.as_str()),
+            Some("Hidden Card")
+        );
+        assert!(matches!(
+            opponent_view.waiting_for,
+            WaitingFor::SurveilChoice { cards, .. } if cards == vec![ObjectId(0)]
+        ));
+    }
+
     #[test]
     fn durable_product_knowledge_survives_reveal_cleanup_for_its_viewer_only() {
         let mut state = GameState::new(FormatConfig::standard(), 3, 42);
@@ -6187,7 +6294,7 @@ mod tests {
             player: PlayerId(0),
             kind: CastOfferKind::FreeCastWindow {
                 candidates: vec![hand_candidate],
-                remaining_casts: 2,
+                remaining_casts: Some(2),
                 remaining_mv_budget: Some(6),
                 filter: crate::types::ability::TargetFilter::Any,
                 zones: vec![Zone::Graveyard, Zone::Hand],
@@ -6213,7 +6320,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(candidates, vec![hand_candidate]);
-                assert_eq!(remaining_casts, 2);
+                assert_eq!(remaining_casts, Some(2));
                 assert_eq!(remaining_mv_budget, Some(6));
             }
             other => panic!("expected FreeCastWindow for controller, got {other:?}"),
@@ -6247,7 +6354,7 @@ mod tests {
                     "opponent must not see the controller's hand id via the member pool"
                 );
                 assert_eq!(member_pool, vec![ObjectId(0)]);
-                assert_eq!(remaining_casts, 2);
+                assert_eq!(remaining_casts, Some(2));
                 assert_eq!(remaining_mv_budget, Some(6));
                 assert_eq!(
                     graveyard_replacement.as_ref(),
@@ -6725,6 +6832,49 @@ mod tests {
             state.pending_discard_batch.is_some(),
             "filtering must not alter the authoritative server carrier"
         );
+    }
+
+    /// CR 400.2 + CR 616.1: an exile-until replacement continuation carries
+    /// hidden library order and is server-only for every viewer.
+    #[test]
+    fn parked_exile_from_top_until_is_absent_from_every_viewer_projection() {
+        let mut state = GameState::new_two_player(42);
+        let pending = create_object(
+            &mut state,
+            CardId(70_008),
+            PlayerId(0),
+            "Pending Secret".to_string(),
+            Zone::Library,
+        );
+        let remaining = create_object(
+            &mut state,
+            CardId(70_009),
+            PlayerId(0),
+            "Remaining Secret".to_string(),
+            Zone::Library,
+        );
+        state.pending_exile_from_top_until = Some(Box::new(
+            crate::types::game_state::PendingExileFromTopUntil {
+                pending_card: pending,
+                remaining: vec![remaining],
+                linked_batch: Vec::new(),
+                cumulative: 0,
+            },
+        ));
+        let authoritative = serde_json::to_string(&state.pending_exile_from_top_until)
+            .expect("authoritative continuation serializes");
+        assert!(authoritative.contains(&remaining.0.to_string()));
+
+        for viewer in [PlayerId(0), PlayerId(1)] {
+            let view = filter_state_for_viewer(&state, viewer);
+            assert!(view.pending_exile_from_top_until.is_none());
+            let wire = serde_json::to_string(&view).expect("filtered state serializes");
+            assert!(
+                !wire.contains("pendingExileFromTopUntil")
+                    && !wire.contains("pending_exile_from_top_until")
+            );
+        }
+        assert!(state.pending_exile_from_top_until.is_some());
     }
 
     /// CR 510.2 + CR 616.1: `pending_combat_lifelink` is the parked
@@ -7718,6 +7868,8 @@ mod tests {
             },
             constraint: None,
             granted_to,
+            duration: None,
+            source_id: None,
         }];
         (state, card)
     }
@@ -7839,6 +7991,7 @@ mod tests {
                 Zone::Battlefield,
             )));
             obj.casting_permissions = vec![CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost: crate::types::mana::ManaCost::zero(),
                 cost_provenance: ExileGrantCostProvenance::Alternative,
                 cast_transformed: false,

@@ -398,6 +398,7 @@ fn priority_land_play_omits_an_exile_land_blocked_by_a_play_restriction() {
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -409,6 +410,7 @@ fn priority_land_play_omits_an_exile_land_blocked_by_a_play_restriction() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -1902,6 +1904,7 @@ fn spell_auto_tap_honors_exile_any_color_permission() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -1913,6 +1916,7 @@ fn spell_auto_tap_honors_exile_any_color_permission() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -1963,6 +1967,7 @@ fn add_play_from_exile_test_spell(
     obj.casting_permissions
         .push(CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::Permanent,
             granted_to,
             frequency: CastFrequency::Unlimited,
@@ -1974,6 +1979,7 @@ fn add_play_from_exile_test_spell(
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
     spell
@@ -2253,6 +2259,7 @@ fn cast_permanent_from_granted_permission_enters_under_caster_control() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -2264,6 +2271,7 @@ fn cast_permanent_from_granted_permission_enters_under_caster_control() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -2304,6 +2312,7 @@ fn play_land_from_granted_permission_enters_under_player_control() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -2315,6 +2324,7 @@ fn play_land_from_granted_permission_enters_under_player_control() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -3074,6 +3084,7 @@ fn foretell_cast_does_not_inherit_sibling_alt_cost_or_spend_rider() {
         *cost = foretell_cost.clone();
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::zero(),
                 cast_transformed: false,
@@ -3746,6 +3757,7 @@ fn exile_with_alt_cost_zero_uses_no_cost_path() {
         .unwrap()
         .casting_permissions
         .push(CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::zero(),
             cast_transformed: false,
@@ -11676,6 +11688,7 @@ fn undaunted_no_op_without_keyword() {
 fn play_from_exile_raise(granted_to: PlayerId, raise: Option<ManaCost>) -> CastingPermission {
     CastingPermission::PlayFromExile {
         provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+        mode: crate::types::ability::CardPlayMode::Play,
         duration: Duration::Permanent,
         granted_to,
         frequency: CastFrequency::Unlimited,
@@ -11687,6 +11700,7 @@ fn play_from_exile_raise(granted_to: PlayerId, raise: Option<ManaCost>) -> Casti
         single_use_group: None,
         single_use: false,
         cast_cost_raise: raise,
+        alt_ability_cost: None,
         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
     }
 }
@@ -16730,16 +16744,21 @@ fn granted_blitz_offers_blitz_variant() {
     );
 }
 
-/// CR 702.152a + CR 604.1 + CR 118.9: Henzie "Toolbox" Torre — "Each creature
-/// spell you cast with mana value 4 or greater has blitz. The blitz cost is
-/// equal to its mana cost." The grant carries `Blitz(ManaCost::SelfManaCost)`, so
-/// the offered Blitz option must surface the self-referential cost (resolved to
-/// the spell's own mana cost at payment time by the shared `SelfManaCost` path,
-/// the same one the granted-flashback cost uses). This pins that a granted
-/// alternative cost equal to the card's mana cost flows intact through the
-/// casting-variant choice set rather than being dropped or fixed to a constant.
+/// CR 702.152a + CR 604.1 + CR 118.9 + CR 601.2f: Henzie "Toolbox" Torre —
+/// "Each creature spell you cast with mana value 4 or greater has blitz. The
+/// blitz cost is equal to its mana cost." The grant carries
+/// `Blitz(ManaCost::SelfManaCost)`, but that placeholder must be concretized
+/// against the recipient spell's own mana cost at the grant-collector exit
+/// (`resolve_self_cost_spell_keyword`, called from `granted_spell_keywords_for`
+/// / `granted_spell_keyword_instances_for`) — BEFORE cost modifiers and
+/// affordability are evaluated — not left unresolved to be "resolved at
+/// payment time" (issue #5435: an unresolved `SelfManaCost` has mana value 0
+/// but is not "without paying mana", so it silently acted as a real {0}
+/// alternative cost, letting AI blitz-cast unaffordable creatures for free).
+/// This pins that the offered Blitz option carries the spell's concrete mana
+/// cost, not the raw placeholder.
 #[test]
-fn granted_blitz_self_mana_cost_surfaces_self_referential_cost() {
+fn granted_blitz_self_mana_cost_resolves_to_spell_mana_cost() {
     use crate::types::ability::{FilterProp, TargetFilter, TypeFilter, TypedFilter};
     use crate::types::keywords::Keyword;
     use crate::types::statics::StaticMode;
@@ -16797,14 +16816,80 @@ fn granted_blitz_self_mana_cost_surfaces_self_referential_cost() {
         .find(|o| o.variant == CastingVariant::Blitz)
         .expect("granted Blitz must surface the Blitz option");
     assert_eq!(
-        blitz.mana_cost,
-        ManaCost::SelfManaCost,
-        "granted Blitz must carry the self-referential cost (resolved to the \
-         spell's own mana cost at payment time), got {:?}",
+        blitz.mana_cost, spell_cost,
+        "granted Blitz must carry the concretized cost (the spell's own mana \
+         cost), not the unresolved SelfManaCost placeholder, got {:?}",
         blitz.mana_cost
     );
     // The recipient really is MV >= 4, so the grant's filter admits it.
     assert_eq!(state.objects.get(&spell).unwrap().mana_cost, spell_cost);
+}
+
+/// CR 702.137a + CR 604.1 + CR 118.9: Building-block sibling of the granted-Blitz
+/// test above. `resolve_self_cost_spell_keyword` is a shared mapper over the whole
+/// cast-time alternative-cost family, so pin a SECOND keyword through it —
+/// otherwise every test of that helper is Blitz-shaped and a Blitz-only special
+/// case would pass unnoticed. Spectacle is the discriminating pick: unlike Blitz
+/// it is gated on an opponent having lost life this turn (CR 702.137a), so the
+/// concretized cost has to survive a different candidate-enumeration path.
+#[test]
+fn granted_spectacle_self_mana_cost_resolves_to_spell_mana_cost() {
+    use crate::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+    use crate::types::keywords::Keyword;
+    use crate::types::statics::StaticMode;
+
+    let mut state = setup_game_at_main_phase();
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+    // CR 702.137a: Spectacle only functions while an opponent lost life this turn.
+    state.players[1].life_lost_this_turn = 2;
+
+    let grantor = create_object(
+        &mut state,
+        CardId(9120),
+        PlayerId(0),
+        "Spectacle Grantor".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&grantor).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        let def = StaticDefinition::new(StaticMode::CastWithKeyword {
+            keyword: Keyword::Spectacle(ManaCost::SelfManaCost),
+        })
+        .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)));
+        obj.static_definitions = vec![def].into();
+    }
+
+    // Recipient: a {3} instant in hand with no printed Spectacle.
+    let spell_cost = ManaCost::generic(3);
+    let spell = create_object(
+        &mut state,
+        CardId(9121),
+        PlayerId(0),
+        "Some Instant".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.base_card_types.core_types.push(CoreType::Instant);
+        obj.mana_cost = spell_cost.clone();
+        obj.base_mana_cost = spell_cost.clone();
+    }
+
+    let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
+    let spectacle = choices
+        .options
+        .iter()
+        .find(|o| o.variant == CastingVariant::Spectacle)
+        .expect("granted Spectacle must surface the Spectacle option");
+    assert_eq!(
+        spectacle.mana_cost, spell_cost,
+        "granted Spectacle must carry the concretized cost (the spell's own mana \
+         cost), not the unresolved SelfManaCost placeholder, got {:?}",
+        spectacle.mana_cost
+    );
 }
 
 /// CR 702.141a + CR 604.1 (seam 4: activated-ability-on-grant): Encore
@@ -18971,6 +19056,7 @@ fn cast_with_keyword_convoke_honors_from_exile_filter() {
         obj.casting_permissions
             .push(crate::types::ability::CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: crate::types::ability::Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -18982,6 +19068,7 @@ fn cast_with_keyword_convoke_honors_from_exile_filter() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -19073,6 +19160,7 @@ fn convoke_from_exile_stacks_with_red_spell_cost_reduction_on_hybrid_cost() {
         obj.casting_permissions
             .push(crate::types::ability::CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: crate::types::ability::Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -19084,6 +19172,7 @@ fn convoke_from_exile_stacks_with_red_spell_cost_reduction_on_hybrid_cost() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -19246,6 +19335,7 @@ fn play_from_exile_grant_binds_to_grantee_and_carries_any_mana_permission() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -19257,6 +19347,7 @@ fn play_from_exile_grant_binds_to_grantee_and_carries_any_mana_permission() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -19627,8 +19718,10 @@ fn graveyard_timed_alt_cost_grant_omits_an_artifact_land_but_keeps_its_land_play
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
             });
     }
 
@@ -19750,6 +19843,7 @@ fn graveyard_in_place_alt_cost_grant_is_consumed_after_one_cast() {
         // never expires).
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::zero(),
                 cast_transformed: false,
@@ -20263,6 +20357,7 @@ fn enters_with_counter_does_not_leak_from_non_consumed_permission() {
             // P1: the permission the caster (PlayerId(0)) actually consumes.
             obj.casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -20280,6 +20375,7 @@ fn enters_with_counter_does_not_leak_from_non_consumed_permission() {
             // finality rider that must NOT leak onto this cast.
             obj.casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -20360,6 +20456,7 @@ fn exact_permission_does_not_inherit_sibling_etb_counter() {
         {
             obj.casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -20445,6 +20542,7 @@ fn exact_permission_does_not_inherit_sibling_permanent_modification() {
         {
             obj.casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -20517,6 +20615,7 @@ fn hand_alt_cost_permission_overrides_printed_mana_cost() {
         obj.mana_cost = ManaCost::generic(5);
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::zero(),
                 cast_transformed: false,
@@ -20564,6 +20663,7 @@ fn add_borrowed_exile_sorcery_with_mana_value(
 
 fn beseech_style_permission() -> CastingPermission {
     CastingPermission::ExileWithAltCost {
+        source_id: None,
         cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
         cost: ManaCost::zero(),
         cast_transformed: false,
@@ -20608,6 +20708,7 @@ fn failing_mana_value_permission_does_not_override_unconstrained_permission() {
         obj.casting_permissions.push(beseech_style_permission());
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::zero(),
                 cast_transformed: false,
@@ -20677,6 +20778,7 @@ fn once_per_turn_collection_counter_play_permission_requires_live_source_static(
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::OncePerTurn,
@@ -20688,6 +20790,7 @@ fn once_per_turn_collection_counter_play_permission_requires_live_source_static(
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -20751,6 +20854,7 @@ fn collection_counter_play_permission_is_once_per_turn() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::Permanent,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::OncePerTurn,
@@ -20762,6 +20866,7 @@ fn collection_counter_play_permission_is_once_per_turn() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -27671,6 +27776,7 @@ fn prototype_from_exile_uses_play_permission_any_color_not_alt_cost_sibling() {
     obj.base_keywords = obj.keywords.clone();
     obj.casting_permissions = vec![
         CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::zero(),
             cast_transformed: false,
@@ -27685,6 +27791,7 @@ fn prototype_from_exile_uses_play_permission_any_color_not_alt_cost_sibling() {
         },
         CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::UntilEndOfTurn,
             granted_to: PlayerId(0),
             frequency: CastFrequency::Unlimited,
@@ -27696,6 +27803,7 @@ fn prototype_from_exile_uses_play_permission_any_color_not_alt_cost_sibling() {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         },
     ];
@@ -29310,6 +29418,7 @@ fn cast_only_from_zones_blocks_affected_opponent_from_exile() {
         .unwrap()
         .casting_permissions
         .push(crate::types::ability::CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::generic(2),
             cast_transformed: false,
@@ -32494,6 +32603,7 @@ fn cast_with_keyword_convoke_uses_caster_not_stored_controller() {
         };
         obj.casting_permissions
             .push(crate::types::ability::CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: obj.mana_cost.clone(),
                 cast_transformed: false,
@@ -39213,6 +39323,174 @@ mod alt_cost_reduction_509 {
                  single Alien token"
         );
     }
+
+    /// CR 702.119a + CR 604.1 + CR 118.9: Building-block sibling of
+    /// `granted_blitz_self_mana_cost_resolves_to_spell_mana_cost` /
+    /// `granted_spectacle_self_mana_cost_resolves_to_spell_mana_cost` — pins
+    /// that `resolve_self_cost_spell_keyword` also concretizes a GRANTED
+    /// `Keyword::Emerge(EmergeCost { mana_cost: SelfManaCost, .. })`, not just
+    /// keywords whose cost is a bare `ManaCost`. Emerge's cost lives inside a
+    /// struct field (`EmergeCost.mana_cost`), which is exactly why the arm was
+    /// originally missed and fell through the mapper's `other => other.clone()`
+    /// wildcard (issue #5435 follow-up).
+    ///
+    /// This is a full `CastWithKeyword` runtime regression, not just a
+    /// choice-set shape check: it proves the caster (a) cannot emerge for
+    /// free, and (b) actually pays the concretized, sacrifice-reduced mana
+    /// cost end to end (mirrors
+    /// `emerge_only_affordable_after_sacrifice_reduction_casts_and_sacrifices_creature`
+    /// above).
+    #[test]
+    fn granted_emerge_self_mana_cost_resolves_to_spell_mana_cost_and_is_paid() {
+        // Grantor: "creatures you control have emerge. The emerge cost is
+        // equal to its mana cost." — modeled directly as the CastWithKeyword
+        // static the parser emits for such a grant (same shape as the Henzie
+        // Blitz grantor above), carrying `Emerge(EmergeCost::creature(SelfManaCost))`.
+        let mut state = setup_game_at_main_phase();
+        let grantor = create_object(
+            &mut state,
+            CardId(9200),
+            PlayerId(0),
+            "Emerge Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            let def = StaticDefinition::new(StaticMode::CastWithKeyword {
+                keyword: Keyword::Emerge(EmergeCost::creature(ManaCost::SelfManaCost)),
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)));
+            obj.static_definitions = vec![def].into();
+        }
+
+        // Recipient: a {6} creature in hand with NO printed Emerge — the
+        // option must come entirely from the grant.
+        let spell_cost = ManaCost::generic(6);
+        let spell = create_object(
+            &mut state,
+            CardId(9201),
+            PlayerId(0),
+            "Big Vanilla Creature".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = spell_cost.clone();
+            obj.base_mana_cost = spell_cost.clone();
+        }
+        assert!(
+            !state
+                .objects
+                .get(&spell)
+                .unwrap()
+                .keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Emerge(_))),
+            "recipient must have no printed Emerge — the option must come from the grant"
+        );
+
+        // A mana-value-4 creature to sacrifice: CR 702.119a reduces the {6}
+        // emerge cost by 4, to a payable-but-nonzero {2}.
+        let sacrifice =
+            create_sacrifice_creature(&mut state, PlayerId(0), 9202, ManaCost::generic(4));
+
+        // 1) Affordability: with NO mana at all, the caster must NOT be able
+        //    to emerge for free. An unresolved SelfManaCost has mana value 0
+        //    and is not flagged `is_without_paying_mana`, so it silently acts
+        //    as a real {0} alternative cost — this is exactly the issue
+        //    #5435 regression. Even after the best available sacrifice
+        //    reduction ({6} - MV4 = {2}), the cost is still nonzero, so
+        //    zero mana must remain unaffordable. This must be checked BEFORE
+        //    any mana is funded, since `can_cast_object_now` filters candidate
+        //    options by affordability — a starved probe is the only way to
+        //    observe "free" behavior distinctly from "unaffordable" behavior.
+        assert!(
+            !can_cast_object_now(&state, PlayerId(0), spell),
+            "granted Emerge must not be castable for free with zero mana available"
+        );
+
+        // 2) Fund exactly the post-reduction {2}, no more.
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+        assert!(
+            can_cast_object_now(&state, PlayerId(0), spell),
+            "granted Emerge must become affordable once the post-reduction {{2}} is funded"
+        );
+
+        // 3) The offered Emerge option must carry the spell's own concrete
+        //    mana cost (pre-sacrifice-reduction, matching the granted-Blitz/
+        //    granted-Spectacle sibling tests' `mana_cost` shape), not the raw
+        //    SelfManaCost placeholder and not zero.
+        let choices = casting_variant_choice_set(&state, PlayerId(0), spell, None);
+        let emerge_option = choices
+            .options
+            .iter()
+            .find(|o| o.variant == CastingVariant::Emerge)
+            .expect("granted Emerge must surface the Emerge option");
+        assert_eq!(
+            emerge_option.mana_cost, spell_cost,
+            "granted Emerge must carry the concretized cost (the spell's own \
+             mana cost), not the unresolved SelfManaCost placeholder, got {:?}",
+            emerge_option.mana_cost
+        );
+        assert_ne!(
+            emerge_option.mana_cost,
+            ManaCost::zero(),
+            "the concretized Emerge cost must not silently be a free {{0}} cost"
+        );
+
+        let card_id = state.objects[&spell].card_id;
+        let mut events = Vec::new();
+        let wf = handle_cast_spell(&mut state, PlayerId(0), spell, card_id, &mut events)
+            .expect("granted-Emerge-only cast should enter sacrifice payment");
+        match &wf {
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                choices,
+                resume:
+                    CostResume::SpellCost {
+                        source: SpellCostSource::Emerge,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(
+                    choices.contains(&sacrifice),
+                    "granted-Emerge sacrifice prompt must include the controlled creature"
+                );
+            }
+            other => panic!("expected granted-Emerge PayCost(Sacrifice), got {other:?}"),
+        }
+
+        state.waiting_for = wf;
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![sacrifice],
+            },
+        )
+        .expect("sacrificing the creature should complete the granted-Emerge cast");
+
+        assert_eq!(
+            state.objects[&sacrifice].zone,
+            Zone::Graveyard,
+            "the emerge sacrifice must move the creature to the graveyard"
+        );
+        assert_eq!(
+            state.objects[&spell].zone,
+            Zone::Stack,
+            "the granted-Emerge cast spell must be on the stack"
+        );
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            0,
+            "granted Emerge must charge the concretized, reduced {{2}} cost, \
+             consuming exactly the two mana funded above"
+        );
+    }
 }
 
 /// CR 107.4 + CR 202.1 + CR 603.2 + CR 603.4 (issue #4370): Namor the
@@ -45096,6 +45374,7 @@ fn a_free_static_ordered_first_does_not_hide_a_normal_cost_static() {
 /// (`NormalCost` provenance — a normal cast route).
 fn normal_cost_grant(player: PlayerId, cost: ManaCost) -> crate::types::ability::CastingPermission {
     crate::types::ability::CastingPermission::ExileWithAltCost {
+        source_id: None,
         cost,
         cost_provenance: crate::types::ability::ExileGrantCostProvenance::NormalCost,
         cast_transformed: false,
@@ -45419,6 +45698,7 @@ fn a_normal_cost_play_grant_with_companion_lets_disguise_cast_face_down() {
 /// Free-cast grant permission as `cast_from_zone` installs it (Dauthi-class).
 fn free_cast_grant(player: PlayerId) -> crate::types::ability::CastingPermission {
     crate::types::ability::CastingPermission::ExileWithAltCost {
+        source_id: None,
         cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
         cost: ManaCost::zero(),
         cast_transformed: false,
@@ -45439,6 +45719,7 @@ fn play_from_exile_grant(
     companion: bool,
 ) -> crate::types::ability::CastingPermission {
     crate::types::ability::CastingPermission::PlayFromExile {
+        mode: CardPlayMode::Play,
         duration: crate::types::ability::Duration::Permanent,
         granted_to: player,
         frequency: CastFrequency::Unlimited,
@@ -45450,6 +45731,7 @@ fn play_from_exile_grant(
         single_use_group: None,
         single_use: false,
         cast_cost_raise: None,
+        alt_ability_cost: None,
         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         provenance: if companion {
             crate::types::ability::PlayFromExileProvenance::LandLookCompanion
@@ -45706,6 +45988,7 @@ fn resolution_offer_grant(
     source_id: ObjectId,
 ) -> crate::types::ability::CastingPermission {
     crate::types::ability::CastingPermission::ExileWithAltCost {
+        source_id: None,
         cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
         cost: ManaCost::zero(),
         cast_transformed: false,
@@ -46334,6 +46617,7 @@ fn add_impulse_exiled_card(
     obj.casting_permissions
         .push(CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: crate::types::ability::Duration::UntilEndOfNextTurnOf {
                 player: crate::types::ability::PlayerScope::Controller,
             },
@@ -46354,6 +46638,7 @@ fn add_impulse_exiled_card(
             single_use_group: Some(single_use_group),
             single_use: true,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
     exiled
@@ -46622,6 +46907,7 @@ fn grant_object_exile_land_play_permission(
         .casting_permissions
         .push(CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: crate::types::ability::Duration::UntilEndOfNextTurnOf {
                 player: crate::types::ability::PlayerScope::Controller,
             },
@@ -46635,6 +46921,7 @@ fn grant_object_exile_land_play_permission(
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
 }
@@ -46874,6 +47161,7 @@ fn impulse_play_from_exile_land_uses_play_path_not_cast_path() {
         .casting_permissions
         .push(CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: crate::types::ability::Duration::UntilEndOfNextTurnOf {
                 player: crate::types::ability::PlayerScope::Controller,
             },
@@ -46887,6 +47175,7 @@ fn impulse_play_from_exile_land_uses_play_path_not_cast_path() {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
 
@@ -46899,6 +47188,115 @@ fn impulse_play_from_exile_land_uses_play_path_not_cast_path() {
     assert!(
         !spell_objects_available_to_cast(&state, player).contains(&land),
         "impulse-granted lands must not surface on the cast path"
+    );
+}
+
+/// CR 305.1: a cast-only exile grant still surfaces its card for spell casting,
+/// but it cannot authorize the distinct land-play special action.
+#[test]
+fn cast_mode_play_from_exile_does_not_authorize_an_exiled_land() {
+    let mut state = setup_game_at_main_phase();
+    let player = PlayerId(0);
+    let land = add_exiled_land(&mut state, player, "Cast-only Exiled Island");
+    grant_object_exile_land_play_permission(
+        &mut state,
+        land,
+        player,
+        ObjectId(99_004),
+        CastFrequency::Unlimited,
+    );
+    let CastingPermission::PlayFromExile { mode, .. } = state.objects[&land]
+        .casting_permissions
+        .first_mut()
+        .expect("test helper attaches one permission")
+    else {
+        unreachable!("test helper attaches PlayFromExile")
+    };
+    *mode = CardPlayMode::Cast;
+
+    assert!(
+        !exile_lands_playable_by_permission(&state, player)
+            .iter()
+            .any(|(id, _)| *id == land),
+        "a Cast grant must not become land-play authority"
+    );
+    let card_id = state.objects[&land].card_id;
+    let battlefield_before = state.battlefield.len();
+    let land_drops_before = state.lands_played_this_turn;
+    let result = apply_as_current(
+        &mut state,
+        GameAction::PlayLand {
+            object_id: land,
+            card_id,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "the real PlayLand action must reject Cast-only authority"
+    );
+    assert_eq!(state.objects[&land].zone, Zone::Exile);
+    assert_eq!(state.battlefield.len(), battlefield_before);
+    assert_eq!(state.lands_played_this_turn, land_drops_before);
+}
+
+/// CR 614.12: the land-entry rider belongs to the exact authority elected for
+/// the play, rather than any sibling exile permission on the same card.
+#[test]
+fn exiled_land_entry_rider_uses_the_elected_permission_only() {
+    let mut state = setup_game_at_main_phase();
+    let player = PlayerId(0);
+    let land = add_exiled_land(&mut state, player, "Two-authority Exiled Island");
+    grant_object_exile_land_play_permission(
+        &mut state,
+        land,
+        player,
+        ObjectId(99_005),
+        CastFrequency::Unlimited,
+    );
+    grant_object_exile_land_play_permission(
+        &mut state,
+        land,
+        player,
+        ObjectId(99_006),
+        CastFrequency::Unlimited,
+    );
+    let CastingPermission::PlayFromExile {
+        land_enter_tapped, ..
+    } = state.objects[&land].casting_permissions[1]
+    else {
+        unreachable!("test helper attaches PlayFromExile")
+    };
+    assert_eq!(
+        land_enter_tapped,
+        crate::types::zones::EtbTapState::Unspecified
+    );
+    let CastingPermission::PlayFromExile {
+        land_enter_tapped, ..
+    } = state
+        .objects
+        .get_mut(&land)
+        .unwrap()
+        .casting_permissions
+        .get_mut(1)
+        .unwrap()
+    else {
+        unreachable!("test helper attaches PlayFromExile")
+    };
+    *land_enter_tapped = crate::types::zones::EtbTapState::Tapped;
+
+    let card_id = state.objects[&land].card_id;
+    apply_as_current(
+        &mut state,
+        GameAction::PlayLand {
+            object_id: land,
+            card_id,
+        },
+    )
+    .expect("the first object-attached permission authorizes the land");
+
+    assert!(
+        !state.objects[&land].tapped,
+        "the later tapped sibling must not affect the elected first permission"
     );
 }
 
@@ -52756,6 +53154,7 @@ fn graveyard_paid_offer_uses_exact_appended_permission_over_conflicting_sibling(
         .unwrap()
         .casting_permissions
         .push(CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::zero(),
             cast_transformed: false,
@@ -53150,6 +53549,7 @@ fn exact_resolution_offer_does_not_inherit_sibling_cast_transformed() {
         });
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::zero(),
                 cast_transformed: true,
@@ -53212,6 +53612,7 @@ fn exact_resolution_offer_does_not_consume_sibling_once_per_turn_permission() {
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::OncePerTurn,
@@ -53223,6 +53624,7 @@ fn exact_resolution_offer_does_not_consume_sibling_once_per_turn_permission() {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
     }
@@ -53284,6 +53686,7 @@ fn exact_resolution_offer_without_concession_does_not_inherit_later_any_color_si
         ));
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::SelfManaCost,
                 cast_transformed: false,
@@ -53304,6 +53707,7 @@ fn exact_resolution_offer_without_concession_does_not_inherit_later_any_color_si
             });
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
+                source_id: None,
                 cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                 cost: ManaCost::SelfManaCost,
                 cast_transformed: false,

@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engine::ai_support::{candidate_actions, legal_actions_for_viewer, AiDecisionContract};
+use engine::ai_support::{
+    candidate_actions, legal_actions_for_viewer, stuck_decision_diagnostic, AiDecisionContract,
+};
 use engine::game::elimination::eliminate_player;
 use engine::game::engine::{
     apply, apply_verified_ai_priority_pass, classify_restored_stack_automation,
@@ -20,12 +22,12 @@ use engine::types::ability::{
     ChoiceType, ControllerRef, CopyRetargetPermission, Effect, ResolvedAbility, TargetFilter,
     TargetRef, TargetSelectionMode, TypedFilter,
 };
-use engine::types::actions::{GameAction, ResolveAllConsentDecision};
+use engine::types::actions::{GameAction, ResolveAllConsentDecision, ResolveAllScope};
 use engine::types::card_type::CoreType;
 use engine::types::events::GameEvent;
 use engine::types::format::FormatConfig;
 use engine::types::game_state::{
-    AutoPassMode, GameState, PersistedGameState, StackEntry, StackEntryKind,
+    AutoPassMode, GameState, PersistedGameState, PriorityPassingMode, StackEntry, StackEntryKind,
     StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
     StackResolutionPolicy, StackResolutionSession, TurnBoundary, WaitingFor,
 };
@@ -50,7 +52,10 @@ fn begin(state: &mut GameState) -> u64 {
     apply(
         state,
         P0,
-        GameAction::BeginResolveAll { max_resolutions: 7 },
+        GameAction::BeginResolveAll {
+            max_resolutions: 7,
+            scope: ResolveAllScope::Shared,
+        },
     )
     .expect("priority holder may begin Resolve All consent");
     match &state.waiting_for {
@@ -169,6 +174,7 @@ fn browser_partial_priority_equip_grants_then_resolves_at_the_public_batch_seam(
         P0,
         GameAction::BeginResolveAll {
             max_resolutions: 100,
+            scope: ResolveAllScope::Shared,
         },
     )
     .expect("the human priority holder starts the browser Resolve All flow");
@@ -242,6 +248,7 @@ fn browser_partial_priority_equip_uses_the_shared_session_instead_of_a_prefix_pr
         P0,
         GameAction::BeginResolveAll {
             max_resolutions: 100,
+            scope: ResolveAllScope::Shared,
         },
     )
     .expect("the human priority holder starts Resolve All");
@@ -294,13 +301,109 @@ fn restored_mid_stack_priority_discards_an_orphaned_trigger_event_carrier() {
     let encoded = serde_json::to_string(&persisted).expect("mid-stack state serializes");
     let persisted: PersistedGameState =
         serde_json::from_str(&encoded).expect("mid-stack state deserializes");
-    let restored = persisted.into_game_state();
+    let restored = persisted
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
 
     assert!(
         restored.pending_trigger_event_batch.is_empty(),
         "a saved orphan carrier is not active stack work and must not poison Resolve All after reload"
     );
     assert!(restored.pending_trigger.is_none());
+}
+
+/// CR 117.3d: `ResolveAllScope::Own` binds the requester alone, so a table with
+/// AI seats can never park the requester on a consent prompt nobody answers.
+#[test]
+fn own_scope_resolves_without_asking_anyone() {
+    let mut state = GameState::new(FormatConfig::free_for_all(), 3, 0x5E55_1017);
+    state.active_player = P2;
+    state.priority_player = P0;
+    state.waiting_for = WaitingFor::Priority { player: P0 };
+    state.stack.push_back(no_op_entry(1, P2));
+    state.stack.push_back(no_op_entry(2, P2));
+
+    let result = apply(
+        &mut state,
+        P0,
+        GameAction::BeginResolveAll {
+            max_resolutions: 1,
+            scope: ResolveAllScope::Own,
+        },
+    )
+    .expect("the priority holder begins Resolve All without anyone else's consent");
+
+    assert!(
+        !matches!(
+            state.waiting_for,
+            WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. }
+        ),
+        "Own scope raises no consent prompt, got {:?}",
+        state.waiting_for
+    );
+    assert!(state.resolve_all_consent_run.is_none());
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::EffectResolved { .. }))
+            .count(),
+        1,
+        "the requester's own session resolves under its cap with no second party"
+    );
+    assert_eq!(state.stack.len(), 1);
+    for viewer in [P0, P1, P2] {
+        assert!(
+            !legal_actions_for_viewer(&state, viewer)
+                .0
+                .iter()
+                .any(|action| matches!(
+                    action,
+                    GameAction::RespondResolveAllConsent { .. }
+                        | GameAction::RevokeResolveAllConsent { .. }
+                )),
+            "{viewer:?} must not be offered a consent response"
+        );
+    }
+}
+
+/// CR 117.1: Full Control is a standing refusal to give up any window, and it
+/// must survive a session ANOTHER player installed — those passes are taken
+/// inside `run_auto_pass_loop` and never reach a frontend, so a client-only
+/// toggle could not have stopped them.
+#[test]
+fn full_control_holds_a_window_against_another_players_resolve_all() {
+    let mut state = GameState::new(FormatConfig::free_for_all(), 3, 0xFC0_0DED);
+    state.active_player = P2;
+    state.priority_player = P0;
+    state.waiting_for = WaitingFor::Priority { player: P0 };
+    state.stack.push_back(no_op_entry(1, P2));
+    state.stack.push_back(no_op_entry(2, P2));
+    // P1 has nothing meaningful to do, so ONLY Full Control can hold their
+    // window — the meaningful-action gate would let the session pass them.
+    state
+        .priority_passing_modes
+        .insert(P1, PriorityPassingMode::FullControl);
+
+    apply(
+        &mut state,
+        P0,
+        GameAction::BeginResolveAll {
+            max_resolutions: 0,
+            scope: ResolveAllScope::Own,
+        },
+    )
+    .expect("P0 begins their own Resolve All");
+
+    assert!(
+        !state.stack.is_empty(),
+        "P1's Full Control must stop the session before it drains the stack"
+    );
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { player } if player == P1),
+        "the window belongs to the Full Control player, got {:?}",
+        state.waiting_for
+    );
 }
 
 #[test]
@@ -339,7 +442,10 @@ fn final_grant_transfers_the_requested_cap_zero_as_unlimited() {
         let epoch = apply(
             &mut state,
             P0,
-            GameAction::BeginResolveAll { max_resolutions },
+            GameAction::BeginResolveAll {
+                max_resolutions,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("priority holder begins")
         .waiting_for;
@@ -652,7 +758,10 @@ fn begin_resolve_all_refuses_to_replace_an_existing_resolution_session() {
     assert!(apply(
         &mut state,
         P0,
-        GameAction::BeginResolveAll { max_resolutions: 1 },
+        GameAction::BeginResolveAll {
+            max_resolutions: 1,
+            scope: ResolveAllScope::Shared
+        },
     )
     .is_err());
     assert_eq!(
@@ -762,7 +871,9 @@ fn persisted_pending_consent_decline_restores_the_captured_baseline() {
     let encoded = serde_json::to_string(&persisted).expect("pending consent serializes");
     let persisted: PersistedGameState =
         serde_json::from_str(&encoded).expect("pending consent deserializes");
-    let mut restored = persisted.into_game_state();
+    let mut restored = persisted
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
     assert!(matches!(
         restored.waiting_for,
         WaitingFor::ResolveAllConsent { epoch: restored_epoch, representative } if restored_epoch == epoch && representative == P1
@@ -779,6 +890,60 @@ fn persisted_pending_consent_decline_restores_the_captured_baseline() {
     .expect("restored responder may decline");
     assert_eq!(restored.stack.len(), 1);
     assert!(restored.auto_pass.is_empty());
+}
+
+/// CR 117.4: a save written before `ResolveAllScope` existed carries no `scope`
+/// key at all, and `#[serde(default)]` must resolve that to `Own` -- the scope
+/// that binds only the requester. Defaulting a legacy run to `Shared` would
+/// silently hand it table-wide authority over seats that never consented, which
+/// is precisely what the field's default exists to prevent.
+///
+/// `begin` opens a SHARED run, so the captured payload really does carry a
+/// `scope`. That matters twice over: removing the key is what reconstructs a
+/// genuine pre-migration payload, and starting from `Shared` is what makes the
+/// assertion discriminating -- the default has to FLIP the value, not merely
+/// reproduce it. The `remove` is asserted because a fixture that never carried
+/// a `scope` would otherwise pass this test while proving nothing.
+#[test]
+fn a_pre_scope_save_restores_as_an_own_run() {
+    let mut state = GameState::new_two_player(431);
+    state.stack.push_back(no_op_entry(1, P0));
+    begin(&mut state);
+
+    let encoded = serde_json::to_string(&PersistedGameState::capture(state))
+        .expect("pending consent serializes");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&encoded).expect("the captured payload is valid JSON");
+    // A persisted payload is either a trusted envelope wrapping `state` or a
+    // bare raw state. `reject_legacy_raw_prompt_authority` reads it the same way.
+    let root = if doc.get("state").is_some() {
+        doc.get_mut("state").expect("just observed")
+    } else {
+        &mut doc
+    };
+    let run = root
+        .get_mut("resolve_all_consent_run")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the captured payload carries the consent run");
+    assert!(
+        run.remove("scope").is_some(),
+        "the fixture must carry a scope for its removal to reconstruct a legacy save"
+    );
+
+    let persisted: PersistedGameState =
+        serde_json::from_str(&doc.to_string()).expect("a pre-scope save still deserializes");
+    let restored = persisted
+        .into_game_state()
+        .expect("a pre-scope save satisfies the checked restore contract");
+    assert_eq!(
+        restored
+            .resolve_all_consent_run
+            .as_ref()
+            .expect("the restored snapshot keeps its consent run")
+            .scope,
+        ResolveAllScope::Own,
+        "a legacy run must not acquire table-wide authority"
+    );
 }
 
 #[test]
@@ -802,7 +967,8 @@ fn serialized_legacy_pending_grant_removes_its_mode_before_entering_ready() {
         .expect("legacy pending run serializes without a baseline");
     let mut restored = serde_json::from_str::<PersistedGameState>(&encoded)
         .expect("legacy pending run deserializes")
-        .into_game_state();
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
     assert!(restored
         .resolve_all_consent_run
         .as_ref()
@@ -839,7 +1005,9 @@ fn restored_mid_stack_priority_can_start_a_new_resolve_all_consent_run() {
     let encoded = serde_json::to_string(&persisted).expect("mid-stack priority serializes");
     let persisted: PersistedGameState =
         serde_json::from_str(&encoded).expect("mid-stack priority deserializes");
-    let mut restored = persisted.into_game_state();
+    let mut restored = persisted
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
 
     let epoch = begin(&mut restored);
     assert!(matches!(
@@ -860,7 +1028,10 @@ fn decline_under_turn_control_restores_the_semantic_priority_snapshot() {
     apply(
         &mut state,
         P1,
-        GameAction::BeginResolveAll { max_resolutions: 7 },
+        GameAction::BeginResolveAll {
+            max_resolutions: 7,
+            scope: ResolveAllScope::Shared,
+        },
     )
     .expect("the controller may begin Resolve All for the controlled priority seat");
     let epoch = match state.waiting_for {
@@ -916,7 +1087,10 @@ fn eliminating_a_consent_representative_drops_the_run_and_restores_living_priori
     apply(
         &mut state,
         P0,
-        GameAction::BeginResolveAll { max_resolutions: 7 },
+        GameAction::BeginResolveAll {
+            max_resolutions: 7,
+            scope: ResolveAllScope::Shared,
+        },
     )
     .expect("priority holder may begin Resolve All consent");
     assert!(matches!(
@@ -1273,7 +1447,10 @@ fn ready_two_seat_state() -> GameState {
     apply(
         &mut state,
         P0,
-        GameAction::BeginResolveAll { max_resolutions: 1 },
+        GameAction::BeginResolveAll {
+            max_resolutions: 1,
+            scope: ResolveAllScope::Shared,
+        },
     )
     .expect("priority holder may begin Resolve All consent");
     let WaitingFor::ResolveAllConsent { epoch, .. } = state.waiting_for else {
@@ -1355,7 +1532,8 @@ fn persisted_restore_classifies_without_advancing_stack_automation() {
     let encoded = serde_json::to_string(&persisted).expect("Ready state serializes");
     let restored = serde_json::from_str::<PersistedGameState>(&encoded)
         .expect("Ready state deserializes")
-        .into_game_state();
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
 
     assert_eq!(
         classify_restored_stack_automation(&restored),
@@ -1439,7 +1617,8 @@ fn restored_rechecking_session_waits_for_a_fresh_ai_contract() {
         .expect("the active rechecking session serializes");
     let mut state = serde_json::from_str::<PersistedGameState>(&encoded)
         .expect("the active rechecking session deserializes")
-        .into_game_state();
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
     assert_eq!(
         classify_restored_stack_automation(&state),
         RestoredStackAutomation::ActiveSession
@@ -1735,6 +1914,117 @@ fn a_ready_latch_with_no_run_repairs_to_priority_without_resolving() {
     );
     assert!(state.auto_pass.is_empty());
 }
+
+/// The row-8 negative sibling for `viewer_projection_ingest_gate`: the same
+/// prompt as [`pending_consent_without_its_run`], but with its run still LIVE
+/// and built by the real reducer. An authoritative state in this shape must
+/// keep decoding — it is what proves the projection gate keys on the marker
+/// rather than on the prompt.
+pub(crate) fn pending_consent_with_live_run() -> GameState {
+    let mut state = GameState::new(FormatConfig::free_for_all(), 2, 0x0C0F_FEE2);
+    state.stack.push_back(no_op_entry(1, P0));
+    begin(&mut state);
+    state
+}
+
+/// The reporter's shape: P0 proposes Resolve All, P1's consent is queued, and
+/// the private run is gone while the public prompt still stands.
+pub(crate) fn pending_consent_without_its_run() -> GameState {
+    let mut state = GameState::new(FormatConfig::free_for_all(), 2, 0x0C0F_FEE2);
+    state.stack.push_back(no_op_entry(1, P0));
+    let epoch = begin(&mut state);
+    // Not an arbitrary mutation: this is exactly what a viewer projection of a
+    // pending consent carries, so any state reconstructed from one has it.
+    let projected = filter_state_for_viewer(&state, P0);
+    assert_eq!(projected.waiting_for, state.waiting_for);
+    assert!(projected.resolve_all_consent_run.is_none());
+    state.resolve_all_consent_run = None;
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::ResolveAllConsent { epoch: e, representative: P1 } if e == epoch
+    ));
+    state
+}
+
+#[test]
+fn a_consent_prompt_with_no_run_issues_no_response_and_reports_a_wedge() {
+    let mut state = pending_consent_without_its_run();
+    let WaitingFor::ResolveAllConsent { epoch, .. } = state.waiting_for else {
+        unreachable!("the fixture asserts its own prompt")
+    };
+
+    assert!(
+        !candidate_actions(&state).iter().any(|candidate| matches!(
+            candidate.action,
+            GameAction::RespondResolveAllConsent { .. }
+        )),
+        "a response the reducer can only reject must never enter the issued domain"
+    );
+    assert!(
+        AiDecisionContract::issue(&state, P1).candidates.is_empty(),
+        "this prompt's contract is issued without reducer simulation, so an \
+         unanswerable candidate would reach an AI submission unchecked"
+    );
+    for decision in [
+        ResolveAllConsentDecision::Grant,
+        ResolveAllConsentDecision::Decline,
+    ] {
+        assert!(
+            apply(
+                &mut state,
+                P1,
+                GameAction::RespondResolveAllConsent { epoch, decision },
+            )
+            .is_err(),
+            "the empty domain is correct rather than over-strict: {decision:?} is refused"
+        );
+    }
+
+    let diagnostic = stuck_decision_diagnostic(&state)
+        .expect("a decision nobody can answer must surface as a wedge");
+    assert_eq!(diagnostic.waiting_for_kind, "ResolveAllConsent");
+    assert_eq!(diagnostic.stuck_players, vec![P1]);
+    assert!(
+        legal_actions_for_viewer(&state, P1).0.is_empty(),
+        "the representative's own viewer set was already empty; the issued \
+         domain is what disagreed with it"
+    );
+}
+
+#[test]
+fn a_consent_prompt_with_no_run_repairs_to_priority_without_resolving() {
+    let mut coherent = GameState::new(FormatConfig::free_for_all(), 2, 0x0C0F_FEE3);
+    coherent.stack.push_back(no_op_entry(1, P0));
+    begin(&mut coherent);
+    assert_eq!(
+        classify_restored_stack_automation(&coherent),
+        RestoredStackAutomation::None,
+        "a live consent prompt is a decision to answer, not automation to resume"
+    );
+
+    let mut state = pending_consent_without_its_run();
+    assert_eq!(
+        classify_restored_stack_automation(&state),
+        RestoredStackAutomation::Repair,
+        "an unanswerable saved authorization is a repair, like a run-less Ready latch"
+    );
+
+    let resumed = resume_restored_stack_automation(&mut state);
+
+    assert_eq!(
+        resumed.presentation.outcome,
+        RestoredStackAutomationOutcome::ZeroResolutionRepair
+    );
+    assert_eq!(resumed.presentation.automated_resolution_count, 0);
+    assert_eq!(state.stack.len(), 1, "the stack entry survives the repair");
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        "the repair must restore ordinary priority, got {:?}",
+        state.waiting_for
+    );
+    assert!(state.resolve_all_consent_run.is_none());
+}
+
 /// Generic restore classification is inert on the overwhelming majority of
 /// states, which carry no stack automation at all.
 #[test]

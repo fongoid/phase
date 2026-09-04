@@ -8,17 +8,17 @@ use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::action_rejection::{ActionRejection, ActionRejectionCode};
 use crate::types::actions::{
     DebugAction, GameAction, MayTriggerAutoChoiceOp, PriorityYieldOp, ResolveAllConsentDecision,
-    TriggerOrderTemplateOp,
+    ResolveAllScope, TriggerOrderTemplateOp,
 };
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActionResult, AssistState, AutoMayChoice, AutoPassMode, AutoPassRequest, CastOfferKind,
     CastingVariant, ConvokeMode, CostResume, GameState, LandPlayRecord, LoopDetectionMode,
     ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind, PendingCostMoveResume,
-    PendingCounterPostAction, PendingEffectResolved, ResolveAllConsentParticipant,
-    ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope, StackEntry, StackEntryKind,
-    StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
-    StackResolutionPolicy, StackResolutionSession, WaitingFor,
+    PendingCounterPostAction, PendingEffectResolved, PersistedRestoreError, PriorityPassingMode,
+    ResolveAllConsentParticipant, ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope,
+    StackEntry, StackEntryKind, StackResolutionAutoPassOverlay, StackResolutionBudget,
+    StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, WaitingFor,
 };
 use crate::types::identifiers::{CardId, DelayedTriggerOrigin, ObjectId, ObjectIncarnationRef};
 use crate::types::match_config::MatchType;
@@ -1056,6 +1056,33 @@ pub fn apply_interaction_with_rejection(
 /// it exists now and may reuse only the verified representative's own pass at
 /// later priority windows. It never infers a pass for an unverified
 /// representative and never authorizes a new stack entry.
+/// The priority player for whom `action` is a verified AI stack-continuation
+/// pass, or `None` when it is not one.
+///
+/// **Single authority for that classification.** Both AI dispatch routers
+/// (`phase_ai::auto_play::run_ai_actions_with_limit` and engine-wasm's
+/// `submit_ai_action_proposal`) pick their reducer boundary with this function,
+/// and [`apply_verified_ai_priority_pass`] gates on the very same call — so the
+/// routers and the callee cannot disagree about what this boundary accepts.
+/// Returning the window's `PlayerId` rather than a bool is what lets the callee
+/// consume the classification it is gated by instead of re-deriving it.
+///
+/// CR 601.2a + CR 601.2h: `GameAction::PassPriority` is overloaded by prompt. At
+/// `WaitingFor::Priority` it passes priority; at `WaitingFor::ManaPayment` the
+/// reducer routes the SAME variant to `casting_costs::finalize_mana_payment` —
+/// there it means "pay the total cost" (CR 601.2h). Announcing a spell puts it
+/// on the stack (CR 601.2a), so a nonempty stack is true throughout every cast
+/// and cannot separate the two meanings on its own; the prompt is what does.
+pub fn verified_ai_stack_pass_player(state: &GameState, action: &GameAction) -> Option<PlayerId> {
+    if !matches!(action, GameAction::PassPriority) || state.stack.is_empty() {
+        return None;
+    }
+    match state.waiting_for {
+        WaitingFor::Priority { player } => Some(player),
+        _ => None,
+    }
+}
+
 pub fn apply_verified_ai_priority_pass(
     state: &mut GameState,
     authenticated_actor: PlayerId,
@@ -1070,18 +1097,21 @@ pub fn apply_verified_ai_priority_pass(
             "AI priority pass no longer matches its issued decision contract".to_string(),
         ));
     }
-    let WaitingFor::Priority { player } = &state.waiting_for else {
+    // The routers select this boundary with the same call, so a mismatch here
+    // is impossible by construction rather than by convention.
+    let Some(player) = verified_ai_stack_pass_player(state, &action) else {
         return Err(EngineError::ActionNotAllowed(
-            "AI stack continuation requires a live priority window".to_string(),
+            "AI stack continuation requires a live priority window over a nonempty stack"
+                .to_string(),
         ));
     };
-    if *player != contract.semantic_owner || state.stack.is_empty() {
+    if player != contract.semantic_owner {
         return Err(EngineError::ActionNotAllowed(
             "AI stack continuation requires the issued nonempty priority window".to_string(),
         ));
     }
 
-    let representative = super::topology::priority_pass_representative(state, *player);
+    let representative = super::topology::priority_pass_representative(state, player);
     let inserted_verified_representative = if let Some(session) =
         state.stack_resolution_session.as_ref()
     {
@@ -1413,13 +1443,9 @@ fn apply_action_boundary_core(
     // while the real state is repaired.
     let pre_recovery_pass_was_authorized = matches!(&action, GameAction::PassPriority)
         && check_actor_authorization(state, authenticated_actor, &action).is_ok();
-    effects::sweep_ownerless_post_replacement_strand(state);
-    let recovered_devour_rest_boundary =
-        recover_orphaned_devour_completion_at_priority_boundary(state)
-            || recover_orphaned_spell_resolution_at_priority_boundary(state);
-    state.remove_empty_active_post_replacement_frame();
+    let recovered_terminal_rest_boundary = sweep_and_recover_priority_boundary_rest(state);
     let recovered_stale_priority_pass =
-        recovered_devour_rest_boundary && matches!(&action, GameAction::PassPriority);
+        recovered_terminal_rest_boundary && matches!(&action, GameAction::PassPriority);
     let boundary_snapshot = state.clone();
     let journal_start = state.resolved_rules_journal.entries().len();
     let is_actor_scoped_preference = action.is_actor_scoped_preference();
@@ -1552,16 +1578,7 @@ fn apply_action_boundary_core(
 /// live priority window. A prompt-bearing Devour entry or a pending multi-entry
 /// ChangeZone iteration therefore remains untouched.
 fn recover_orphaned_devour_completion_at_priority_boundary(state: &mut GameState) -> bool {
-    let is_orphaned_devour_completion = matches!(state.waiting_for, WaitingFor::Priority { .. })
-        && state.resolving_stack_entry.is_some()
-        && state.resolution_stack.len() == 2
-        && state.active_change_zone_frame().is_some_and(|frame| {
-            frame.pending.is_none() && frame.devour_eligible_snapshot.is_some()
-        })
-        && state
-            .active_post_replacement_drains()
-            .is_some_and(crate::types::game_state::PostReplacementDrainStack::is_empty);
-    if !is_orphaned_devour_completion {
+    if !is_orphaned_devour_completion_at_priority_boundary(state) {
         return false;
     }
 
@@ -1587,24 +1604,7 @@ fn recover_orphaned_devour_completion_at_priority_boundary(state: &mut GameState
 /// Consume only that exact bare carrier rest, then route settlement through the
 /// ordinary completed-carrier authority.
 fn recover_orphaned_spell_resolution_at_priority_boundary(state: &mut GameState) -> bool {
-    let Some(pending) = state.active_spell_resolution() else {
-        return false;
-    };
-    let exact_bare_spell_resolution_rest = matches!(state.waiting_for, WaitingFor::Priority { .. })
-        && state.stack.is_empty()
-        && state.resolution_stack.len() == 1
-        && state.active_ability_continuation().is_none()
-        && state.pending_cast.is_none()
-        && state.pending_resolution_completion.is_none()
-        && matches!(
-            state.resolving_stack_entry.as_ref(),
-            Some(crate::types::game_state::StackEntry {
-                id,
-                kind: StackEntryKind::Spell { .. },
-                ..
-            }) if *id == pending.object_id
-        );
-    if !exact_bare_spell_resolution_rest {
+    if !is_orphaned_spell_resolution_at_priority_boundary(state) {
         return false;
     }
 
@@ -1627,6 +1627,255 @@ fn recover_orphaned_spell_resolution_at_priority_boundary(state: &mut GameState)
     };
     *state = recovered;
     true
+}
+
+/// Prepare a decoded persisted state before runtime-only card data is restored.
+///
+/// This is deliberately a bounded, monotonic repair loop rather than a call to
+/// the ordinary action reducer: decoding must not invent a player action or a
+/// Resolve All continuation. Each iteration first retires ownerless
+/// post-replacement dispatches, then consumes one exact terminal carrier, then
+/// removes the newly exposed empty frame. If that sequence cannot strictly
+/// lower the terminal-rest measure, the caller receives a fail-closed restore
+/// error instead of publishing a priority state that `start_next_turn` will
+/// later reject.
+pub(crate) fn recover_terminal_resolution_rest_on_restore(
+    state: &mut GameState,
+) -> Result<bool, PersistedRestoreError> {
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        return Ok(false);
+    }
+
+    // A construction recipient may be serialized after the direct
+    // triggered-mana root has completed. At Priority, that recipient alone is
+    // not proof of the exceptional settled-priority path, so it cannot survive
+    // the persistence boundary as scheduling authority.
+    if state.pending_triggered_mana_resume.is_none() {
+        state.pending_trigger_construction_priority_recipient = None;
+    }
+
+    let mut remaining_steps = terminal_rest_measure(state).saturating_add(1);
+    let mut recovered_terminal_rest = false;
+    loop {
+        let before = terminal_rest_measure(state);
+        recovered_terminal_rest |= sweep_and_recover_priority_boundary_rest(state);
+        let after = terminal_rest_measure(state);
+
+        if after == 0 {
+            break;
+        }
+        if after >= before {
+            return Err(PersistedRestoreError::TerminalRestRecoveryExhausted);
+        }
+        remaining_steps = remaining_steps
+            .checked_sub(1)
+            .ok_or(PersistedRestoreError::TerminalRestRecoveryExhausted)?;
+        if remaining_steps == 0 {
+            return Err(PersistedRestoreError::TerminalRestRecoveryExhausted);
+        }
+    }
+
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.stack_resolution_session.is_none()
+        && (state.resolving_stack_entry.is_some() || state.pending_resolution_completion.is_some())
+    {
+        return Err(PersistedRestoreError::UnsettledPriorityResolution);
+    }
+    Ok(recovered_terminal_rest)
+}
+
+fn terminal_rest_measure(state: &GameState) -> usize {
+    // Removing an outer ownerless/empty post-replacement frame can expose the
+    // terminal carrier below it. Weight the outer obstruction above that
+    // carrier so every permitted exposure is still strictly decreasing.
+    let (ownerless, empty_post_replacement) =
+        state
+            .active_post_replacement_drains()
+            .map_or((0, 0), |drains| {
+                (
+                    usize::from(drains.resident().is_some_and(|drain| {
+                        matches!(
+                            drain.status,
+                            crate::types::game_state::DrainStatus::Dispatching
+                        )
+                    })),
+                    usize::from(
+                        crate::types::game_state::PostReplacementDrainStack::is_empty(drains),
+                    ),
+                )
+            });
+    ownerless * 4
+        + empty_post_replacement * 2
+        + usize::from(is_orphaned_devour_completion_at_priority_boundary(state))
+        + usize::from(is_orphaned_spell_resolution_at_priority_boundary(state))
+}
+
+fn has_ownerless_post_replacement_dispatch_at_priority_boundary(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && !crate::game::engine_replacement::post_replacement_dispatch_is_live()
+        && state
+            .active_post_replacement_drains()
+            .and_then(crate::types::game_state::PostReplacementDrainStack::resident)
+            .is_some_and(|drain| {
+                matches!(
+                    drain.status,
+                    crate::types::game_state::DrainStatus::Dispatching
+                )
+            })
+}
+
+/// Retires the exact, engine-owned terminal rest that can remain visible at a
+/// priority boundary after a post-replacement dispatch has completed.
+///
+/// The live action boundary and persisted restore must preserve this ordering:
+/// sweep the ownerless dispatch, consume an exact terminal carrier, then remove
+/// the exposed empty frame before considering the post-replacement completion.
+fn sweep_and_recover_priority_boundary_rest(state: &mut GameState) -> bool {
+    let swept_ownerless_post_replacement_dispatch =
+        has_ownerless_post_replacement_dispatch_at_priority_boundary(state);
+    effects::sweep_ownerless_post_replacement_strand(state);
+    let recovered_terminal_rest = recover_orphaned_devour_completion_at_priority_boundary(state)
+        || recover_orphaned_spell_resolution_at_priority_boundary(state);
+    state.remove_empty_active_post_replacement_frame();
+    recovered_terminal_rest
+        || recover_ownerless_post_replacement_completion_at_priority_boundary(
+            state,
+            swept_ownerless_post_replacement_dispatch,
+        )
+}
+
+/// An ownerless post-replacement dispatch proves that its continuation already
+/// returned, but pre-v0.65 persistence could retain the resolving carrier after
+/// the now-empty drain frame is removed. Settle only that carrier completion; a
+/// Ready or Paused drain, any remaining frame, or a pending completion is live
+/// work and remains untouched.
+fn recover_ownerless_post_replacement_completion_at_priority_boundary(
+    state: &mut GameState,
+    swept_ownerless_post_replacement_dispatch: bool,
+) -> bool {
+    if !swept_ownerless_post_replacement_dispatch
+        || !matches!(state.waiting_for, WaitingFor::Priority { .. })
+        || !state.resolution_stack.is_empty()
+        || state.pending_cast.is_some()
+        || state.pending_resolution_completion.is_some()
+        || state.resolving_stack_entry.is_none()
+    {
+        return false;
+    }
+
+    let mut recovered = state.clone();
+    settle_resolving_stack_entry_after_continuation_resume(&mut recovered);
+    if recovered.resolving_stack_entry.is_some() {
+        return false;
+    }
+
+    priority::reset_priority(&mut recovered);
+    recovered.waiting_for = WaitingFor::Priority {
+        player: recovered.active_player,
+    };
+    *state = recovered;
+    true
+}
+
+fn is_orphaned_devour_completion_at_priority_boundary(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.resolving_stack_entry.is_some()
+        && state.resolution_stack.len() == 2
+        && state.active_change_zone_frame().is_some_and(|frame| {
+            frame.pending.is_none() && frame.devour_eligible_snapshot.is_some()
+        })
+        && state
+            .active_post_replacement_drains()
+            .is_some_and(crate::types::game_state::PostReplacementDrainStack::is_empty)
+}
+
+fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool {
+    let Some(pending) = state.active_spell_resolution() else {
+        return false;
+    };
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.stack.is_empty()
+        && state.resolution_stack.len() == 1
+        && state.active_ability_continuation().is_none()
+        && state.pending_cast.is_none()
+        && state.pending_resolution_completion.is_none()
+        && matches!(
+            state.resolving_stack_entry.as_ref(),
+            Some(crate::types::game_state::StackEntry {
+                id,
+                kind: StackEntryKind::Spell { .. },
+                ..
+            }) if *id == pending.object_id
+        )
+}
+
+/// Finalize a checked persisted restore after its runtime-only data is present.
+///
+/// `finalize_rules_state` remains interior to this boundary so no partially
+/// rehydrated state escapes. The terminal-rest preparation has already either
+/// settled exact engine-owned residue or failed closed, so this makes no pass,
+/// stack-resolution, or Resolve All decision on the caller's behalf.
+pub(crate) fn finalize_persisted_restore(
+    state: &mut GameState,
+    recovered_terminal_rest: bool,
+) -> Result<(), PersistedRestoreError> {
+    finalize_rules_state(state);
+    let recovered_terminal_rest =
+        recovered_terminal_rest || recover_terminal_resolution_rest_on_restore(state)?;
+    if recovered_terminal_rest {
+        settle_deferred_triggers_after_persisted_restore(state)?;
+    }
+    // The settlement pipeline returns its authoritative wait rather than
+    // publishing it itself. Synchronize that wait before the one display
+    // finalization below.
+    finalize_rules_state(state);
+    finalize_display_state(state);
+    Ok(())
+}
+
+/// Settle a deferred trigger batch that survived a persisted terminal-rest
+/// repair before publishing a priority window.
+///
+/// Restore never treats a serialized construction recipient as proof that the
+/// settled-priority pipeline is safe. That recipient is scheduling state, not
+/// a live typed root: a raw snapshot can forge it without the completed
+/// triggered-mana root that validated the exceptional drain policy. Drop it
+/// and use the ordinary resolution-safe pipeline instead. A batch that remains
+/// queued after that policy is not publishable.
+fn settle_deferred_triggers_after_persisted_restore(
+    state: &mut GameState,
+) -> Result<(), PersistedRestoreError> {
+    let WaitingFor::Priority { player } = &state.waiting_for else {
+        return Ok(());
+    };
+    let player = *player;
+    // `pending_triggered_mana_resume` is absent once the direct root has
+    // completed, so the saved recipient alone cannot establish the live root
+    // provenance required by `SettledPriority`. Do not manufacture that
+    // provenance from serialized scheduling data.
+    state.pending_trigger_construction_priority_recipient = None;
+    if state.deferred_triggers.is_empty() {
+        return Ok(());
+    }
+
+    let mut events = Vec::new();
+    let waiting_for = engine_priority::run_post_action_pipeline_from(
+        state,
+        &mut events,
+        0,
+        &WaitingFor::Priority { player },
+        false,
+        false,
+    )
+    .map_err(|error| PersistedRestoreError::PrioritySettlementFailed(error.to_string()))?;
+    state.waiting_for = waiting_for;
+
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && !state.deferred_triggers.is_empty()
+    {
+        return Err(PersistedRestoreError::DeferredTriggerSettlement);
+    }
+    Ok(())
 }
 
 fn finish_action_boundary(
@@ -7724,6 +7973,24 @@ enum AutoPassDecision {
 /// interrupt logic is boundary-agnostic — both `EndOfCurrentTurn` and
 /// `MyNextTurnStart` behave identically within a priority window.
 fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassDecision {
+    // CR 117.1 + CR 723.5: Full Control is the player's standing refusal to have
+    // any window taken from them, and it outranks every auto-pass session —
+    // including one another player installed, which is what reaches this loop
+    // without ever consulting the frontend. Checked BEFORE the no-session `Exit`
+    // arm because `Exit` itself falls through to a pass when someone else holds
+    // a live `UntilStackEmpty` session. Preference ownership follows the
+    // authorized submitter, as it does in `auto_pass_recommended`.
+    if state.priority_passing_mode(turn_control::authorized_submitter_for_player(state, player))
+        == PriorityPassingMode::FullControl
+    {
+        // `Finish` also drops a stale session this player owns; both variants
+        // break the loop, so either way the window is theirs.
+        return if state.auto_pass.contains_key(&player) {
+            AutoPassDecision::Finish
+        } else {
+            AutoPassDecision::Break
+        };
+    }
     let Some(mode) = state.auto_pass.get(&player) else {
         return AutoPassDecision::Exit;
     };
@@ -7758,8 +8025,8 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
 
 /// True when `player` has an active turn-boundary auto-pass session (either
 /// boundary). Both `EndOfCurrentTurn` and `MyNextTurnStart` drive the
-/// DeclareAttackers/DeclareBlockers empty auto-submit arms, since both
-/// auto-submit empty attackers within the current turn.
+/// DeclareAttackers empty auto-submit arm, since both pre-commit that player
+/// to declaring no attackers within the current turn.
 fn end_of_turn_active(state: &GameState, player: PlayerId) -> bool {
     matches!(
         state.auto_pass.get(&player),
@@ -8066,6 +8333,20 @@ fn stack_resolution_session_priority_decision(
         let Some(session) = state.stack_resolution_session.as_ref() else {
             return StackResolutionSessionPriorityDecision::NotActive;
         };
+        // CR 117.1: a Full Control holder is never auto-passed by a session —
+        // theirs or anyone else's. Scoped to `Automatic`: an EXPLICIT
+        // PassPriority is that player's own deliberate decision and still drives
+        // the session. This is the only gate covering a session REPRESENTATIVE,
+        // whose windows are otherwise passed without even the meaningful-action
+        // check below. (The no-session case is handled one layer out, by
+        // `priority_auto_pass_decision`.)
+        if matches!(pass_kind, StackResolutionSessionPassKind::Automatic)
+            && state
+                .priority_passing_mode(turn_control::authorized_submitter_for_player(state, holder))
+                == PriorityPassingMode::FullControl
+        {
+            return StackResolutionSessionPriorityDecision::Pause;
+        }
 
         let current_representatives = super::topology::canonical_priority_representatives(
             state,
@@ -8429,13 +8710,12 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 }
             }
 
-            // Auto-submit empty blockers when nothing can be chosen, and submit
-            // an empty declaration for a live turn-boundary preference just as
-            // Declare Attackers does above.
-            // CR 509.1 says the turn-based action still runs when no legal blocks
-            // are available, and CR 117.1c requires the active player to receive
-            // priority during the step (instants and Ninjutsu-family activations
-            // per CR 702.49 — notably Sneak, which is restricted to this step).
+            // Auto-submit empty blockers only when there is no blocking choice:
+            // no legal blocker exists, or every attacker has left the battlefield.
+            // Unlike declaring attackers, a turn-boundary preference does not
+            // pre-commit the defender to declining optional blocks.
+            // CR 509.1 performs the defender's declaration, and CR 509.2 then
+            // gives the active player priority after that declaration completes.
             // A phase stop on Declare Blockers overrides this even without an
             // auto-pass session: if the player explicitly asked to pause here,
             // honor it.
@@ -8445,8 +8725,7 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 ..
             } if !state.phase_stop_hit(*player)
                 && (valid_blocker_ids.is_empty()
-                    || !super::combat::has_attackers_in_play(state)
-                    || end_of_turn_active(state, *player)) =>
+                    || !super::combat::has_attackers_in_play(state)) =>
             {
                 let mut events = Vec::new();
                 match engine_combat::handle_empty_blockers(state, *player, &mut events) {
@@ -8615,6 +8894,7 @@ fn begin_resolve_all_consent(
     state: &mut GameState,
     priority_player: PlayerId,
     max_resolutions: u32,
+    scope: ResolveAllScope,
 ) -> Result<WaitingFor, EngineError> {
     match state
         .stack_resolution_session
@@ -8623,8 +8903,8 @@ fn begin_resolve_all_consent(
     {
         // An AI-issued recheck is an internal, provisional shortcut. An
         // explicit Resolve All proposal is the priority holder's replacement
-        // shortcut, so restore the saved preferences before asking every
-        // representative for the new proposal's consent.
+        // shortcut, so restore the saved preferences before installing the
+        // requester's own session below.
         Some(StackResolutionPolicy::RecheckNoMeaningfulPriorityAction) => {
             take_and_restore_stack_resolution_session(state);
         }
@@ -8638,6 +8918,10 @@ fn begin_resolve_all_consent(
     super::priority::pass_priority_legality(state, priority_player)?;
     let current_representative =
         super::topology::priority_pass_representative(state, priority_player);
+    // CR 117.3d / CR 117.4: `Own` binds the requester alone (no consent to ask,
+    // so nobody can block it); `Shared` opens the table-wide compression
+    // proposal, rotated so the requester is first and self-granted. See
+    // `ResolveAllScope`.
     let mut representatives = super::topology::priority_pass_participants(state);
     let Some(current_index) = representatives
         .iter()
@@ -8647,7 +8931,10 @@ fn begin_resolve_all_consent(
             "Resolve All requires a live priority representative".to_string(),
         ));
     };
-    representatives.rotate_left(current_index);
+    match scope {
+        ResolveAllScope::Own => representatives = vec![current_representative],
+        ResolveAllScope::Shared => representatives.rotate_left(current_index),
+    }
 
     let epoch = state.next_resolve_all_consent_epoch;
     let next_epoch = epoch.checked_add(1).ok_or_else(|| {
@@ -8660,6 +8947,7 @@ fn begin_resolve_all_consent(
     state.resolve_all_consent_run = Some(ResolveAllConsentRun {
         epoch,
         max_resolutions: StackResolutionBudget::from_legacy_max_resolutions(max_resolutions),
+        scope,
         priority_snapshot: ResolveAllPrioritySnapshot {
             waiting_player: priority_player,
             priority_player: state.priority_player,
@@ -8686,6 +8974,9 @@ fn begin_resolve_all_consent(
         ),
     });
 
+    // An `Own` run is single-participant and self-granted, so it materializes on
+    // the spot and never raises a consent prompt. A `Shared` run queues the
+    // remaining representatives for the table-wide compression proposal.
     if state
         .resolve_all_consent_run
         .as_ref()
@@ -9032,7 +9323,7 @@ fn respond_resolve_all_consent(
         let run = state.resolve_all_consent_run.as_mut().ok_or_else(|| {
             EngineError::InvalidAction("Resolve All consent is not active".to_string())
         })?;
-        if run.epoch != epoch || run.next_pending_representative() != Some(representative) {
+        if !run.accepts_response_from(epoch, representative) {
             return Err(EngineError::InvalidAction(
                 "Resolve All consent response is no longer pending".to_string(),
             ));
@@ -9584,9 +9875,13 @@ fn apply_action(
             }
             return pass_installed_auto_pass_priority(state, *player, &mut events);
         }
-        (WaitingFor::Priority { player }, GameAction::BeginResolveAll { max_resolutions }) => {
-            begin_resolve_all_consent(state, *player, max_resolutions)?
-        }
+        (
+            WaitingFor::Priority { player },
+            GameAction::BeginResolveAll {
+                max_resolutions,
+                scope,
+            },
+        ) => begin_resolve_all_consent(state, *player, max_resolutions, scope)?,
         (
             WaitingFor::ResolveAllConsent {
                 epoch,
@@ -14682,6 +14977,7 @@ fn record_exile_play_permission(
         Some(casting::ExileLandPlayAuthorization::ObjectAttached {
             source,
             frequency: CastFrequency::OncePerTurn,
+            ..
         }) => crate::game::ledger::consume_once_per_turn_permission(
             state,
             source,
@@ -15099,7 +15395,13 @@ fn handle_play_land(
         let enters_tapped = state
             .objects
             .get(&object_id)
-            .is_some_and(|obj| super::casting::exile_play_land_enters_tapped(obj, player));
+            .zip(
+                exile_play_authorization
+                    .and_then(|authorization| authorization.casting_permission_index()),
+            )
+            .is_some_and(|(obj, permission_index)| {
+                super::casting::exile_play_land_enters_tapped(state, obj, player, permission_index)
+            });
         if enters_tapped {
             if let Some(slot) = proposed.battlefield_entry_tap_state_mut() {
                 *slot = crate::types::zones::EtbTapState::Tapped;
@@ -15605,16 +15907,59 @@ fn is_tappable_creature_for_cost(state: &GameState, id: ObjectId, player: Player
     })
 }
 
-/// CR 602.5b + CR 702.122a: "activate only once each turn" is keyed to the exact
-/// object incarnation, so a Vehicle that leaves and returns (a new object per
-/// CR 400.7) may be crewed again. Single authority for reading the crew-cadence
-/// set — callers never touch `crew_activated_this_turn` directly.
+/// CAVEAT: the set is recorded at crew ANNOUNCEMENT and cleared only at turn
+/// start (CR 602.5b). It is therefore NOT a layer-independent test for "the
+/// crew payoff is in force": a Stifle-class counter (CR 701.6a) removes the
+/// pending crew entry before it resolves, leaving the cadence record stale all
+/// turn while the Vehicle never became a creature. Consumers that must reject
+/// a redundant re-crew should test PAYOFF-IN-FORCE instead — see
+/// [`crew_pending_on_stack`] / [`crew_resolved_this_turn_contains`].
 pub(crate) fn crew_activated_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
     state
         .objects
         .get(&vehicle_id)
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
         .is_some_and(|r| state.crew_activated_this_turn.contains(&r))
+}
+
+/// CR 702.122a: Has a `KeywordAction::Crew` for this Vehicle RESOLVED this
+/// turn (the resolved-crew marker)? This is the crew-repeat guard's
+/// PAYOFF-IN-FORCE authority: the marker is written only when the Crew stack
+/// entry actually resolves and installs the transient UEOT `AddType(Creature)`
+/// effect, so a countered crew (CR 701.6a) never sets it — and neither does a
+/// generic SelfRef self-animation (Kylox-class), which installs the same
+/// transient shape with no Crew resolution behind it. Only an explicit
+/// successful Crew sets the marker. Incarnation-keyed: a Vehicle that leaves
+/// and returns is a new object (CR 400.7) and is re-crewable.
+pub fn crew_resolved_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+        .is_some_and(|r| state.crew_resolved_this_turn.contains(&r))
+}
+
+/// CR 702.122a + CR 113.3b + CR 117.3c: Is a Crew activation for this Vehicle
+/// currently pending on the stack? Crew's payoff — the transient UEOT
+/// `AddType(Creature)` effect — is applied at stack RESOLUTION, not at
+/// announcement (CR 113.3b opens a priority window for counterspell-class
+/// effects between the two; CR 117.3c hands that same player priority again
+/// after the activation — the very re-crew window this guard exists to close).
+/// Between announcement and resolution the pending `KeywordAction::Crew` entry
+/// is the proof that the payoff is owed; the cadence set alone is not (see
+/// [`crew_activated_this_turn_contains`]).
+pub fn crew_pending_on_stack(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state.stack.iter().any(|entry| {
+        matches!(
+            &entry.kind,
+            StackEntryKind::KeywordAction {
+                action: KeywordAction::Crew {
+                    vehicle_id: pending,
+                    ..
+                },
+            } if *pending == vehicle_id
+        )
+    })
 }
 
 /// CR 602.5b + CR 702.122a: record a crew activation against the Vehicle's current
@@ -15626,6 +15971,23 @@ pub(crate) fn record_crew_activation(state: &mut GameState, vehicle_id: ObjectId
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
     {
         state.crew_activated_this_turn.insert(r);
+    }
+}
+
+/// CR 702.122a: record a RESOLVED crew against the Vehicle's current
+/// incarnation. Single authority for writing the resolved-crew marker set —
+/// called from the `KeywordAction::Crew` stack-resolution arm (stack.rs) in
+/// the exact block that installs the UEOT `AddType(Creature)` transient, so
+/// the marker and the payoff are written together and cannot drift.
+/// Deliberately NOT written at crew announcement: a countered crew (CR 701.6a)
+/// installs no payoff, and the Vehicle must stay re-crewable.
+pub(crate) fn record_crew_resolution(state: &mut GameState, vehicle_id: ObjectId) {
+    if let Some(r) = state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+    {
+        state.crew_resolved_this_turn.insert(r);
     }
 }
 
@@ -16348,6 +16710,14 @@ pub fn start_game_with_starting_player(
     state.active_player = starting_player;
     state.priority_player = starting_player;
     state.current_starting_player = starting_player;
+    // CR 103.8 + CR 500: the starting player takes their first turn HERE — turn 1
+    // is established inline rather than through `turns::start_next_turn`, which is
+    // where every later turn's per-player count is incremented. Without this the
+    // starting player's `turns_taken` stays one behind every other seat for the
+    // whole game, so `QuantityRef::TurnsTaken` ("the number of turns you've taken
+    // this game") and every "your Nth turn" condition read low for exactly the
+    // player who has taken the MOST turns.
+    state.players[starting_player.0 as usize].turns_taken += 1;
     // First-game default chooser is the starting player; BO3 restarts can pre-set this.
     if state.next_game_chooser.is_none() {
         state.next_game_chooser = Some(starting_player);
@@ -16404,6 +16774,10 @@ pub fn start_game_skip_mulligan(state: &mut GameState) -> ActionResult {
     state.active_player = starting_player;
     state.priority_player = starting_player;
     state.current_starting_player = starting_player;
+    // CR 103.8 + CR 500: see the matching increment in
+    // `start_game_with_starting_player` — turn 1 bypasses `turns::start_next_turn`,
+    // so the starting player's own first turn must be counted here.
+    state.players[starting_player.0 as usize].turns_taken += 1;
     state.phase = Phase::Untap;
 
     events.push(GameEvent::TurnStarted {
@@ -16824,7 +17198,7 @@ mod resolve_all_consent_session_tests {
         let mut state = GameState::new(FormatConfig::free_for_all(), 1, 0x51_1E);
         state.stack.push_back(no_op_entry(1, P0));
 
-        let waiting = begin_resolve_all_consent(&mut state, P0, 1)
+        let waiting = begin_resolve_all_consent(&mut state, P0, 1, ResolveAllScope::Shared)
             .expect("the sole representative is already unanimous");
 
         assert!(matches!(waiting, WaitingFor::Priority { player: P0 }));
@@ -16841,7 +17215,7 @@ mod resolve_all_consent_session_tests {
     fn two_headed_giant_final_grant_overlays_only_canonical_team_representatives() {
         let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0x2A6);
         state.stack.push_back(no_op_entry(1, P0));
-        let waiting = begin_resolve_all_consent(&mut state, P0, 7)
+        let waiting = begin_resolve_all_consent(&mut state, P0, 7, ResolveAllScope::Shared)
             .expect("the active team representative begins consent");
         let WaitingFor::ResolveAllConsent {
             epoch,
@@ -19262,10 +19636,11 @@ mod stage2_injector_tests {
         // first, so this helper exercises the chokepoint the server's `from_persisted`
         // and WASM's `decode_restored_game_state` actually funnel through — including
         // the CR 732.2a load-seam bound invariant.
-        // `.expect(..)`, not `?`: `into_game_state` returns `GameState`, not `Result`.
+        // The test unwraps the fallible persistence boundary after asserting this fixture decodes.
         serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
             .expect("gameState deserializes through the production decoder")
             .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract")
     }
 
     const EMBLEM: ObjectId = ObjectId(541);
@@ -20155,7 +20530,7 @@ mod stage2_injector_tests {
 
         assert_eq!(
             producers.len() + readers.len() + in_test,
-            44,
+            46,
             "CR 603.5 prompt census drifted. A new PRODUCER must have its recipient bound \
              somewhere — the mint's conjunct (a) covers exactly ONE of them. A new READER is \
              the benign case (U4's own consumption arm was one).\n\
@@ -20163,9 +20538,12 @@ mod stage2_injector_tests {
         );
         assert_eq!(
             (producers.len(), readers.len(), in_test),
-            (5, 9, 30),
+            (5, 9, 32),
             "the partition, not just the total: five PRODUCTION producers, nine PRODUCTION \
-             readers (they read `state.waiting_for` and never write it), 30 `#[cfg(test)]` lines.\nproducers={producers:#?}\n\
+             readers (they read `state.waiting_for` and never write it), 32 `#[cfg(test)]` lines \
+             (the 31st is `sba.rs`'s paused-resolution fixture for the CR 704.4 safety-net guard; \
+             the 32nd is `triggers.rs`'s positive reach-guard row for \
+             `resolution_frame_is_live_off_priority`).\nproducers={producers:#?}\n\
              readers={readers:#?}"
         );
         assert_eq!(
@@ -21078,10 +21456,11 @@ mod kilo_interruptibility_tests {
         // Decoding AS `PersistedGameState` (rather than decoding a bare `GameState` and
         // wrapping it) additionally routes the dump through
         // `reject_legacy_raw_prompt_authority` + `decode_persisted_resolution_state`.
-        // `.expect(..)`, not `?`: `into_game_state` returns `GameState`, not `Result`.
+        // The test unwraps the fallible persistence boundary after asserting this fixture decodes.
         serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
             .expect("gameState deserializes through the production decoder")
             .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract")
     }
 
     fn beat_actor(state: &GameState) -> PlayerId {

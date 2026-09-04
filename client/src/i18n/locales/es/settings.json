@@ -26,7 +26,7 @@
     "autoPass": "Auto-Pass",
     "skipLowUsePriorityWindows": "Omitir ventanas de prioridad de poco uso (experimental)",
     "skipLowUsePriorityWindowsDescription": "Pasa automáticamente tus propias ventanas de prioridad con la pila vacía durante el mantenimiento, el paso de robar y el paso final. Las paradas de fase y el Control total siguen pausando.",
-    "logDefault": "Registro predeterminado",
+    "logDockSide": "Posición del registro de la partida",
     "spellPayment": "Pago de hechizos",
     "manualManaPayment": "Pago manual de maná para hechizos",
     "spellPaymentOptions": { "auto": "Automático", "autoExceptSacrificialMana": "Preguntar antes de sacrificar", "manual": "Manual" },
@@ -56,9 +56,9 @@
       "medium": "Mediano",
       "large": "Grande"
     },
-    "logDefaultOptions": {
-      "open": "Abierto",
-      "closed": "Cerrado"
+    "logDockSideOptions": {
+      "left": "Izquierda",
+      "right": "Derecha"
     }
   },
   "visual": {
@@ -172,6 +172,7 @@
     "signedInAs": "Sesión iniciada como {{name}}",
     "syncNow": "Sincronizar ahora",
     "statusSyncing": "Sincronizando…",
+    "statusPaused": "La sincronización en la nube está en pausa mientras estás sin conexión.",
     "statusError": "Error de sincronización",
     "lastSynced": "Última sincronización: {{time}}",
     "never": "nunca",
@@ -211,6 +212,7 @@
   "visualPacks": {
     "title": "Catálogo visual sin conexión",
     "description": "Elige las imágenes que quieres conservar en este dispositivo. El catálogo de tarjetas se almacena en caché desde Scryfall y cada imagen se descarga directamente desde Scryfall.",
+    "offlineUnavailable": "Las descargas de red no están disponibles sin conexión. Vuelve a conectarte para actualizar el catálogo o instalar, sincronizar, reparar o reanudar imágenes.",
     "availability": {
       "loading": "Comprobando el soporte del catálogo visual sin conexión...",
       "browser": "Este navegador no ofrece las funciones de almacenamiento local necesarias para descargar imágenes sin conexión.",
@@ -222,9 +224,15 @@
     "selector": {
       "title": "Selección de catálogo",
       "core": "Reverso de carta",
-      "printing": "Impresiones en inglés",
-      "locale": "Impresiones de conjuntos localizados",
+      "printing": "Impresiones de la colección",
       "complete": "Todas las imágenes actuales de cartas en inglés",
+      "curated": "Una imagen por carta",
+      "deck_library": "Biblioteca de mazos",
+      "curatedNote": "Una imagen por carta, elegida por tus Preferencias de ilustración de cartas en la pestaña Visual. Si las cambias allí, esta selección las sigue.",
+      "curatedDefaultNote": "Una imagen por carta. No tienes reglas de ilustración, así que se descarga la ilustración predeterminada de cada carta: añade reglas en Preferencias de ilustración de cartas, en la pestaña Visual, para elegir otras ediciones.",
+      "deckLibraryNote": "Una imagen por cada carta usada en la biblioteca compartida de mazos, incluidos los preconstruidos de Commander para IA. Sigue las Preferencias de ilustración de cartas. Tras instalarse, la aplicación descarga las incorporaciones y elimina las imágenes que ya no se necesitan mientras está en ejecución; quitar este paquete detiene esa sincronización.",
+      "driftNone": "Tus imágenes instaladas ya coinciden con estos ajustes.",
+      "driftSummary": "Tus imágenes instaladas están desactualizadas: {{add}} por añadir, {{remove}} por quitar, {{refresh}} por actualizar.",
       "setCode": "Código de colección",
       "setPlaceholder": "por ej. fin",
       "language": "Idioma de la imagen",
@@ -234,7 +242,10 @@
     "actions": {
       "estimate": "Descarga de presupuesto",
       "estimating": "Analizando el catálogo de Scryfall…",
+      "estimateCurated": "Recalcular tamaño",
+      "estimatingCurated": "Calculando el tamaño…",
       "install": "Instalar selección",
+      "sync": "Sincronizar imágenes",
       "cancel": "Cancelar operación",
       "resume": "Reanudar operación",
       "retry": "Inténtalo de nuevo",
@@ -248,11 +259,18 @@
       "removeAll": "Eliminar todos los elementos visuales sin conexión"
     },
     "estimate": {
-      "title": "Análisis de la instantánea de Scryfall"
+      "title": "Análisis de la instantánea de Scryfall",
+      "progressTitle": "Progreso del análisis del catálogo",
+      "curatedTitle": "Descarga estimada",
+      "headroomWarning": "Esto supera el espacio libre que informa este navegador. Aun así puedes instalarlo: si se queda sin espacio, la descarga puede reanudarse y conserva todo lo ya guardado.",
+      "evictionWarning": "Este navegador no ha concedido almacenamiento persistente, por lo que puede borrar estas imágenes cuando al dispositivo le quede poco espacio.",
+      "progress": "{{downloaded}} MB de {{total}} MB leídos · {{records}} cartas analizadas · {{images}} imágenes encontradas"
     },
     "metrics": {
-      "assetRecords": "Registros de activos",
-      "uniqueObjects": "Objetos únicos",
+      "assetRecords": "Registros de imágenes",
+      "estimatedImageBytes": "Tamaño estimado de descarga",
+      "availableBytes": "Espacio libre disponible",
+      "uniqueObjects": "Imágenes por descargar",
       "logicalImageBytes": "Bytes de imagen lógica",
       "uniqueImageBytes": "Bytes de imagen únicos",
       "shardCount": "fragmentos",
@@ -265,6 +283,7 @@
         "cancel_requested": "Cancelación solicitada",
         "finalizing": "Finalizando",
         "failed": "Error: listo para reanudar",
+        "terminated": "Detenido: esta operación no se puede reanudar",
         "completed": "Completado",
         "cancelled": "Cancelado"
       },
@@ -272,7 +291,9 @@
       "root": "raíz del catálogo",
       "packs": "Paquetes: {{current}} de {{total}}",
       "objects": "Imágenes: {{current}} de {{total}}",
+      "objectsUnknown": "Imágenes descargadas: {{current}}",
       "scanNote": "El total aumenta mientras se analiza la instantánea de Scryfall. Las imágenes ya descargadas permanecen locales y se omiten al reanudar.",
+      "estimateNote": "El total quedó fijado al iniciar esta descarga. Las imágenes ya descargadas permanecen locales y se omiten al reanudar.",
       "finalizing": "Finalizando la instalación del catálogo"
     },
     "status": {
@@ -285,7 +306,15 @@
       "installed": "Paquetes instalados",
       "noneInstalled": "No hay paquetes visuales instalados.",
       "upgradeAvailable": "Actualización disponible",
-      "receiptRoot": "Raíz del recibo: {{root}}"
+      "receiptRoot": "Instalado desde la instantánea: {{root}}",
+      "membershipDigest": "Huella de la selección: {{digest}}",
+      "storageUsage": "Almacenamiento usado por este sitio",
+      "persistence": "Protección contra borrado",
+      "persistenceState": {
+        "persisted": "Concedida: este navegador conservará estas imágenes",
+        "best_effort": "No concedida: este navegador puede borrar estas imágenes cuando quede poco espacio",
+        "unsupported": "Este navegador no lo indica"
+      }
     },
     "verification": {
       "revision": "Revisión instalada verificada {{revision}}.",
@@ -304,7 +333,8 @@
       }
     },
     "removal": {
-      "committed": "Eliminación confirmada en la revisión {{revision}}."
+      "committed": "Eliminación confirmada en la revisión {{revision}}.",
+      "inProgress": "Eliminando elementos visuales sin conexión…"
     },
     "cleanup": {
       "malformed_entry": "No se pudo recuperar una entrada de caché con formato incorrecto",
@@ -312,15 +342,24 @@
       "remove_failed": "No se pudo eliminar un archivo de caché",
       "catalog_state": "No se pudo recuperar el estado del catálogo histórico"
     },
+    "packs": {
+      "core": "Reverso de carta",
+      "complete": "Todas las imágenes actuales de cartas en inglés",
+      "curated": "Una imagen por carta",
+      "deckLibrary": "Biblioteca de mazos",
+      "printing": "Impresiones de {{set}}",
+      "locale": "Impresiones de {{set}} ({{language}})"
+    },
     "errors": {
       "unsupported_shell": "Esta versión de la aplicación no admite catálogos visuales sin conexión.",
       "unauthorized": "Esta ventana no puede administrar catálogos visuales sin conexión.",
       "unavailable": "La gestión del catálogo visual sin conexión no está disponible temporalmente.",
       "invalid_input": "La selección de catálogo solicitada no es válida.",
-      "conflict": "Los paquetes instalados dependen de esta selección.",
+      "conflict": "Esta selección está desactualizada: el catálogo o tus preferencias de ilustración cambiaron después de hacerla. Vuelve a calcularla e inténtalo de nuevo.",
       "cancelled": "La operación fue cancelada.",
       "network": "La solicitud de red del catálogo falló.",
       "storage": "El catálogo no se pudo escribir en el almacenamiento del dispositivo.",
+      "insufficient_storage": "No hay espacio suficiente: esta descarga necesita al menos {{required}}, pero solo hay {{available}} libres.",
       "trust": "No se puede confiar en la respuesta del catálogo.",
       "emit": "La aplicación no pudo informar el progreso del catálogo.",
       "internal": "No se pudo completar la operación del catálogo."
@@ -362,6 +401,21 @@
       "combat": "Tiempo del daño de combate: cuánto permanecen bloqueadores y atacantes antes de que se resuelva el daño.",
       "banners": "Visualización del cartel de inicio de turno."
     }
+  },
+  "offlinePreparation": {
+    "title": "Preparación sin conexión",
+    "description": "Prepara este escritorio para juego local sin conexión antes de activar Trabajar sin conexión.",
+    "prepare": "Preparar sin conexión",
+    "preparing": "Preparando…",
+    "workOffline": "Trabajar sin conexión",
+    "checklistLabel": "Lista de preparación sin conexión",
+    "visualWarning": "Los paquetes visuales instalados necesitan atención. Ábrelos para repararlos; el juego local sigue disponible.",
+    "incompleteTitle": "La preparación sin conexión está incompleta",
+    "incompleteMessage": "Falta: {{capabilities}}. ¿Activar Trabajar sin conexión de todos modos?",
+    "confirmOffline": "Activar Trabajar sin conexión",
+    "states": { "needs-preparation": "Prepara este dispositivo antes de trabajar sin conexión.", "preparing": "Preparando capacidades de juego local…", "ready": "Este dispositivo está listo para jugar sin conexión.", "failed": "Algunas capacidades necesarias no están listas.", "reconnect-required": "Vuelve a conectarte antes de preparar el juego sin conexión.", "reload-or-relaunch-required": "Recarga la aplicación o reinicia el escritorio y vuelve a preparar." },
+    "capabilities": { "appShell": "Aplicación", "browserEngine": "Motor y base de cartas", "scryfallSearch": "Datos de búsqueda", "preconCatalog": "Mazos preconstruidos", "bundledAiCatalog": "Catálogo de mazos de IA", "deckLibrary": "Biblioteca de mazos instalada", "nativeEngine": "Motor nativo" },
+    "capabilityStates": { "ready": "Listo", "not-ready": "No listo", "reload-required": "Debe recargarse", "not-applicable": "No aplicable", "not-installed": "No instalado" }
   },
   "artChain": {
     "emptyState": "Usando la ilustración predeterminada de Scryfall. Añade reglas a continuación para personalizar.",

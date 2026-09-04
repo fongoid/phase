@@ -61,6 +61,58 @@ import {
 } from "../services/intergameCommandLedger";
 import { assignAvatarForSeat } from "../services/playerAvatars";
 
+/**
+ * Prepare a host snapshot for the publicly retrievable P2P backup endpoint.
+ *
+ * IndexedDB keeps the full host snapshot and is the only durable location from
+ * which a Chaos draft can resume. The HTTP backup is reachable by a derivable
+ * host peer id, so it may retain the candidate intent but must never upload the
+ * per-seat Chaos assignment matrix. The server repeats this redaction at its
+ * trust boundary.
+ */
+function redactChaosAssignmentsFromPublicBackup(
+  snapshot: PersistedDraftHostSession,
+): PersistedDraftHostSession {
+  if (snapshot.draftSessionJson === null) return snapshot;
+
+  try {
+    const session: unknown = JSON.parse(snapshot.draftSessionJson);
+    if (!isJsonRecord(session) || !isJsonRecord(session.config)) return snapshot;
+    if (!redactChaosAssignmentsFromSource(session.config.source)) return snapshot;
+
+    return { ...snapshot, draftSessionJson: JSON.stringify(session) };
+  } catch {
+    // The server also redacts at the trust boundary. Keeping an unexpected
+    // opaque payload intact preserves the existing best-effort backup behavior.
+    return snapshot;
+  }
+}
+
+function redactChaosAssignmentsFromSource(source: unknown): boolean {
+  if (!isJsonRecord(source)) return false;
+
+  let redacted = false;
+  const redactSetLayout = (layout: unknown): void => {
+    if (!isJsonRecord(layout) || !("candidate_codes" in layout) || !("assignments" in layout)) {
+      return;
+    }
+    delete layout.assignments;
+    redacted = true;
+  };
+
+  // `DraftSource`'s canonical serde output is adjacent-tagged. The older
+  // externally tagged form is accepted too so a legacy transport shape cannot
+  // bypass this client defense before the server applies its matching redaction.
+  redactSetLayout(source.Set);
+  if (source.type === "Set") redactSetLayout(source.data);
+  redactSetLayout(source);
+  return redacted;
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /** Tracks Bo3 match state between games for a single pairing. */
@@ -141,6 +193,13 @@ const PICK_TIMER_DURATIONS_MS: readonly number[] = [
 
 function pickTimerDurationMs(pickNumber: number): number {
   return PICK_TIMER_DURATIONS_MS[Math.min(pickNumber, PICK_TIMER_DURATIONS_MS.length - 1)];
+}
+
+/** A host seed controls both card collation and private Chaos assignments. */
+function hostDraftSeed(): number {
+  const values = new Uint32Array(1);
+  crypto.getRandomValues(values);
+  return values[0]!;
 }
 
 /**
@@ -311,9 +370,14 @@ export class P2PDraftHost {
   private seatTokens = new Map<number, string>();
   private seatNames = new Map<number, string>();
   private kickedTokens = new Set<string>();
+  /**
+   * The absolute end of a guest's current reconnect episode. It survives a
+   * successful tentative reconnect so a later drop cannot grant a new window.
+   */
+  private reconnectDeadlines = new Map<number, number>();
   private disconnectedSeats = new Map<
     number,
-    { disconnectedAt: number; timer: ReturnType<typeof setTimeout> | null }
+    { deadlineAt: number; timer: ReturnType<typeof setTimeout> | null }
   >();
   private expiredDisconnectedSeats = new Set<number>();
   private picksThisRound = new Set<number>();
@@ -461,7 +525,7 @@ export class P2PDraftHost {
     // The third caller, the public `getHostView()`, is NOT covered by this
     // ordering — it is covered by `buildLobbyView`'s throw-on-null, which is
     // why that rule is load-bearing rather than defensive.
-    this.procedure = await this.adapter.draftProcedure(this.kind);
+    this.procedure = await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
 
     this.hostConnectionUnsub = this.onGuestConnected((conn) => {
       this.handleNewConnection(conn);
@@ -679,6 +743,7 @@ export class P2PDraftHost {
     }
 
     const reconnectSeat = seat;
+    let reconnectDeadlineAt: number | null = null;
     let live = true;
     const stopWatching = session.onDisconnect?.(() => { live = false; }) ?? (() => {});
     try {
@@ -704,12 +769,18 @@ export class P2PDraftHost {
         await this.rejectAndClose(session, "NoReconnectWindow", "Reconnect window expired", "Reconnect window expired");
         return;
       }
-      if (grace.timer !== null) clearTimeout(grace.timer);
-      this.disconnectedSeats.delete(reconnectSeat);
+      reconnectDeadlineAt = grace.deadlineAt;
+      this.clearReconnectGrace(reconnectSeat);
       this.guestSessions.set(reconnectSeat, session);
       session.onMessage((msg) => {
         this.runDetachedMutation("guest message", () => this.handleGuestMessage(reconnectSeat, msg, session));
       });
+
+      // The prior fence makes the engine's connected bitmap recoverable while
+      // this reconnect is tentative. This fence records the completed handoff
+      // while retaining its absolute deadline, so a later recovery or drop
+      // can use only the remaining grace window.
+      await this.persistSessionStrict();
 
       const view = this.draftStarted
         ? await this.adapter.getViewForSeat(reconnectSeat)
@@ -739,11 +810,13 @@ export class P2PDraftHost {
       if (this.draftStarted) {
         try { await this.adapter.setSeatConnected(reconnectSeat, false); } catch { /* best-effort rollback */ }
       }
-      if (!this.disconnectedSeats.has(reconnectSeat)) {
-        const timer = setTimeout(() => {
-          this.runDetachedMutation("reconnect grace expiry", () => this.expireReconnectGrace(reconnectSeat));
-        }, this.gracePeriodMs);
-        this.disconnectedSeats.set(reconnectSeat, { disconnectedAt: Date.now(), timer });
+      if (!this.disconnectedSeats.has(reconnectSeat) && reconnectDeadlineAt !== null) {
+        if (reconnectDeadlineAt > Date.now()) {
+          this.scheduleReconnectGrace(reconnectSeat, reconnectDeadlineAt);
+        } else {
+          this.reconnectDeadlines.delete(reconnectSeat);
+          this.expiredDisconnectedSeats.add(reconnectSeat);
+        }
       }
       try {
         await this.persistSessionStrict();
@@ -780,7 +853,14 @@ export class P2PDraftHost {
     msg: DraftP2PMessage,
     originatingSession = this.guestSessions.get(seat),
   ): Promise<void> {
+    // A queued message from a replaced DataChannel must never act on the seat
+    // its successor now owns.
+    if (originatingSession && this.guestSessions.get(seat) !== originatingSession) return;
     switch (msg.type) {
+      case "draft_leave": {
+        await this.handleGuestLeave(seat, msg.draftToken, originatingSession);
+        break;
+      }
       case "draft_pick": {
         if (!this.canGuestPick(seat)) return;
         await this.handlePick(seat, msg.cardInstanceIds);
@@ -870,8 +950,11 @@ export class P2PDraftHost {
 
   private async startDraftInner(botFillEmptySeats: boolean): Promise<void> {
     if (this.draftStarted) return;
+    if (this.disconnectedSeats.size > 0) {
+      throw new Error("Cannot start draft while a player is reconnecting");
+    }
 
-    const seed = Math.floor(Math.random() * 0xffffffff);
+    const seed = hostDraftSeed();
     this.draftSeed = seed;
     const draftCode = `draft-${seed.toString(16).padStart(8, "0")}`;
     const seats: MultiplayerSeatDescriptor[] = [];
@@ -1325,39 +1408,179 @@ export class P2PDraftHost {
 
   // ── Disconnect / Reconnect ─────────────────────────────────────────
 
+  /**
+   * A participant's explicit exit revokes the capability rather than opening
+   * reconnect grace. Its acknowledgement is deliberately after the durable
+   * mutation, so a guest never drops its recovery state for a leave the host
+   * could lose on refresh.
+   */
+  private async handleGuestLeave(
+    seat: number,
+    draftToken: string,
+    originatingSession?: DraftPeerSession,
+  ): Promise<void> {
+    const session = this.guestSessions.get(seat);
+    if (!session || session !== originatingSession || this.seatTokens.get(seat) !== draftToken) return;
+
+    const priorGraceDeadline = this.disconnectedSeats.get(seat)?.deadlineAt;
+    const priorReconnectDeadline = this.reconnectDeadlines.get(seat);
+    const priorWorkspace = this.perSeatWorkspaceSnapshots.get(seat);
+    const priorToken = this.seatTokens.get(seat);
+    const priorName = this.seatNames.get(seat);
+    const wasKicked = this.kickedTokens.has(draftToken);
+    const wasExpired = this.expiredDisconnectedSeats.has(seat);
+    let sessionEnded = false;
+    let sessionEndedAt: number | null = null;
+    const stopWatchingSession = session.onDisconnect(() => {
+      sessionEnded = true;
+      sessionEndedAt = Date.now();
+    });
+
+    let attemptedDisconnect = false;
+    try {
+      this.guestSessions.delete(seat);
+      this.clearReconnectGrace(seat);
+      this.reconnectDeadlines.delete(seat);
+      this.perSeatWorkspaceSnapshots.delete(seat);
+
+      if (!this.draftStarted) {
+        this.seatTokens.delete(seat);
+        this.seatNames.delete(seat);
+      } else {
+        this.kickedTokens.add(draftToken);
+        this.seatTokens.delete(seat);
+        this.expiredDisconnectedSeats.add(seat);
+        // A rejected adapter call can still have changed the engine. Treat the
+        // attempted transition as needing compensation either way.
+        attemptedDisconnect = true;
+        await this.adapter.setSeatConnected(seat, false);
+      }
+
+      // Leave is a compensating transaction: unlike a reducer command, its
+      // failed snapshot must never be retained and replayed after this branch
+      // restores the participant's recovery capability.
+      await this.persistSessionStrict({ retainFailedDraftSnapshot: false });
+    } catch (error) {
+      // A failed leave transition leaves the prior durable session
+      // authoritative. Restore its complete in-memory counterpart before
+      // returning without an acknowledgement, so the existing recovery
+      // capability stays usable.
+      if (!sessionEnded) this.guestSessions.set(seat, session);
+      const reconnectDeadline = priorGraceDeadline
+        ?? priorReconnectDeadline
+        ?? (sessionEndedAt === null ? undefined : sessionEndedAt + this.gracePeriodMs);
+      if (sessionEnded && reconnectDeadline !== undefined) {
+        this.scheduleReconnectGrace(seat, reconnectDeadline);
+      } else if (priorGraceDeadline !== undefined) {
+        this.scheduleReconnectGrace(seat, priorGraceDeadline);
+      } else if (priorReconnectDeadline !== undefined) {
+        this.reconnectDeadlines.set(seat, priorReconnectDeadline);
+      }
+      if (priorWorkspace !== undefined) this.perSeatWorkspaceSnapshots.set(seat, priorWorkspace);
+      if (priorToken !== undefined) this.seatTokens.set(seat, priorToken);
+      if (priorName !== undefined) this.seatNames.set(seat, priorName);
+      if (wasKicked) this.kickedTokens.add(draftToken);
+      else this.kickedTokens.delete(draftToken);
+      if (wasExpired) this.expiredDisconnectedSeats.add(seat);
+      else this.expiredDisconnectedSeats.delete(seat);
+      if (this.draftStarted && attemptedDisconnect && !sessionEnded) {
+        try {
+          await this.adapter.setSeatConnected(seat, true);
+        } catch (rollbackError) {
+          // The durable state and every local recovery record have already
+          // been restored. Surface the adapter failure without sacrificing the
+          // participant's capability by letting rollback abort halfway through.
+          const message = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+          console.error("[P2PDraftHost] leave rollback connectivity failed:", rollbackError);
+          this.emit({ type: "error", message: `leave rollback connectivity failed: ${message}` });
+        }
+      }
+      if (sessionEnded) {
+        if (this.draftStarted) {
+          try {
+            // A connection that closed during the failed leave is still gone.
+            // Keep the engine paused/disconnected for its recovered grace
+            // window instead of compensating it back to a live seat.
+            await this.adapter.setSeatConnected(seat, false);
+          } catch (disconnectError) {
+            this.reportDetachedMutationFailure("leave disconnect recovery", disconnectError);
+          }
+        }
+        try {
+          await this.persistSessionStrict({ retainFailedDraftSnapshot: false });
+        } catch (persistError) {
+          this.reportDetachedMutationFailure("leave disconnect recovery", persistError);
+        }
+        // A second persistence failure cannot make this lost connection look
+        // live. Pause/synchronize from the restored local state regardless of
+        // whether its recovery snapshot made it to storage.
+        if (this.draftStarted) this.reconcileEffectivePause();
+        else this.syncLobbyToGuests();
+      }
+      throw error;
+    } finally {
+      stopWatchingSession();
+    }
+    try {
+      await session.send({
+        type: "draft_leave_ack",
+        draftProtocolVersion: DRAFT_PROTOCOL_VERSION,
+        draftToken,
+      });
+    } catch (error) {
+      // The leave is already durable. A failed notification cannot skip
+      // terminal cleanup or hide the departure from the remaining seats.
+      console.warn("[P2PDraftHost] leave acknowledgement failed:", error);
+    }
+    session.close("Participant left draft");
+
+    if (this.draftStarted) {
+      await this.broadcastViews();
+      this.reconcileEffectivePause();
+    } else {
+      this.syncLobbyToGuests();
+    }
+    this.emit({ type: "seatDisconnected", seatIndex: seat });
+  }
+
   private handleGuestDisconnect(seat: number): void {
     if (!this.guestSessions.has(seat)) return;
     if (this.disconnectedSeats.has(seat)) return;
 
     this.guestSessions.delete(seat);
 
-    if (!this.draftStarted) {
-      // Pre-draft disconnect: free the seat
-      this.seatTokens.delete(seat);
-      this.seatNames.delete(seat);
-      this.runDetachedMutation("pre-draft disconnect", async () => {
-        await this.persistSessionStrict();
-        this.syncLobbyToGuests();
-        this.emit({ type: "seatDisconnected", seatIndex: seat });
-      });
-      return;
-    }
-
-    // Mid-draft disconnect: grace window
-    const timer = setTimeout(() => {
-      this.runDetachedMutation("reconnect grace expiry", () => this.expireReconnectGrace(seat));
-    }, this.gracePeriodMs);
-
-    this.disconnectedSeats.set(seat, { disconnectedAt: Date.now(), timer });
+    this.scheduleReconnectGrace(
+      seat,
+      this.reconnectDeadlines.get(seat) ?? Date.now() + this.gracePeriodMs,
+    );
     // The socket callback is synchronous, but all externally visible state
     // follows the one durable queue: connected bitmap → snapshot → views/pause.
     this.runDetachedMutation("guest disconnect", async () => {
-      await this.adapter.setSeatConnected(seat, false);
+      if (this.draftStarted) await this.adapter.setSeatConnected(seat, false);
       await this.persistSessionStrict();
-      await this.broadcastViews();
-      this.reconcileEffectivePause();
+      if (this.draftStarted) {
+        await this.broadcastViews();
+        this.reconcileEffectivePause();
+      } else {
+        this.syncLobbyToGuests();
+      }
       this.emit({ type: "seatDisconnected", seatIndex: seat });
     });
+  }
+
+  private scheduleReconnectGrace(seat: number, deadlineAt: number): void {
+    this.reconnectDeadlines.set(seat, deadlineAt);
+    const remainingMs = Math.max(0, deadlineAt - Date.now());
+    const timer = setTimeout(() => {
+      this.runDetachedMutation("reconnect grace expiry", () => this.expireReconnectGrace(seat));
+    }, remainingMs);
+    this.disconnectedSeats.set(seat, { deadlineAt, timer });
+  }
+
+  private clearReconnectGrace(seat: number): void {
+    const grace = this.disconnectedSeats.get(seat);
+    if (grace?.timer !== null && grace?.timer !== undefined) clearTimeout(grace.timer);
+    this.disconnectedSeats.delete(seat);
   }
 
   /**
@@ -1394,8 +1617,19 @@ export class P2PDraftHost {
   private async expireReconnectGrace(seat: number): Promise<void> {
     // Grace expiry remains an effective pause: a missing player cannot
     // silently resume the pod just because their reconnect window ended.
-    if (!this.disconnectedSeats.delete(seat)) return;
-    if (this.draftStarted) await this.adapter.setSeatConnected(seat, false);
+    if (!this.disconnectedSeats.has(seat)) return;
+    this.clearReconnectGrace(seat);
+    this.reconnectDeadlines.delete(seat);
+    if (!this.draftStarted) {
+      this.seatTokens.delete(seat);
+      this.seatNames.delete(seat);
+      this.perSeatWorkspaceSnapshots.delete(seat);
+      await this.persistSessionStrict();
+      this.syncLobbyToGuests();
+      this.emit({ type: "seatDisconnected", seatIndex: seat });
+      return;
+    }
+    await this.adapter.setSeatConnected(seat, false);
     this.expiredDisconnectedSeats.add(seat);
     await this.persistSessionStrict();
     this.broadcastToGuests({
@@ -1626,7 +1860,7 @@ export class P2PDraftHost {
     }
   }
 
-  private matchBindingFor(pairing: PairingView): DraftMatchBinding {
+  private matchBindingFor(pairing: PairingView, matchAuthoritySeat: number): DraftMatchBinding {
     const existing = this.matchBindings.get(pairing.match_id);
     if (existing && existing.round === pairing.round) return existing;
 
@@ -1638,7 +1872,7 @@ export class P2PDraftHost {
       lease: crypto.randomUUID(),
       nonce: crypto.randomUUID(),
       revision: 0,
-      matchAuthoritySeat: Math.min(pairing.seat_a, pairing.seat_b),
+      matchAuthoritySeat,
     };
     this.matchBindings.set(pairing.match_id, binding);
     return binding;
@@ -1717,7 +1951,13 @@ export class P2PDraftHost {
       revision: receipt.revision,
     };
     if (seat === 0) return;
-    await this.guestSessions.get(seat)?.send(message);
+    try {
+      await this.guestSessions.get(seat)?.send(message);
+    } catch (error) {
+      // The receipt is already durable; an exact retry can acknowledge it
+      // without applying the result to the reducer again.
+      console.warn("[P2PDraftHost] settlement acknowledgement failed:", error);
+    }
   }
 
   /**
@@ -1771,16 +2011,16 @@ export class P2PDraftHost {
     const seatB = pairing.seat_b;
     const seatAIsBot = this.isBotSeatFromView(view, seatA);
     const seatBIsBot = this.isBotSeatFromView(view, seatB);
-    const session = await this.exportDraftSession();
-    const binding = this.matchBindingFor(pairing);
-
     if (seatAIsBot && seatBIsBot) {
       await this.reportMatchResult(pairing.match_id, Math.min(seatA, seatB));
       return;
     }
 
+    const session = await this.exportDraftSession();
+
     if (seatAIsBot || seatBIsBot) {
       const humanSeat = seatAIsBot ? seatB : seatA;
+      const binding = this.matchBindingFor(pairing, humanSeat);
       const botSeat = seatAIsBot ? seatA : seatB;
       const botName = seatAIsBot ? pairing.name_a : pairing.name_b;
       const humanDeck = this.submittedDeckForSeat(session, humanSeat);
@@ -1806,6 +2046,7 @@ export class P2PDraftHost {
     }
 
     const matchHostSeat = Math.min(seatA, seatB);
+    const binding = this.matchBindingFor(pairing, matchHostSeat);
     const guestSeat = matchHostSeat === seatA ? seatB : seatA;
     const matchRoomCode = `${this.draftCode ?? "draft"}-${pairing.match_id}`;
     const hostDeck = this.submittedDeckForSeat(session, matchHostSeat);
@@ -2001,8 +2242,8 @@ export class P2PDraftHost {
       const seed = this.draftSeed ?? hashStringToSeed(this.draftCode || this.roomCode || "draft");
       await this.adapter.replaceSeatWithBot(seat, this.botNameForSeat(seat, seed));
       const grace = this.disconnectedSeats.get(seat);
-      if (grace && grace.timer !== null) clearTimeout(grace.timer);
-      this.disconnectedSeats.delete(seat);
+      if (grace) this.clearReconnectGrace(seat);
+      this.reconnectDeadlines.delete(seat);
       this.expiredDisconnectedSeats.delete(seat);
       this.seatTokens.delete(seat);
       this.seatNames.delete(seat);
@@ -2415,10 +2656,8 @@ export class P2PDraftHost {
 
     // Cancel grace timer if active
     const grace = this.disconnectedSeats.get(seat);
-    if (grace) {
-      if (grace.timer !== null) clearTimeout(grace.timer);
-      this.disconnectedSeats.delete(seat);
-    }
+    if (grace) this.clearReconnectGrace(seat);
+    this.reconnectDeadlines.delete(seat);
     this.expiredDisconnectedSeats.delete(seat);
 
     await this.persistSessionStrict();
@@ -2460,20 +2699,30 @@ export class P2PDraftHost {
     void this.enqueuePersistSession(snapshot).catch(() => {});
   }
 
-  /** Admission callers await this fence before issuing a recoverable token. */
-  private persistSessionStrict(): Promise<void> {
+  /**
+   * Callers await this fence before making a recovery capability externally
+   * visible. A caller that fully compensates its mutation can opt out of
+   * retaining its failed engine snapshot for replay.
+   */
+  private persistSessionStrict(
+    options: { retainFailedDraftSnapshot?: boolean } = {},
+  ): Promise<void> {
     if (!this.persistenceId || this.persistenceClosed) return Promise.resolve();
     return this.enqueuePersistSession(
       this.draftStarted ? undefined : this.buildPersistedSnapshot(null),
+      options.retainFailedDraftSnapshot,
     );
   }
 
   /**
    * Serializes snapshots while retaining a live queue after a failed write.
-   * Fire-and-forget mutations report errors through `persistSession`; admission
-   * awaits the returned task and rolls its mutation back on failure.
+   * Fire-and-forget mutations report errors through `persistSession`; callers
+   * that await the returned task may roll their mutation back on failure.
    */
-  private enqueuePersistSession(snapshotAtMutation?: PersistedDraftHostSession): Promise<void> {
+  private enqueuePersistSession(
+    snapshotAtMutation?: PersistedDraftHostSession,
+    retainFailedDraftSnapshot = true,
+  ): Promise<void> {
     if (!this.persistenceId || this.persistenceClosed) return Promise.resolve();
     const persist = this.persistQueue.then(async () => {
       if (this.persistenceClosed) return;
@@ -2494,7 +2743,7 @@ export class P2PDraftHost {
       } catch (error) {
         // Admission has its own transactional rollback.  Only an engine-backed
         // snapshot represents a reducer result that must be replayed exactly.
-        if (this.draftStarted) this.pendingDraftSnapshot = snapshot;
+        if (this.draftStarted && retainFailedDraftSnapshot) this.pendingDraftSnapshot = snapshot;
         throw error;
       }
 
@@ -2523,6 +2772,7 @@ export class P2PDraftHost {
       seatTokens: Object.fromEntries(this.seatTokens),
       seatNames: Object.fromEntries(this.seatNames),
       kickedTokens: [...this.kickedTokens],
+      reconnectDeadlines: Object.fromEntries(this.reconnectDeadlines),
       expiredDisconnectedSeats: [...this.expiredDisconnectedSeats],
       draftStarted: this.draftStarted,
       manualPause: this.manualPause,
@@ -2556,13 +2806,14 @@ export class P2PDraftHost {
   private async uploadBackupSnapshot(snapshot: PersistedDraftHostSession): Promise<void> {
     if (!this.backupEndpoint || !this.draftCode) return;
     try {
+      const publicSnapshot = redactChaosAssignmentsFromPublicBackup(snapshot);
       await fetch(`${this.backupEndpoint}/p2p-draft-backup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           draft_code: this.draftCode,
           host_peer_id: this.hostPeer.id,
-          snapshot_json: JSON.stringify(snapshot),
+          snapshot_json: JSON.stringify(publicSnapshot),
         }),
       });
     } catch (err) {
@@ -2658,12 +2909,24 @@ export class P2PDraftHost {
       this.rememberMatchDecks(recoveredLaunch);
     }
 
-    this.armRecoveredGuestGrace();
+    const recoveryStateChanged = this.armRecoveredGuestGrace(session.reconnectDeadlines);
+    if (recoveryStateChanged) {
+      // Persist the recovery transition from the original engine snapshot
+      // before importing it. A second host crash during import therefore sees
+      // this same absolute deadline rather than granting a fresh window.
+      await this.enqueuePersistSession(this.buildPersistedSnapshot(session.draftSessionJson));
+    }
 
     if (session.draftSessionJson) {
       const view = await this.adapter.importSession(session.draftSessionJson, 2);
+      for (const seat of this.expiredDisconnectedSeats) {
+        await this.adapter.setSeatConnected(seat, false);
+      }
       if (this.reconcileRetainedWorkspace(0, view.pool).changed) this.persistSession();
       await this.recoverSettlementOutbox(view);
+      if (this.rotateLegacyBotMatchAuthorities(view)) {
+        await this.persistSessionStrict();
+      }
 
       this.reconcileEffectivePause();
 
@@ -2696,15 +2959,76 @@ export class P2PDraftHost {
     return null;
   }
 
-  /** Restored guests get the same bounded reconnect window in lobby or draft. */
-  private armRecoveredGuestGrace(): void {
-    for (const seat of this.seatTokens.keys()) {
-      if (seat === 0 || this.disconnectedSeats.has(seat) || this.expiredDisconnectedSeats.has(seat)) continue;
-      const timer = setTimeout(() => {
-        this.runDetachedMutation("recovered reconnect grace expiry", () => this.expireReconnectGrace(seat));
-      }, 5 * 60_000);
-      this.disconnectedSeats.set(seat, { disconnectedAt: Date.now(), timer });
+  /**
+   * A recovered host is the first observer that knows its peers are gone. It
+   * persists that absolute deadline before serving recovery, so another host
+   * recovery cannot reset the grace clock. Snapshots from before this field
+   * existed fail closed rather than guessing how much grace remained.
+   */
+  private armRecoveredGuestGrace(reconnectDeadlines: Record<number, number> | undefined): boolean {
+    let changed = false;
+    const now = Date.now();
+    for (const seat of [...this.seatTokens.keys()]) {
+      if (seat === 0 || this.expiredDisconnectedSeats.has(seat)) continue;
+      if (reconnectDeadlines === undefined) {
+        if (this.draftStarted) {
+          this.expiredDisconnectedSeats.add(seat);
+        } else {
+          this.seatTokens.delete(seat);
+          this.seatNames.delete(seat);
+          this.perSeatWorkspaceSnapshots.delete(seat);
+        }
+        changed = true;
+        continue;
+      }
+
+      const deadlineAt = reconnectDeadlines[seat] ?? now + this.gracePeriodMs;
+      if (deadlineAt <= now) {
+        this.reconnectDeadlines.delete(seat);
+        if (this.draftStarted) {
+          this.expiredDisconnectedSeats.add(seat);
+        } else {
+          this.seatTokens.delete(seat);
+          this.seatNames.delete(seat);
+          this.perSeatWorkspaceSnapshots.delete(seat);
+        }
+        changed = true;
+        continue;
+      }
+
+      this.scheduleReconnectGrace(seat, deadlineAt);
+      if (reconnectDeadlines[seat] === undefined) changed = true;
     }
+    return changed;
+  }
+
+  /**
+   * Old snapshots selected the lowest numbered seat as the settlement
+   * authority, including bot seats. A bot cannot return a participant
+   * settlement, so repair only the active human-versus-bot binding after the
+   * restored engine view identifies its human participant. Completed and
+   * future-round bindings intentionally retain their historical capability.
+   */
+  private rotateLegacyBotMatchAuthorities(view: DraftPlayerView): boolean {
+    let changed = false;
+    for (const pairing of view.pairings ?? []) {
+      if (pairing.round !== view.current_round || pairing.status !== "InProgress") continue;
+
+      const seatAIsBot = this.isBotSeatFromView(view, pairing.seat_a);
+      const seatBIsBot = this.isBotSeatFromView(view, pairing.seat_b);
+      if (seatAIsBot === seatBIsBot) continue;
+
+      const binding = this.matchBindings.get(pairing.match_id);
+      if (!binding || binding.round !== pairing.round) continue;
+
+      const humanSeat = seatAIsBot ? pairing.seat_b : pairing.seat_a;
+      const botSeat = seatAIsBot ? pairing.seat_a : pairing.seat_b;
+      if (binding.matchAuthoritySeat !== botSeat) continue;
+
+      this.matchBindings.set(pairing.match_id, { ...binding, matchAuthoritySeat: humanSeat });
+      changed = true;
+    }
+    return changed;
   }
 
   /** Replays only write-ahead settlements that the restored draft still lacks. */
@@ -2740,6 +3064,7 @@ export class P2PDraftHost {
       if (timer !== null) clearTimeout(timer);
     }
     this.disconnectedSeats.clear();
+    this.reconnectDeadlines.clear();
     this.bo3State.clear();
     this.matchDecks.clear();
     this.matchLaunches.clear();
@@ -2755,7 +3080,13 @@ export class P2PDraftHost {
     // Fence queued non-terminal saves before awaiting guest notifications.
     this.persistenceClosed = true;
     for (const session of this.guestSessions.values()) {
-      await session.send({ type: "draft_host_left", reason: "Host left the draft" });
+      try {
+        await session.send({ type: "draft_host_left", reason: "Host left the draft" });
+      } catch (error) {
+        // A disconnected guest cannot prevent notification of the remaining
+        // guests or the terminal cleanup of the host's durable session.
+        console.warn("[P2PDraftHost] termination notification failed:", error);
+      }
     }
     await this.persistQueue;
     if (this.persistenceId) {
@@ -2792,6 +3123,7 @@ export class P2PDraftHost {
         connected: i === 0 || this.guestSessions.has(i),
         has_submitted_deck: false,
         pick_status: "NotDrafting",
+        active_pack_count: 0,
         face_up_draft_cards: [],
       });
     }
@@ -2810,6 +3142,7 @@ export class P2PDraftHost {
     return {
       status: "Lobby",
       kind: this.kind,
+      launch_capability: this.procedure.launch_capability,
       current_pack_number: 0,
       pick_number: 0,
       pass_direction: "Left",
@@ -2819,6 +3152,7 @@ export class P2PDraftHost {
       // placeholder that disagrees with the real view is the [G6] defect class
       // this run has already paid for once.
       required_pick_count: 0,
+      pick_selection_mode: this.procedure?.pick_selection_mode ?? "Direct",
       pool: [],
       draft_effects: [],
       pool_groups: EMPTY_DRAFT_POOL_GROUPS,

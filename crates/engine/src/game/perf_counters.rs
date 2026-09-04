@@ -46,6 +46,29 @@ pub struct PerfCounterSnapshot {
     pub sba_empty_battlefield_short_circuits: u64,
 }
 
+/// Test-only cache-use counters for the homogeneous target-selection walk.
+///
+/// Kept separate from [`PerfCounterSnapshot`], whose serialized field set powers
+/// the AI performance baseline rather than integration-test instrumentation.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomogeneousTargetWalkCacheCounters {
+    pub initializations: u64,
+    pub advances: u64,
+}
+
+/// Test-only counters for the prior-target-binding seams (cross-slot
+/// object-relative target binding, e.g. Puca's Mischief / Spawnbroker /
+/// Daring Thief). Kept out of [`PerfCounterSnapshot`] for the same reason the
+/// homogeneous-walk counters are: that struct's serialized field set powers
+/// the AI performance baseline.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PriorTargetBindingCounters {
+    pub static_union_enumerations: u64,
+    pub selection_bindings: u64,
+}
+
 thread_local! {
     /// Per-thread (NOT process-global) so parallel `cargo test` runs do not
     /// cross-pollute counters between a test's `reset()` and `snapshot()`.
@@ -102,6 +125,20 @@ thread_local! {
         sba_battlefield_snapshot_builds: 0,
         sba_empty_battlefield_short_circuits: 0,
     }) };
+    #[cfg(feature = "test-support")]
+    static HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS: Cell<HomogeneousTargetWalkCacheCounters> = const {
+        Cell::new(HomogeneousTargetWalkCacheCounters {
+            initializations: 0,
+            advances: 0,
+        })
+    };
+    #[cfg(feature = "test-support")]
+    static PRIOR_TARGET_BINDING_COUNTERS: Cell<PriorTargetBindingCounters> = const {
+        Cell::new(PriorTargetBindingCounters {
+            static_union_enumerations: 0,
+            selection_bindings: 0,
+        })
+    };
     static LEGALITY_CLONE_PHASE: Cell<Option<LegalityClonePhase>> = const { Cell::new(None) };
 }
 
@@ -141,6 +178,47 @@ fn with_mut(f: impl FnOnce(&mut PerfCounterSnapshot)) {
 
 pub fn record_state_clone_for_legality() {
     with_mut(|s| s.state_clone_for_legality += 1);
+}
+
+#[cfg(feature = "test-support")]
+pub fn record_homogeneous_target_walk_cache_initialization() {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.initializations += 1;
+        cell.set(counters);
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub fn record_homogeneous_target_walk_cache_advance() {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.advances += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2c + CR 603.3d: recorded once per candidate of the prior object slot
+/// unioned at static slot-build time (`union_over_prior_object_candidates`).
+#[cfg(feature = "test-support")]
+pub fn record_prior_target_binding_static_union_enumeration() {
+    PRIOR_TARGET_BINDING_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.static_union_enumerations += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2c + CR 603.3d: recorded once per selection-time bind
+/// (`bind_prior_object_targets` returning `Some`) inside
+/// `legal_targets_for_selected_slot`.
+#[cfg(feature = "test-support")]
+pub fn record_prior_target_binding_selection() {
+    PRIOR_TARGET_BINDING_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.selection_bindings += 1;
+        cell.set(counters);
+    });
 }
 
 fn record_phase_owned_state_clone_for(
@@ -364,6 +442,27 @@ pub fn snapshot() -> PerfCounterSnapshot {
     COUNTERS.with(|c| c.get())
 }
 
+#[cfg(feature = "test-support")]
+pub fn homogeneous_target_walk_cache_snapshot() -> HomogeneousTargetWalkCacheCounters {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(Cell::get)
+}
+
+#[cfg(feature = "test-support")]
+pub fn prior_target_binding_snapshot() -> PriorTargetBindingCounters {
+    PRIOR_TARGET_BINDING_COUNTERS.with(Cell::get)
+}
+
+#[cfg(feature = "test-support")]
+pub fn reset_prior_target_binding_counters() {
+    PRIOR_TARGET_BINDING_COUNTERS
+        .with(|counters| counters.set(PriorTargetBindingCounters::default()));
+}
+
 pub fn reset() {
     COUNTERS.with(|c| c.set(PerfCounterSnapshot::default()));
+    #[cfg(feature = "test-support")]
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS
+        .with(|counters| counters.set(HomogeneousTargetWalkCacheCounters::default()));
+    #[cfg(feature = "test-support")]
+    reset_prior_target_binding_counters();
 }

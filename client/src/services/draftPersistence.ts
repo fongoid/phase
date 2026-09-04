@@ -47,6 +47,9 @@ export interface PersistedDraftHostSession {
   seatNames: Record<number, string>;
   /** Tokens that were kicked — refused on reconnect. */
   kickedTokens: string[];
+  /** Absolute reconnect deadline by seat. An absent field is legacy and cannot
+   * safely establish a new recovery window. */
+  reconnectDeadlines?: Record<number, number>;
   /** Seats whose reconnect grace elapsed while this host owned the pod. */
   expiredDisconnectedSeats?: number[];
   /** Whether StartDraft has been applied. */
@@ -143,6 +146,20 @@ export interface ActiveDraftGuestMeta {
   hostPeerId: string;
   timestamp: number;
 }
+
+/** Stable identity of a guest recovery locator read from local storage. */
+export interface ActiveDraftGuestMetaCapture {
+  roomCode: string;
+  displayName: string;
+  hostPeerId: string;
+  timestamp: number;
+}
+
+/** Non-mutating classification for guest recovery callers. */
+export type ActiveDraftGuestLoadResult =
+  | { type: "absent" }
+  | { type: "invalid"; capture: ActiveDraftGuestMetaCapture | null }
+  | { type: "present"; meta: ActiveDraftGuestMeta; capture: ActiveDraftGuestMetaCapture };
 
 export type ActiveDraftPodPhase =
   | "lobby"
@@ -319,19 +336,56 @@ export function saveActiveDraftGuest(meta: Omit<ActiveDraftGuestMeta, "timestamp
   }));
 }
 
-export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+function activeDraftGuestCapture(value: unknown): ActiveDraftGuestMetaCapture | null {
+  if (!isActiveDraftGuestMeta(value)) return null;
+  return {
+    roomCode: value.roomCode,
+    displayName: value.displayName,
+    hostPeerId: value.hostPeerId,
+    timestamp: value.timestamp,
+  };
+}
+
+/** Inspects the guest recovery locator without removing malformed or expired data. */
+export function inspectActiveDraftGuest(): ActiveDraftGuestLoadResult {
   try {
     const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
-    if (!raw) return null;
+    if (!raw) return { type: "absent" };
     const value: unknown = JSON.parse(raw);
-    if (!isActiveDraftGuestMeta(value) || Date.now() - value.timestamp > GUEST_SESSION_TTL_MS) {
-      clearActiveDraftGuest();
-      return null;
+    if (!isActiveDraftGuestMeta(value)) return { type: "invalid", capture: null };
+    const capture = activeDraftGuestCapture(value);
+    if (!capture || Date.now() - capture.timestamp > GUEST_SESSION_TTL_MS) {
+      return { type: "invalid", capture };
     }
-    return value;
+    return { type: "present", meta: value, capture };
   } catch {
-    clearActiveDraftGuest();
-    return null;
+    return { type: "invalid", capture: null };
+  }
+}
+
+export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+  const active = inspectActiveDraftGuest();
+  if (active.type === "present") return active.meta;
+  if (active.type === "invalid") clearActiveDraftGuest();
+  return null;
+}
+
+/** Clears guest metadata only when it still matches a previously inspected locator. */
+export function clearActiveDraftGuestIfCurrent(capture: ActiveDraftGuestMetaCapture): void {
+  try {
+    const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
+    if (!raw) return;
+    const currentCapture = activeDraftGuestCapture(JSON.parse(raw));
+    if (
+      currentCapture?.roomCode === capture.roomCode
+      && currentCapture.displayName === capture.displayName
+      && currentCapture.hostPeerId === capture.hostPeerId
+      && currentCapture.timestamp === capture.timestamp
+    ) {
+      clearActiveDraftGuest();
+    }
+  } catch {
+    // A malformed replacement is not evidence that this caller owns it.
   }
 }
 
@@ -432,6 +486,7 @@ function isPersistedDraftHostSession(value: unknown): value is PersistedDraftHos
     isSeatStringRecord(value.seatTokens) &&
     isSeatStringRecord(value.seatNames) &&
     Array.isArray(value.kickedTokens) && value.kickedTokens.every((token) => typeof token === "string") &&
+    (value.reconnectDeadlines === undefined || isSeatDeadlineRecord(value.reconnectDeadlines)) &&
     (value.expiredDisconnectedSeats === undefined ||
       (Array.isArray(value.expiredDisconnectedSeats) && value.expiredDisconnectedSeats.every(isNonnegativeInteger))) &&
     typeof value.draftStarted === "boolean" &&
@@ -467,6 +522,15 @@ function isPoolInput(value: unknown): value is PoolInput {
     // resumes instead of having its snapshot discarded as corrupt.
     if (isSetPackSequence(value.data)) return true;
     return typeof value.data.set_pool_json === "string" && isJsonRecord(value.data.set_pool_json);
+  }
+  if (value.type === "Chaos") {
+    return (
+      Array.isArray(value.data.pools) &&
+      value.data.pools.every(isRecord) &&
+      Array.isArray(value.data.candidate_codes) &&
+      value.data.candidate_codes.length > 0 &&
+      value.data.candidate_codes.every(isNonEmptyString)
+    );
   }
   if (value.type !== "Cube") return false;
   const settings = value.data.cube_draft_settings;
@@ -505,6 +569,12 @@ function isSetPackSequence(data: Record<string, unknown>): boolean {
 
 function isSeatStringRecord(value: unknown): value is Record<number, string> {
   return isRecord(value) && Object.entries(value).every(([seat, token]) => isPositiveSeat(seat) && typeof token === "string");
+}
+
+function isSeatDeadlineRecord(value: unknown): value is Record<number, number> {
+  return isRecord(value) && Object.entries(value).every(
+    ([seat, deadline]) => isPositiveSeat(seat) && isPositiveFiniteNumber(deadline),
+  );
 }
 
 function isPositiveSeat(value: string): boolean {

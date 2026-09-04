@@ -22,12 +22,13 @@ use crate::types::ability::{
     CountScope, CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode,
     Duration, EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction, ObjectProperty,
-    ObjectScope, ParsedCondition, PerpetualModification, PlayerFilter, PlayerRelation, PlayerScope,
-    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation,
-    SpeedDelta, SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement,
-    StackAbilityKind, StaticCondition, StaticDefinition, TapStateChange, TargetFilter,
-    TriggerDefinition, TypeFilter, TypedFilter, VoteSubject, ZoneRef,
+    ObjectScope, ObjectSelectionCardinality, ObjectSelectionEligibility, ParsedCondition,
+    PerpetualModification, PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue,
+    PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
+    ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation, SpeedDelta,
+    SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement, StackAbilityKind,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter,
+    TypedFilter, VoteSubject, ZoneRef,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -599,7 +600,7 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::TriggeringSourceController => "triggering source's controller".into(),
         TargetFilter::TriggeringPlayer => "triggering player".into(),
         TargetFilter::TriggeringSource => "triggering source".into(),
-        TargetFilter::EventTarget => "damaged object of the triggering event".into(),
+        TargetFilter::EventTarget => "object targeted by the triggering event".into(),
         TargetFilter::DefendingPlayer => "defending player".into(),
         TargetFilter::ParentTarget => "parent target".into(),
         TargetFilter::ParentTargetSlot { index } => format!("parent target slot {index}"),
@@ -1226,6 +1227,8 @@ fn fmt_duration(d: &Duration) -> String {
             format!("until end of next turn ({})", fmt_player_scope(player))
         }
         Duration::UntilHostLeavesPlay => "while on battlefield".to_string(),
+        Duration::WhileHostOnBattlefield => "while it remains on the battlefield".to_string(),
+        Duration::WhileControllingHost => "while its controller controls the source".to_string(),
         Duration::UntilSourceExilesAnotherCard => "until source exiles another card".to_string(),
         Duration::UntilOpponentBecomesMonarch => {
             "until an opponent becomes the monarch".to_string()
@@ -2379,6 +2382,7 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
                     ThisWayCause::Sacrificed => "sacrificed",
                     ThisWayCause::Returned => "returned",
                     ThisWayCause::Bounced => "bounced",
+                    ThisWayCause::PutIntoGraveyard => "put into a graveyard",
                 };
                 format!("cards {verb} this way")
             }
@@ -3358,7 +3362,11 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             zones,
             graveyard_replacement,
         } => {
-            d.push(("count".into(), count.to_string()));
+            // `None` is the unbounded "any number of spells" form.
+            d.push((
+                "count".into(),
+                count.map_or_else(|| "any".to_string(), |n| n.to_string()),
+            ));
             if let Some(mv) = max_total_mv {
                 d.push(("total mana value".into(), mv.to_string()));
             }
@@ -3570,6 +3578,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             filter,
             min,
             max,
+            cardinality,
+            eligibility,
         } => {
             d.push(("chooser".into(), fmt_target(chooser)));
             d.push(("filter".into(), fmt_target(filter)));
@@ -3578,6 +3588,19 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 "max".into(),
                 max.map_or_else(|| "any".to_string(), |m| m.to_string()),
             ));
+            if let Some(ObjectSelectionCardinality::Exactly { count }) = cardinality {
+                d.push(("cardinality".into(), format!("exactly {count}")));
+            }
+            if let Some(ObjectSelectionEligibility::RemovableCounter { counter_type }) = eligibility
+            {
+                d.push((
+                    "eligibility".into(),
+                    counter_type.as_ref().map_or_else(
+                        || "removable counter".to_string(),
+                        |counter_type| format!("removable {} counter", counter_type.as_str()),
+                    ),
+                ));
+            }
         }
         Effect::ChooseCounterKind { target } => {
             d.push(("target".into(), fmt_target(target)));
@@ -3724,9 +3747,14 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("target".into(), fmt_target(target)));
             d.push(("chooser".into(), fmt_target(chooser)));
         }
-        Effect::Amass { subtype, count } => {
+        Effect::Amass {
+            subtype,
+            count,
+            player,
+        } => {
             d.push(("subtype".into(), subtype.clone()));
             d.push(("count".into(), fmt_quantity(count)));
+            d.push(("player".into(), fmt_target(player)));
         }
         Effect::Monstrosity { count } => {
             d.push(("counters".into(), fmt_quantity(count)));
@@ -6419,7 +6447,14 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
 }
 
 fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
-    matches!(def.condition, Some(StaticCondition::Unrecognized { .. }))
+    // Coverage-tooling detail (not a game rule): recurse through And/Or/Not —
+    // a parser fallback that wraps an unparsed `unless` clause as
+    // `Not(Unrecognized)` is a top-level `Not`, not a top-level `Unrecognized`,
+    // and must still be flagged (`contains_unrecognized` is the single
+    // authority; see its doc comment in `types/ability.rs`).
+    def.condition
+        .as_ref()
+        .is_some_and(StaticCondition::contains_unrecognized)
         || def
             .modifications
             .iter()
@@ -6514,10 +6549,16 @@ fn check_statics(
         }
         // Flag unrecognized conditions — these represent parser gaps where
         // the condition text wasn't decomposed into typed building blocks.
-        if let Some(StaticCondition::Unrecognized { ref text }) = def.condition {
-            let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
-            if !missing.contains(&label) {
-                missing.push(label);
+        // Recurse through And/Or/Not (`contains_unrecognized`/`unrecognized_texts`)
+        // so a nested `Not(Unrecognized)` fallback (e.g. an unbindable
+        // recipient-scoped `unless` gate) is labeled instead of silently
+        // passing as supported.
+        if let Some(condition) = &def.condition {
+            for text in condition.unrecognized_texts() {
+                let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
             }
         }
         for modification in &def.modifications {
@@ -7793,7 +7834,10 @@ fn is_static_supported(
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
 ) -> bool {
     (static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode))
-        && !matches!(stat.condition, Some(StaticCondition::Unrecognized { .. }))
+        && !stat
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized)
         && stat
             .modifications
             .iter()
@@ -8383,6 +8427,9 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::Target => ("TargetObjectColorCount", Handled),
             ObjectScope::Recipient => ("RecipientObjectColorCount", Handled),
             ObjectScope::EventSource => ("EventSourceObjectColorCount", Handled),
+            // EventTarget is a generic object participant of the trigger event
+            // (damage recipient or BecomesTarget object), resolved by the shared
+            // event-target extractor rather than a damage-only special case.
             ObjectScope::EventTarget => ("EventTargetObjectColorCount", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectColorCount", Handled),
             ObjectScope::OtherRevealedCard => ("OtherRevealedCardColorCount", Handled),
@@ -11756,6 +11803,192 @@ mod tests {
         }
     }
 
+    /// Regression for PR #8012 (Bombur, Gentle Dreamer) — maintainer review
+    /// rounds 2 and 3: `extract_cant_untap_condition` falls back to
+    /// `Not(Unrecognized{..})` for a recipient-scoped `unless` tail with no
+    /// runtime binding authority (see
+    /// `oracle_static::tests::static_cant_untap_unless_recipient_scoped_designation_is_unrecognized`
+    /// for the AST-shape proof). That prior test only proves the SHAPE is
+    /// produced — it says nothing about whether coverage honors it. This test
+    /// closes that gap: it feeds the exact nested shape into the actual
+    /// coverage entry points and asserts the card is reported unsupported.
+    ///
+    /// Before the fix, all three of `static_has_unimplemented_parts`,
+    /// `check_statics`, and `is_static_supported` matched ONLY a top-level
+    /// `StaticCondition::Unrecognized`, so this `Not(Unrecognized)` shape
+    /// silently passed as fully supported (a false green) even though the
+    /// restriction is permanently inert at runtime — `Unrecognized` evaluates
+    /// `true`, and the wrapping `Not` negates it to `false` forever, so the
+    /// CantUntap gate can never actually apply. `StaticCondition::
+    /// contains_unrecognized` / `unrecognized_texts` (`types/ability.rs`) are
+    /// now the single recursive authority both `card_face_has_unimplemented_parts`
+    /// and `card_face_gaps` delegate to, so a nested `Unrecognized` at ANY
+    /// depth under `Not`/`And`/`Or` is caught, not just this one call site.
+    #[test]
+    fn cant_untap_with_nested_unrecognized_condition_is_not_fully_supported() {
+        let def = StaticDefinition::new(StaticMode::CantUntap).condition(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "that player is the monarch".to_string(),
+            }),
+        });
+        let face = CardFace {
+            name: "Test Recipient-Scoped Untap Gate".to_string(),
+            static_abilities: vec![def],
+            ..Default::default()
+        };
+
+        assert!(
+            super::card_face_has_unimplemented_parts(&face),
+            "a CantUntap static whose condition is Not(Unrecognized) must be \
+             flagged as having unimplemented parts, not reported as fully \
+             parsed/supported"
+        );
+
+        let gaps = super::card_face_gaps(&face);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("Unrecognized")),
+            "card_face_gaps must surface the nested unrecognized clause as a \
+             parse-gap label so coverage tooling sees the honest gap instead \
+             of silence, got {gaps:?}"
+        );
+    }
+
+    /// Regression for PR #8012 (Bombur, Gentle Dreamer) — maintainer review
+    /// round 5, the card-face coverage half of the payment-continuation
+    /// blocker.
+    ///
+    /// CR 118.12a "unless [a player] pays [cost]" is an optional cost; the
+    /// engine offers that choice only at attack/block declaration
+    /// (`WaitingFor::CombatTaxPayment`). CR 502.3 untapping is a turn-based
+    /// action with no payment prompt, so a `CantUntap` gated on `UnlessPay`
+    /// could never be satisfied — `game::layers::evaluate_condition` hard-codes
+    /// it to `false`. The parser now refuses to attach it and emits the honest
+    /// `Not(Unrecognized)` gap shape instead (see
+    /// `oracle_static::tests::static_cant_untap_unless_payment_condition_is_unrecognized`
+    /// for the AST proof).
+    ///
+    /// This test is the OUTCOME half: it drives that shape through the real
+    /// card-face coverage entry points and asserts the card is reported
+    /// unsupported with a labelled gap, so the condition is visibly deferred
+    /// rather than silently accepted. Paired with the nested-`Unrecognized`
+    /// test above, it covers both unsupported-condition classes the untap-step
+    /// gate rejects (unbindable designation anchor, absent continuation).
+    #[test]
+    fn cant_untap_with_payment_gated_condition_is_not_fully_supported() {
+        let def = StaticDefinition::new(StaticMode::CantUntap).condition(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "you pay {2}".to_string(),
+            }),
+        });
+        let face = CardFace {
+            name: "Test Payment-Gated Untap Restriction".to_string(),
+            static_abilities: vec![def],
+            ..Default::default()
+        };
+
+        assert!(
+            super::card_face_has_unimplemented_parts(&face),
+            "a CantUntap gated on a payment the untap step can never prompt for              must be flagged as having unimplemented parts, not reported as              fully parsed/supported"
+        );
+
+        let gaps = super::card_face_gaps(&face);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("you pay {2}")),
+            "card_face_gaps must name the deferred payment clause so the gap is              actionable in coverage tooling, got {gaps:?}"
+        );
+    }
+
+    /// The same outcome check for the two PRINTED cards a follow-up audit of PR
+    /// #8012 found carrying the identical defect on non-`CantUntap` modes.
+    ///
+    /// CR 118.12a / CR 509.1c: the payment prompt
+    /// (`WaitingFor::CombatTaxPayment`) exists only for `CantAttack` /
+    /// `CantBlock` / `CantAttackOrBlock` (`combat::combat_tax_mode_matches`).
+    /// Awesome Presence lowers to `CantBeBlocked` and Hipparion to
+    /// `BlockRestriction`, so neither gate can ever be satisfied and both were
+    /// being reported as fully supported. Driving the real Oracle lines through
+    /// the parser and then the card-face coverage entry points is the end-to-end
+    /// half: the AST proofs live in
+    /// `oracle_static::tests::awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt`
+    /// and `object_composes_with_a_trailing_unless_condition`.
+    #[test]
+    fn block_side_payment_gated_statics_are_not_fully_supported() {
+        for (name, line, gap_needle) in [
+            (
+                "Awesome Presence",
+                "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.",
+                "defending player pays {3}",
+            ),
+            (
+                "Hipparion",
+                "~ can't block creatures with power 3 or greater unless you pay {1}.",
+                "you pay {1}",
+            ),
+        ] {
+            let def = crate::parser::oracle_static::parse_static_line(line)
+                .unwrap_or_else(|| panic!("{name} should still parse to a static"));
+            let face = CardFace {
+                name: name.to_string(),
+                static_abilities: vec![def],
+                ..Default::default()
+            };
+
+            assert!(
+                super::card_face_has_unimplemented_parts(&face),
+                "{name}: a payment gate on a mode with no combat-tax prompt must be \
+                 flagged as having unimplemented parts, not reported as fully supported"
+            );
+
+            let gaps = super::card_face_gaps(&face);
+            assert!(
+                gaps.iter().any(|gap| gap.contains(gap_needle)),
+                "{name}: card_face_gaps must name the deferred payment clause so the \
+                 gap is actionable in coverage tooling, got {gaps:?}"
+            );
+        }
+    }
+
+    /// The same end-to-end check for the POSITIVE-tail route the maintainer
+    /// review of this PR found still bypassing the acceptance authority:
+    /// `grammar::parse_enchanted_equipped_predicate`'s `"as long as"`
+    /// conditional continuous grant.
+    ///
+    /// CR 118.12a + CR 613: `oracle_nom::condition::parse_unless_pay_condition`
+    /// accepts a bare `"you pay {N}"` with no `"unless"` prefix, so an
+    /// `"as long as"` tail can carry a payment gate onto a
+    /// `StaticMode::Continuous` — a mode whose enforcement point is the layer
+    /// pipeline, which offers no payment round-trip. Coverage reported such a
+    /// grant fully supported. The AST proof is
+    /// `oracle_static::tests::attached_conditional_grant_payment_gate_is_deferred_not_accepted`;
+    /// this is the half that pins what `coverage-report` actually consumes.
+    ///
+    /// No printed card matches this shape today — which is exactly why it needs
+    /// a regression test rather than a corpus entry: the route is live, so the
+    /// first card printed into it must not be silently green.
+    #[test]
+    fn attached_conditional_grant_payment_gate_is_not_fully_supported() {
+        let line = "Enchanted creature gets +2/+2 as long as you pay {1}.";
+        let def = crate::parser::oracle_static::parse_static_line(line)
+            .expect("the conditional attached grant should still parse to a static");
+        let face = CardFace {
+            name: "Conditional Grant Probe".to_string(),
+            static_abilities: vec![def],
+            ..Default::default()
+        };
+
+        assert!(
+            super::card_face_has_unimplemented_parts(&face),
+            "a payment gate on a Continuous grant has no enforcement point anywhere \
+             in the engine and must not be reported as fully supported"
+        );
+
+        let gaps = super::card_face_gaps(&face);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("you pay {1}")),
+            "card_face_gaps must name the deferred payment clause, got {gaps:?}"
+        );
+    }
+
     /// CR 113.3b / CR 113.3c + CR 109.4: the ability-kind and controller axes
     /// are independent, so `fmt_target` must render BOTH. Enumerated per-product
     /// arms could not: the trailing kind-only catch-all swallowed
@@ -11971,6 +12204,60 @@ mod tests {
             labels.len(),
             8,
             "every AttackTargetFilter variant must map to a distinct label: {labels:?}"
+        );
+    }
+
+    /// Exact cardinality and counter-removal eligibility are semantic parser
+    /// axes. Defaults deliberately render nothing, preserving existing
+    /// signatures, while non-default selections remain distinguishable.
+    #[test]
+    fn object_selection_cardinality_and_eligibility_reach_parse_details() {
+        let selection = |cardinality, eligibility| Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            min: 0,
+            max: None,
+            cardinality,
+            eligibility,
+        };
+        let default = effect_details(&selection(None, None));
+        assert!(
+            !default
+                .iter()
+                .any(|(key, _)| key == "cardinality" || key == "eligibility"),
+            "the legacy selection shape must not gain signature keys"
+        );
+
+        let exact = effect_details(&selection(
+            Some(ObjectSelectionCardinality::Exactly { count: 2 }),
+            None,
+        ));
+        assert!(
+            exact
+                .iter()
+                .any(|(key, value)| key == "cardinality" && value == "exactly 2"),
+            "an exact selection cardinality must be visible to parse coverage: {exact:?}"
+        );
+        assert_ne!(
+            default, exact,
+            "exact and legacy selections must not collapse"
+        );
+
+        let removable = effect_details(&selection(
+            Some(ObjectSelectionCardinality::Exactly { count: 2 }),
+            Some(ObjectSelectionEligibility::RemovableCounter {
+                counter_type: Some(CounterType::Plus1Plus1),
+            }),
+        ));
+        assert!(
+            removable
+                .iter()
+                .any(|(key, value)| { key == "eligibility" && value == "removable P1P1 counter" }),
+            "counter-removal eligibility must be visible to parse coverage: {removable:?}"
+        );
+        assert_ne!(
+            exact, removable,
+            "counter-eligible and unconstrained exact selections must not collapse"
         );
     }
 
@@ -16320,6 +16607,46 @@ mod tests {
         assert!(
             is_static_supported(&supported, &trigger_registry, &static_registry),
             "a plain keyword-grant continuous static must be supported"
+        );
+    }
+
+    /// Regression for PR #8012 (Bombur, Gentle Dreamer) — maintainer review
+    /// round 3, which cited this exact `is_static_supported` gate
+    /// (`coverage.rs:7794-7816` as of that review): a recipient-scoped
+    /// `unless` tail with no runtime binding authority falls back to
+    /// `Not(Unrecognized{..})`, a NESTED unrecognized leaf. Before the fix,
+    /// `is_static_supported` matched only a TOP-LEVEL
+    /// `StaticCondition::Unrecognized`, so this shape was reported supported
+    /// even though the wrapping `Not` permanently negates the (always-true)
+    /// `Unrecognized` leaf, making the CantUntap restriction inert forever.
+    #[test]
+    fn cant_untap_nested_unrecognized_condition_is_unsupported_static() {
+        let trigger_registry = build_trigger_registry();
+        let static_registry = build_static_registry();
+
+        let def = StaticDefinition::new(StaticMode::CantUntap).condition(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "that player is the monarch".to_string(),
+            }),
+        });
+
+        assert!(
+            !is_static_supported(&def, &trigger_registry, &static_registry),
+            "a CantUntap static gated on Not(Unrecognized) must be reported \
+             unsupported, not silently accepted as fully parsed"
+        );
+
+        // Sanity: the ordinary controller-scoped Bombur shape (Not(HasEnduringStory),
+        // no Unrecognized anywhere in the tree) remains supported — proving the
+        // gap signal comes from the nested Unrecognized leaf, not from CantUntap
+        // or the Not wrapper themselves.
+        let supported =
+            StaticDefinition::new(StaticMode::CantUntap).condition(StaticCondition::Not {
+                condition: Box::new(StaticCondition::HasEnduringStory),
+            });
+        assert!(
+            is_static_supported(&supported, &trigger_registry, &static_registry),
+            "Not(HasEnduringStory) must remain supported"
         );
     }
 
