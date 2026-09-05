@@ -1,5 +1,5 @@
 //! Runtime coverage for the LIFETIME of `ChosenAttribute::Color` on one source
-//! (CR 607.2d + CR 400.7 + CR 608.2d + CR 608.2h + CR 611.2d + CR 611.3a).
+//! (CR 607.2d + CR 400.7 + CR 608.2d + CR 608.2h + CR 611.3a).
 //!
 //! Two seams, one file, because they only make sense together:
 //!
@@ -21,7 +21,7 @@
 //! * **U1 — the resolution-time latch.** A resolution-generated continuous
 //!   effect (`effects/effect.rs::snapshot_transient_modifications`) now
 //!   latches its granting source's chosen colour into the `AddKeyword`
-//!   payload ONCE, when the effect is applied (CR 608.2h + CR 611.2d), so
+//!   payload ONCE, when the effect is applied (CR 608.2h), so
 //!   TWO SIMULTANEOUSLY LIVE grants from the same source each keep their own
 //!   colour instead of both re-reading whichever answer is CURRENT at layer-
 //!   apply time. CR 611.3a scopes this deliberately: a printed STATIC
@@ -247,7 +247,7 @@ fn drain_named_choices(runner: &mut engine::game::scenario::GameRunner, choice: 
 // T1 — TWO SIMULTANEOUSLY LIVE grants from the SAME source.
 // ---------------------------------------------------------------------------
 
-/// T1 (RUNTIME) — CR 608.2h + CR 611.2d. TWO SIMULTANEOUSLY LIVE grants from
+/// T1 (RUNTIME) — CR 608.2h. TWO SIMULTANEOUSLY LIVE grants from
 /// the SAME source each keep their OWN colour.
 ///
 /// The sibling test below, `knight_of_dawn_second_activation_uses_its_own_color`,

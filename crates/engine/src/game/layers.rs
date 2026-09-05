@@ -8059,7 +8059,7 @@ fn apply_continuous_effect_filtered(
     // (which has no chosen-color attribute of its own).
     //
     // A resolution-generated `AddKeyword { Protection | HexproofFrom(ChosenColor) }`
-    // effect (CR 608.2h + CR 611.2d) now arrives here PRE-BAKED to a concrete
+    // effect (CR 608.2h) now arrives here PRE-BAKED to a concrete
     // `Color(c)` by `effects/effect.rs::snapshot_transient_modifications` — that
     // latch fires once, at resolution, and is why a later choice by the same
     // source can no longer retroactively change a grant already in flight. This

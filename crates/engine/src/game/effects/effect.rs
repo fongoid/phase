@@ -993,7 +993,7 @@ fn snapshot_transient_modifications(
                     ),
                 }
             }
-            // CR 608.2h (@2810) + CR 611.2d (@2917): the granted "protection/hexproof from
+            // CR 608.2h (@2810): the granted "protection/hexproof from
             // the [chosen] color" requires information from a specific object — the
             // granting source's chosen colour — and CR 608.2h fixes that answer ONCE, when
             // the effect is applied. Latch it into the payload here so the recipient's

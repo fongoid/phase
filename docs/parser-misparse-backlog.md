@@ -5209,7 +5209,7 @@ are the same family of missing "…of your choice" aliases, on the card-type and
 prevention routes respectively rather than the protection/hexproof route this
 entry otherwise covers.
 
-**F10 — CLOSED. CR 608.2h + CR 611.2d per-grant colour latching.** Two
+**F10 — CLOSED. CR 608.2h per-grant colour latching.** Two
 continuous grants created by two activations of the SAME source that are
 simultaneously live used to both bake from the source's CURRENT chosen colour
 at layer-apply time (`crates/engine/src/game/layers.rs`'s `chosen_color`
@@ -5221,9 +5221,11 @@ activation in one turn.
 Fixed by latching the colour into the `ContinuousModification::AddKeyword`
 payload at resolution time
 (`crates/engine/src/game/effects/effect.rs::snapshot_transient_modifications`),
-CR 608.2h's "the answer is determined only once, when the effect is applied"
-plus CR 611.2d, scoped by CR 611.3a so a printed STATIC ability's grant (which
-is never "locked in") keeps reading live. Regressed by
+CR 608.2h's "the answer is determined only once, when the effect is applied",
+scoped by CR 611.3a so a printed STATIC ability's grant (which is never
+"locked in") keeps reading live. (CR 611.2d was cited here in an earlier
+revision and is wrong for this: its body covers "a variable such as X" and
+defers to 608.2h, so it does not describe latching a chosen colour.) Regressed by
 `knight_of_dawn_two_live_grants_keep_their_own_colors` (T1),
 `armored_guardian_two_recipients_keep_their_own_colors` (T2), and
 `armored_guardian_grants_gate_aura_attachment_per_grant_color` (T3) in
