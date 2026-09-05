@@ -59084,6 +59084,7 @@ fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
         | Effect::FlipPermanent { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
