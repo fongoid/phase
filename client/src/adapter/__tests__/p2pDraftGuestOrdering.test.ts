@@ -15,6 +15,7 @@ vi.mock("../../services/draftPersistence", () => persistence);
 
 import { EMPTY_DRAFT_POOL_GROUPS, type DraftPlayerView } from "../draft-adapter";
 import { P2PDraftGuest, type DraftGuestConnection, type DraftGuestEvent } from "../p2p-draft-guest";
+import { PEER_CONNECT_OPTIONS } from "../../network/connection";
 import { DRAFT_PROTOCOL_VERSION, decodeDraftWireMessage, type DraftP2PMessage } from "../../network/draftProtocol";
 import * as protocol from "../../network/draftProtocol";
 import { FakeDraftDataConnection } from "../../network/__tests__/fakeDraftDataConnection";
@@ -39,6 +40,7 @@ function view(pickNumber: number): DraftPlayerView {
     status: "Drafting",
     kind: "Premier",
     launch_capability: "None",
+    commanders_required: 0,
     current_pack_number: 0,
     pick_number: pickNumber,
     pass_direction: "Left",
@@ -506,7 +508,7 @@ describe("P2P draft guest receive ordering", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     conn.simulateClose();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(connect).toHaveBeenCalledExactlyOnceWith("phase2-ABCDE");
+    expect(connect).toHaveBeenCalledExactlyOnceWith("phase2-ABCDE", PEER_CONNECT_OPTIONS);
     middleConn.simulateOpen();
     await vi.advanceTimersByTimeAsync(0);
     expect(middleConn.sentRaw).toHaveLength(1);
@@ -524,7 +526,7 @@ describe("P2P draft guest receive ordering", () => {
     middleConn.simulateClose();
     await vi.advanceTimersByTimeAsync(1000);
     expect(connect).toHaveBeenCalledTimes(2);
-    expect(connect).toHaveBeenNthCalledWith(2, "phase2-ABCDE");
+    expect(connect).toHaveBeenNthCalledWith(2, "phase2-ABCDE", PEER_CONNECT_OPTIONS);
     newestConn.simulateOpen();
     await vi.advanceTimersByTimeAsync(0);
     expect(newestConn.sentRaw).toHaveLength(1);

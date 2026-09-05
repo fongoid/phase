@@ -2068,7 +2068,7 @@ pub struct ResolveAllConsentRun {
     /// live-authority check accepts them as a SUBSET of the current priority
     /// participants; a `Shared` run is a table-wide proposal and must still
     /// match the live set exactly, or a seat that became a participant after
-    /// the snapshot would be bound by a consent it never gave (CR 117.4).
+    /// the snapshot would be bound by a consent it never gave (CR 117.3d).
     /// Defaults to `Own` so a save written before this field existed cannot
     /// silently acquire table-wide authority.
     #[serde(default)]
@@ -11962,6 +11962,20 @@ pub struct ResolutionOptionalPaymentOption {
     pub cost: AbilityCost,
 }
 
+/// Why a controller is selecting an opponent for a zone choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneOpponentChooserPurpose {
+    #[default]
+    Ordinary,
+    BindReciprocalConsume,
+}
+
+impl ZoneOpponentChooserPurpose {
+    fn is_ordinary(&self) -> bool {
+        matches!(self, Self::Ordinary)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WaitingFor {
@@ -12545,6 +12559,10 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
         source_id: ObjectId,
+        /// Reciprocal producer/consumer role carried across the interactive
+        /// pause. Omitted for ordinary zone choices.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reciprocal_role: Option<crate::types::ability::ReciprocalZoneChoiceRole>,
     },
     /// CR 701.4a: Behold a [quality] — the resolving player chooses which
     /// beholdable object to reveal-or-choose from a MIXED-ZONE candidate set
@@ -13556,6 +13574,11 @@ pub enum WaitingFor {
         player: PlayerId,
         candidates: Vec<PlayerId>,
         ability: Box<crate::types::ability::ResolvedAbility>,
+        #[serde(
+            default,
+            skip_serializing_if = "ZoneOpponentChooserPurpose::is_ordinary"
+        )]
+        purpose: ZoneOpponentChooserPurpose,
     },
     /// CR 601.2c + CR 115.1: A spell with an "of an opponent's choice" target slot
     /// is being cast in a multiplayer game; the controller (`player`) chooses
@@ -33621,6 +33644,7 @@ mod tests {
             up_to: false,
             constraint: None,
             source_id: ObjectId(100),
+            reciprocal_role: None,
         }));
         variants.push(Box::new(WaitingFor::ChooseOneOfBranch {
             player: PlayerId(0),
@@ -36623,8 +36647,8 @@ mod tests {
     ///   head-only shape `evaluate_schedule` uses to RESOLVE, and therefore the plausible
     ///   wrong reading ⇒ arm (b)'s same-head/different-tail pair compares EQUAL ⇒ no latch ⇒
     ///   **arm (b) FAILS while arms (a) and (c) stay green**, because (a)'s heads already
-    ///   differ. The tail is the NEXT episode's pre-declaration, so two proposals agreeing
-    ///   only about this episode are not the same answer;
+    ///   differ. The recorded answer is the whole announcement sequence, so two proposals
+    ///   agreeing only on the head are not the same answer;
     /// * hand-write `impl PartialEq for AnnouncementSubject` with `(Seat(_), Seat(_)) => true`
     ///   ⇒ two DIFFERENT seats compare equal ⇒ arm (a)'s own reach-guard fires first and
     ///   names the vacuity by hand, which is the reach-guard doing its job rather than the
@@ -36678,8 +36702,8 @@ mod tests {
 
         // ── (b) SAME head, DIFFERENT tail ⇒ still Conflicted ──
         //
-        // The tail is a pre-declaration for the NEXT episode (CR 732.2a), not decoration, so
-        // two proposals that agree only about this episode are not the same answer. This is
+        // The recorded answer is the whole announcement sequence (CR 732.2a), not just the
+        // head, so two proposals that agree only on the head are not the same answer. This is
         // the arm a head-only equality would lose.
         let slot_b = DecisionSlot::target(journal_source(914));
         let head1_tail2 = ranked(vec![seat(1), seat(2)]);
@@ -36694,8 +36718,8 @@ mod tests {
         assert_eq!(
             state.loop_answer(&slot_b, PlayerId(0)),
             Some(LoopAnswer::Conflicted),
-            "equality over a `Ranking` is STRUCTURAL, not head-only: the tail is the next \
-             episode's pre-declaration, so differing tails are differing answers"
+            "equality over a `Ranking` is STRUCTURAL, not head-only: the recorded answer is \
+             the whole announcement sequence, so differing tails are differing answers"
         );
 
         // ── (c) the SAME ranking twice ⇒ still Uniform ──

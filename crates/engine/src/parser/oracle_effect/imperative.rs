@@ -40,11 +40,11 @@ use crate::parser::oracle_static::{
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, BounceSelection,
     CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser, ContinuousModification,
-    ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, DigSource, DoorLockOp,
-    Duration, Effect, EffectScope, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
-    GrantedAbilityScope, LibraryPosition, MultiTargetSpec, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope, PlayerScope,
-    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, CounterKindChooser,
+    CounterKindDomain, DigSource, DoorLockOp, Duration, Effect, EffectScope, FaceDownProfile,
+    FilterProp, ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition, MultiTargetSpec,
+    ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
+    PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
     ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
     TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
     ZoneOwner,
@@ -2089,7 +2089,14 @@ pub(super) fn parse_targeted_action_ast(
                 );
                 if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: same clause, same seam as the
+                        // hand-destination arm — a trailing "except for <type
+                        // list>" narrows the POPULATION, so it applies whatever
+                        // zone the resolver later scans.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: Zone::Battlefield,
                         enters_under,
@@ -2120,10 +2127,50 @@ pub(super) fn parse_targeted_action_ast(
                 // remain `ChangeZone { origin: Graveyard, destination: Hand }`,
                 // not `BounceAll` (whose resolver only scans the battlefield).
                 if is_mass && origin.is_none() {
-                    Some(TargetedImperativeAst::ReturnAll { target, count })
+                    // CR 205.3a + CR 608.2c: a mass bounce may carry its
+                    // exclusion AFTER the destination phrase — Whelming Wave's "return
+                    // all creatures to their owners' hands except for Krakens,
+                    // Leviathans, Octopuses, and Serpents". Slinn Voda prints the same
+                    // shape with Merfolk leading the list, and Cyclone Summoner returns
+                    // all PERMANENTS "except for Giants, Wizards, and lands" — so this
+                    // arm sees mixed core-type/subtype exclusions, not only creatures.
+                    // `strip_return_destination_ext_with_remainder` leaves that clause
+                    // in `dest_remainder`, where nothing but the battlefield
+                    // attach-host probe used to look, so the whole exclusion was
+                    // silently dropped and the spell bounced the exempted creatures
+                    // too (issue #7451). Fold it onto the population with the SAME
+                    // grammar the adjacent form uses (Scourglass, The Argent
+                    // Etchings), so both surface orders reach one authority.
+                    //
+                    // A graveyard-origin mass return ("return all creature cards from
+                    // your graveyard to your hand except for Zombies") falls to the
+                    // `ReturnAllToZone` arm below, which applies the SAME exclusion
+                    // through the same helper — an "except for" clause is a population
+                    // filter, so it narrows the same set whichever zone the resolver
+                    // scans. That arm previously dropped the clause silently and
+                    // returned the exempted cards anyway (PR review of issue #7451).
+                    Some(TargetedImperativeAst::ReturnAll {
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
+                        count,
+                    })
                 } else if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: an explicit-origin mass return
+                        // carries its exclusion the same way the implicit-origin
+                        // sibling above does ("return all creature cards from your
+                        // graveyard to your hand except for Zombies"). The clause is
+                        // a POPULATION filter, so it narrows the same set regardless
+                        // of which zone the resolver scans — applying it here rather
+                        // than dropping it is what keeps the two surface orders on one
+                        // grammar authority. Previously this arm silently discarded
+                        // the clause and returned the exempted cards anyway.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: Zone::Hand,
                         // CR 110.2 (docs/MagicCompRules.txt:616): controller
@@ -2151,7 +2198,20 @@ pub(super) fn parse_targeted_action_ast(
             Some(d) => {
                 if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: as above — the exclusion is a
+                        // population filter, not a destination property.
+                        //
+                        // SCOPE: all four mass-return arms in THIS dispatcher apply
+                        // it. `oracle_effect/mod.rs::try_parse_verb_and_target` has
+                        // three sibling `ReturnAllToZone` constructions that do not;
+                        // no printed card routes a mass return with an "except for"
+                        // through the sequence parser today (imperative.rs wins for
+                        // that shape), and unlike here the remainder is returned as
+                        // `rem` rather than dropped. Left for a measured change.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: d.zone,
                         // CR 110.2 (docs/MagicCompRules.txt:616): controller
@@ -4238,6 +4298,77 @@ fn try_parse_choose_damage_source(rest: &str) -> Option<ChooseImperativeAst> {
     Some(ChooseImperativeAst::DamageSource { source_filter })
 }
 
+/// CR 608.2d + CR 122.1b: "a kind of counter[ at random][ that <self> doesn't
+/// have on it] from among <list>" — the counter-kind choice whose population is
+/// PRINTED on the card rather than read off the object (Crystalline Giant).
+///
+/// Three independent riders, each optional and each read from the text rather
+/// than assumed:
+///   * " at random" — the GAME picks (`CounterKindChooser::Random`), so no
+///     prompt is ever shown.
+///   * " that <self> doesn't have on it" — narrows the printed set BEFORE the
+///     pick. CR 608.2d: an excluded option can't be chosen; narrowing after
+///     the draw would let a random pick land on a present kind and place
+///     nothing.
+///   * the list itself, read by `classify_and_parse_from_among_counter_list` —
+///     the same item authority Grimdancer's pair pick uses, so a new counter
+///     spelling is learned in exactly one place.
+///
+/// The domain the exclusion is measured against is the ability's own source:
+/// the sentence says "this creature", which the normalizer writes as `~`.
+fn try_parse_choose_counter_kind_from_among(rest_lower: &str) -> Option<ChooseImperativeAst> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("a kind of counter")
+        .parse(rest_lower.trim())
+        .ok()?;
+    let (rest, random) = opt(tag::<_, _, OracleError<'_>>(" at random"))
+        .parse(rest)
+        .ok()?;
+
+    // Optional exclusion clause. `opt` on the whole sequence, so a card that
+    // prints the list without an exclusion still parses.
+    let exclusion = (
+        tag::<_, _, OracleError<'_>>(" that "),
+        alt((
+            tag("~"),
+            tag("this creature"),
+            tag("this permanent"),
+            tag("it"),
+        )),
+        alt((tag(" doesn't have"), tag(" does not have"))),
+        tag(" on it"),
+    );
+    let (rest, excluded) = match opt(exclusion).parse(rest) {
+        Ok((rest, found)) => (rest, found.is_some()),
+        Err(_) => return None,
+    };
+
+    let (list, _) = tag::<_, _, OracleError<'_>>(" from among ")
+        .parse(rest)
+        .ok()?;
+    let entries = crate::parser::oracle_effect::classify_and_parse_from_among_counter_list(
+        list.trim().trim_end_matches('.'),
+    )?;
+
+    Some(ChooseImperativeAst::CounterKind {
+        // CR 608.2d: the printed set is self-contained; the object the
+        // exclusion reads is the ability's source.
+        target: TargetFilter::SelfRef,
+        domain: CounterKindDomain::Printed {
+            // The list parser also yields a per-entry count. "A kind of
+            // counter" places one of the chosen kind, so the count is not the
+            // choice's business; a printed list that ever spelled a quantity
+            // ("two charge counters") would need it read here.
+            kinds: entries.into_iter().map(|(kind, _count)| kind).collect(),
+            excluding_kinds_on_target: excluded,
+        },
+        chooser: if random.is_some() {
+            CounterKindChooser::Random
+        } else {
+            CounterKindChooser::Controller
+        },
+    })
+}
+
 /// CR 608.2d + CR 122.1: "a [kind of] counter on <domain>" — the counter-kind
 /// choice head. An anaphor (`it` / `that permanent` / `that creature`) binds
 /// to `ParentTarget` (The Caves of Androzani); a typed untargeted domain uses
@@ -4248,6 +4379,13 @@ fn try_parse_choose_damage_source(rest: &str) -> Option<ChooseImperativeAst> {
 /// remains owned by the existing target-designation path rather than being
 /// misclassified as a resolution-time source population.
 fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst> {
+    // CR 608.2d + CR 122.1b: the printed-population sibling shares this head
+    // ("a kind of counter") and is told apart only by its tail, so it must be
+    // tried first — otherwise "on " never matches and the whole clause falls
+    // through to Unimplemented (Crystalline Giant).
+    if let Some(ast) = try_parse_choose_counter_kind_from_among(rest_lower) {
+        return Some(ast);
+    }
     let (domain, _) = alt((
         tag::<_, _, OracleError<'_>>("a kind of counter on "),
         tag("a counter on "),
@@ -4271,6 +4409,8 @@ fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst
     {
         return Some(ChooseImperativeAst::CounterKind {
             target: TargetFilter::ParentTarget,
+            domain: CounterKindDomain::default(),
+            chooser: CounterKindChooser::default(),
         });
     }
 
@@ -4282,7 +4422,11 @@ fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst
     {
         return None;
     }
-    Some(ChooseImperativeAst::CounterKind { target })
+    Some(ChooseImperativeAst::CounterKind {
+        target,
+        domain: CounterKindDomain::default(),
+        chooser: CounterKindChooser::default(),
+    })
 }
 
 /// CR 108.3 + CR 701.38d: Detect "a <type> owned by the voter" and emit
@@ -4896,7 +5040,9 @@ pub(super) fn parse_for_each_player_exile_controlled(
         additional_zones: Vec::new(),
         zone_owner: iter_scope,
         filter: Some(filter),
-        chooser: Chooser::Controller,
+        chooser: Chooser::Controller.into(),
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+        reciprocal_role: None,
         up_to,
         selection: CardSelectionMode::Chosen,
         constraint: None,
@@ -5526,7 +5672,9 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             additional_zones: Vec::new(),
             zone_owner: ZoneOwner::Controller,
             filter: None,
-            chooser,
+            chooser: chooser.into(),
+            candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+            reciprocal_role: None,
             up_to: false,
             selection,
             constraint: None,
@@ -5548,7 +5696,9 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 additional_zones: zones.collect(),
                 zone_owner,
                 filter: Some(filter),
-                chooser,
+                chooser: chooser.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to,
                 selection,
                 constraint: None,
@@ -5579,7 +5729,15 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         ChooseImperativeAst::TwoTargets { target_a, .. } => Effect::TargetOnly { target: target_a },
         // CR 608.2d + CR 122.1: "choose a counter on it" → interactive
         // counter-kind selection on the anaphoric object.
-        ChooseImperativeAst::CounterKind { target } => Effect::ChooseCounterKind { target },
+        ChooseImperativeAst::CounterKind {
+            target,
+            domain,
+            chooser,
+        } => Effect::ChooseCounterKind {
+            target,
+            domain,
+            chooser,
+        },
     }
 }
 
@@ -6891,8 +7049,14 @@ fn try_parse_gain_keyword(text: &str) -> Option<Effect> {
         return None;
     }
 
-    // Default duration: UntilEndOfTurn for keyword granting sub-abilities
-    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    // CR 611.2a (`docs/MagicCompRules.txt:2908`): do NOT inject a default window
+    // here. `None` must stay a true unset sentinel so a window this clause's own
+    // recognizer already hoisted onto the carrier can distribute into the embedded
+    // field (`oracle_ir::ast::duration_is_unset_sentinel`). An injected
+    // `UntilEndOfTurn` is byte-identical to a PRINTED one, so the distribution rule
+    // cannot tell them apart and declines, stranding the printed window. The single
+    // authority for the fallback is the resolver (`game/effects/effect.rs`), which
+    // already applies `.unwrap_or(Duration::UntilEndOfTurn)`.
 
     Some(Effect::GenericEffect {
         static_abilities: vec![StaticDefinition::continuous()
@@ -6953,7 +7117,15 @@ fn try_parse_gain_all_activated_abilities_of_target(text: &str) -> Option<Effect
         recipient: TargetFilter::SelfRef,
         // CR 602.1: "all ACTIVATED abilities of" — the default scope.
         scope: GrantedAbilityScope::ActivatedOnly,
-        duration: duration.or(Some(Duration::UntilEndOfTurn)),
+        // CR 611.2a: emit the PARSED duration verbatim, so `None` is a true unset
+        // sentinel. Injecting a `Some(Duration::UntilEndOfTurn)` default here would
+        // be byte-identical to a PRINTED "until end of turn" and therefore invisible
+        // to `apply_duration_to_effect`'s unset-sentinel guard, which would then
+        // decline to distribute a governing outer duration onto this node. The
+        // default is supplied downstream instead: `gain_activated_abilities.rs`
+        // resolves `duration.or(ability.duration).unwrap_or(UntilEndOfTurn)`, so a
+        // card that prints no window still lands on `UntilEndOfTurn`.
+        duration,
     })
 }
 
@@ -13119,7 +13291,9 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 constraint: None,
@@ -13156,7 +13330,9 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 constraint: None,
@@ -14654,7 +14830,7 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::ParitySource;
+    use crate::types::ability::{ParitySource, ZoneChoiceChooser};
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
     /// round-trip byte-for-byte.
@@ -14871,6 +15047,7 @@ mod tests {
                 .expect("typed untargeted counter domain must parse");
             let ChooseImperativeAst::CounterKind {
                 target: TargetFilter::Typed(filter),
+                ..
             } = ast
             else {
                 panic!("expected typed CounterKind domain, got {ast:?}");
@@ -14928,6 +15105,7 @@ mod tests {
                 try_parse_choose_counter_kind(input),
                 Some(ChooseImperativeAst::CounterKind {
                     target: TargetFilter::ParentTarget,
+                    ..
                 })
             ));
         }
@@ -20250,7 +20428,7 @@ mod tests {
                 assert!(additional_zones.is_empty());
                 assert_eq!(zone_owner, ZoneOwner::Controller);
                 assert!(filter.is_none());
-                assert_eq!(chooser, Chooser::Opponent);
+                assert_eq!(chooser, ZoneChoiceChooser::Opponent);
                 assert!(!up_to);
                 assert!(constraint.is_none());
             }

@@ -392,6 +392,12 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // the "can't" effect takes precedence over the triggered ability directing it.
     "triggered abilities ",
     "can't cause you to sacrifice or exile",
+    // CR 701.9a + CR 701.21a + CR 609.3: Sigarda, Host of Herons / Tajuru
+    // Preserver / Tamiyo, Collector of Tales-class player-level protection —
+    // the "can't" effect takes precedence over the spell/ability directing
+    // the sacrifice/discard.
+    "can't cause you to sacrifice permanents",
+    "can't cause you to discard cards",
     // CR 701.23 + CR 101.2: Mindlock Orb-class search prohibition — the "can't"
     // effect takes precedence over any effect directing a search.
     "can't search libraries",

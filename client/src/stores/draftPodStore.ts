@@ -121,6 +121,8 @@ interface DraftPodState {
    * refuses a sequence longer than the kind opens regardless of this cache.
    */
   packsPerPlayer: number | null;
+  /** Engine-published cube deck-size floor for `procedureCacheKey`. */
+  cubeMinDeckSize: number | null;
 }
 
 interface DraftPodActions {
@@ -195,6 +197,7 @@ const initialState: DraftPodState = {
   pendingProcedureDefault: null,
   packDistribution: null,
   packsPerPlayer: null,
+  cubeMinDeckSize: null,
 };
 
 /**
@@ -230,11 +233,12 @@ let resumeHostedPodAttempt: HostedPodResumeAttempt | null = null;
 // monotonically increasing identity so only the newest read may publish.
 let podOrchestrationGeneration = 0;
 
-function beginPodOrchestration(set: (partial: Partial<DraftPodState>) => void): number {
+function beginPodOrchestration(set?: (partial: Partial<DraftPodState>) => void): number {
   podOrchestrationGeneration += 1;
-  // A newer public operation retires any pool spinner owned by the older
-  // generation before that older continuation can settle.
-  set({ loadingPool: false });
+  // A newer public operation retires any pool spinner and deduplicated resume
+  // attempt owned by the older generation before its continuation can settle.
+  resumeHostedPodAttempt = null;
+  set?.({ loadingPool: false });
   return podOrchestrationGeneration;
 }
 
@@ -268,13 +272,38 @@ function procedureCache(
   procedureCacheKey: ProcedureCacheKey,
 ): Pick<
   DraftPodState,
-  "allowedPodSizes" | "procedureCacheKey" | "packDistribution" | "packsPerPlayer"
+  "allowedPodSizes" | "procedureCacheKey" | "packDistribution" | "packsPerPlayer" | "cubeMinDeckSize"
 > {
   return {
     allowedPodSizes: procedure.allowed_pod_sizes,
     procedureCacheKey,
     packDistribution: procedure.distribution,
     packsPerPlayer: procedure.packs_per_player,
+    cubeMinDeckSize: procedure.cube_min_deck_size,
+  };
+}
+
+function procedurePublication(
+  prev: DraftPodState,
+  procedure: DraftProcedure,
+  target: ProcedureCacheKey,
+  adoptsProcedureDefault: boolean,
+): Partial<DraftPodState> {
+  const podSize = adoptsProcedureDefault
+    ? procedure.pod_size
+    : procedure.allowed_pod_sizes.includes(prev.config.podSize)
+      ? prev.config.podSize
+      : procedure.allowed_pod_sizes[0];
+
+  return {
+    ...procedureCache(procedure, target),
+    config: podSize === prev.config.podSize
+      ? prev.config
+      : { ...prev.config, podSize },
+    pendingProcedureDefault: adoptsProcedureDefault ? null : prev.pendingProcedureDefault,
+    poolMode: procedure.distribution === "AllAtOnce" ? "set" : prev.poolMode,
+    loadingPool: false,
+    configError: null,
   };
 }
 
@@ -291,7 +320,8 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           partial.tournamentFormat !== undefined
           && partial.tournamentFormat !== prev.config.tournamentFormat;
         const procedureChanged = kindChanged || tournamentFormatChanged;
-        const packDistribution = kindChanged ? null : prev.packDistribution;
+        if (procedureChanged) beginPodOrchestration();
+        const packDistribution = procedureChanged ? null : prev.packDistribution;
 
         return {
           config: { ...prev.config, ...partial },
@@ -303,7 +333,8 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           procedureCacheKey: procedureChanged ? null : prev.procedureCacheKey,
           pendingProcedureDefault: procedureChanged ? null : prev.pendingProcedureDefault,
           packDistribution,
-          packsPerPlayer: kindChanged ? null : prev.packsPerPlayer,
+          packsPerPlayer: procedureChanged ? null : prev.packsPerPlayer,
+          cubeMinDeckSize: procedureChanged ? null : prev.cubeMinDeckSize,
           loadingPool: false,
           configError: null,
         };
@@ -312,14 +343,15 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     enterKind: async (kind) => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }
-      const procedureRequest = beginPodOrchestration(set);
       // Apply the kind first: it is the entry point's whole purpose and must not
       // depend on the wasm load succeeding. `setConfig` is the single authority for
       // the Sealed pool-mode rule.
       get().setConfig({ kind });
+      const procedureRequest = beginPodOrchestration(set);
       const target: ProcedureCacheKey = {
         kind,
         tournamentFormat: get().config.tournamentFormat,
@@ -336,8 +368,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           set({ configError: DRAFT_OFFLINE_ERROR });
           return;
         }
-        set({ ...procedureCache(procedure, target), pendingProcedureDefault: null });
-        get().setConfig({ podSize: procedure.pod_size });
+        set((prev) => procedurePublication(prev, procedure, target, true));
       } catch (err) {
         if (
           !isCurrentPodOrchestration(procedureRequest)
@@ -353,6 +384,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     enterKindForEntry: async (kind) => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }
@@ -367,6 +399,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     refreshProcedure: async () => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }
@@ -385,17 +418,11 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           set({ configError: DRAFT_OFFLINE_ERROR });
           return;
         }
-        const adoptsProcedureDefault = get().pendingProcedureDefault?.kind === target.kind
-          && get().pendingProcedureDefault?.tournamentFormat === target.tournamentFormat;
-        set({
-          ...procedureCache(procedure, target),
-          pendingProcedureDefault: adoptsProcedureDefault ? null : get().pendingProcedureDefault,
+        set((prev) => {
+          const adoptsProcedureDefault = prev.pendingProcedureDefault?.kind === target.kind
+            && prev.pendingProcedureDefault?.tournamentFormat === target.tournamentFormat;
+          return procedurePublication(prev, procedure, target, adoptsProcedureDefault);
         });
-        if (adoptsProcedureDefault) {
-          get().setConfig({ podSize: procedure.pod_size });
-        } else if (!procedure.allowed_pod_sizes.includes(get().config.podSize)) {
-          get().setConfig({ podSize: procedure.allowed_pod_sizes[0] });
-        }
       } catch (err) {
         if (
           !isCurrentPodOrchestration(procedureRequest)
@@ -442,6 +469,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     createPod: async () => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }
@@ -476,11 +504,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           set({ configError: "This procedure requires a set pool" });
           return;
         }
-        set(procedureCache(procedure, target));
-        if (!procedure.allowed_pod_sizes.includes(config.podSize)) {
-          get().setConfig({ podSize: procedure.allowed_pod_sizes[0] });
-        }
-        get().setConfig({});
+        set((prev) => procedurePublication(prev, procedure, target, false));
         config = get().config;
         poolMode = get().poolMode;
         setDraftMode = get().setDraftMode;
@@ -491,10 +515,14 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           || get().config !== config
         ) return;
         if (getEffectiveOffline()) {
-          set({ configError: DRAFT_OFFLINE_ERROR });
+          set({ configError: DRAFT_OFFLINE_ERROR, loadingPool: false });
           return;
         }
-        set({ configError: err instanceof Error ? err.message : String(err) });
+        set({
+          configError: err instanceof Error ? err.message : String(err),
+          loadingPool: false,
+        });
+        return;
       }
 
       if (poolMode === "set") {
@@ -630,6 +658,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     resumeHostedPod: async (options = {}) => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return "offline";
       }
@@ -743,8 +772,10 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             configError: null,
             allowedPodSizes: null,
             procedureCacheKey: null,
+            pendingProcedureDefault: null,
             packDistribution: null,
             packsPerPlayer: null,
+            cubeMinDeckSize: null,
           });
         } else {
           // Restore the pack sequence the pod was configured with, so a host
@@ -771,8 +802,10 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             configError: null,
             allowedPodSizes: null,
             procedureCacheKey: null,
+            pendingProcedureDefault: null,
             packDistribution: null,
             packsPerPlayer: null,
+            cubeMinDeckSize: null,
           });
         }
 
@@ -793,10 +826,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             set({ configError: DRAFT_OFFLINE_ERROR });
             return "offline";
           }
-          set(procedureCache(procedure, target));
-          if (!procedure.allowed_pod_sizes.includes(get().config.podSize)) {
-            get().setConfig({ podSize: procedure.allowed_pod_sizes[0] });
-          }
+          set((prev) => procedurePublication(prev, procedure, target, false));
         } catch (err) {
           if (
             !isCurrentAttempt()
@@ -808,6 +838,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             return "offline";
           }
           set({ configError: err instanceof Error ? err.message : String(err) });
+          return "invalid";
         }
 
         const hostConfig: DraftPodHostConfig = {
@@ -853,6 +884,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     joinPod: async () => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }
@@ -900,6 +932,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     startDraft: async () => {
       if (getEffectiveOffline()) {
+        beginPodOrchestration(set);
         set({ configError: DRAFT_OFFLINE_ERROR });
         return;
       }

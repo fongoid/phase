@@ -179,6 +179,29 @@ function setupDraftMatchAvatars(seed: string) {
   });
 }
 
+/**
+ * Drop this client's wire-assigned seat when a game session tears down.
+ *
+ * `activePlayerId` is written only from a wire (`playerIdentity`, P2P
+ * `game_setup`, `setupDraftMatchAvatars`) and had no clear, so it outlived the
+ * game that assigned it. Two consecutive wire-assigned games therefore shared
+ * one value: until the second game's assignment arrived, `resolveLocalSeat`
+ * handed out the FIRST game's seat. `SeatSource` does not cover this — it is
+ * keyed on mode (`"seat-zero"` makes a solo game ignore the field), not on
+ * session, so online → online reads the stale seat.
+ *
+ * Safe against a remount (React StrictMode double-mounts in dev) because every
+ * wire-assigned mode re-establishes the seat when its effect re-runs:
+ * draft-match re-runs `setupDraftMatchAvatars`, and a fresh WS/P2P-guest
+ * adapter re-emits `playerIdentity` from `GameStarted` / `reconnect_ack`. The
+ * P2P HOST is the one path with no re-emit (it emits only from its game-start
+ * flow) — it is unaffected because the host is always seat 0, which is exactly
+ * what `resolveLocalSeat` falls back to.
+ */
+function clearWireAssignedSeat(): void {
+  useMultiplayerStore.getState().setActivePlayerId(null);
+}
+
 function playerNamesRecordToMap(playerNames: Record<number, string>): Map<number, string> {
   const names = new Map<number, string>();
   for (const [playerId, name] of Object.entries(playerNames)) {
@@ -720,6 +743,7 @@ export function GameProvider({
       return () => {
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
       };
     }
 
@@ -980,7 +1004,12 @@ export function GameProvider({
             }
             // Dial target: `conn.peer` is the actual current host peer id;
             // reconnect reuses it rather than reconstructing a prefix.
-            const { conn, peer } = await joinRoom(code, signal, 10_000);
+            // No timeout override: `joinRoom`'s 30s default is sized for a
+            // relayed ICE negotiation. A 10s budget aborted TURN-relayed joins
+            // mid-negotiation, and it bought nothing for a mistyped code —
+            // that path rejects immediately on `peer-unavailable`, never on the
+            // timeout.
+            const { conn, peer } = await joinRoom(code, signal);
             hostPeerHandle = peer;
             signal.throwIfAborted();
             const adapter = new P2PGuestAdapter(
@@ -1055,6 +1084,7 @@ export function GameProvider({
         if (p2pAdapter) p2pAdapter.dispose();
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }
@@ -1356,6 +1386,7 @@ export function GameProvider({
         useMultiplayerStore.getState().setSpectators([]);
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }

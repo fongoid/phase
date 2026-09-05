@@ -164,6 +164,7 @@ function mockView(status: string): DraftPlayerView {
     status: status as DraftPlayerView["status"],
     kind: "Premier",
     launch_capability: "None",
+    commanders_required: 0,
     current_pack_number: 1,
     pick_number: 1,
     pass_direction: "Left",
@@ -1380,7 +1381,7 @@ describe("multiplayerDraftStore", () => {
       expect(mockHostAdapter.updateWorkspace).toHaveBeenCalledTimes(1);
     });
 
-    it("forwards the commander designation through the host adapter", async () => {
+    it("forwards an ordered duplicate commander designation through the host adapter", async () => {
       await useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
         kind: "Premier",
@@ -1397,11 +1398,35 @@ describe("multiplayerDraftStore", () => {
       // CR 903.3. The designation is deliberately NOT derivable from anything
       // else this test sets — the deck is empty here — so a body that dropped
       // the argument, or re-derived it from the deck, cannot satisfy this.
-      await useMultiplayerDraftStore.getState().submitDeck(["Kenrith, the Returned King"]);
+      await useMultiplayerDraftStore.getState().submitDeck([
+        "The Prismatic Piper",
+        "The Prismatic Piper",
+      ]);
 
       expect(mockHostAdapter.submitDeck).toHaveBeenCalledWith(
         [],
-        ["Kenrith, the Returned King"],
+        ["The Prismatic Piper", "The Prismatic Piper"],
+      );
+    });
+
+    it("forwards an ordered duplicate commander designation through the guest adapter", async () => {
+      await useMultiplayerDraftStore.getState().joinDraft({
+        kind: "new",
+        roomCode: "ABCDE",
+        displayName: "Alice",
+      });
+      const deckbuildingView = { ...mockView("Deckbuilding"), pool: [] };
+      capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: null });
+      capturedGuestEventHandler!({ type: "viewUpdated", view: deckbuildingView });
+
+      await useMultiplayerDraftStore.getState().submitDeck([
+        "The Prismatic Piper",
+        "The Prismatic Piper",
+      ]);
+
+      expect(mockGuestAdapter.submitDeck).toHaveBeenCalledWith(
+        [],
+        ["The Prismatic Piper", "The Prismatic Piper"],
       );
     });
 

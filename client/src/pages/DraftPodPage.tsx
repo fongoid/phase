@@ -128,6 +128,12 @@ function PodSetup() {
   );
   const packDistribution = useDraftPodStore((s) => s.packDistribution);
   const packsPerPlayer = useDraftPodStore((s) => s.packsPerPlayer);
+  const cubeMinDeckSize = useDraftPodStore((s) =>
+    s.procedureCacheKey?.kind === s.config.kind
+    && s.procedureCacheKey.tournamentFormat === s.config.tournamentFormat
+      ? s.cubeMinDeckSize
+      : null,
+  );
   const refreshProcedure = useDraftPodStore((s) => s.refreshProcedure);
 
   // The kind radios record intent (`setConfig`) but publish nothing, so the
@@ -498,7 +504,8 @@ function PodSetup() {
               setCubeForm({ cubeName, cubeListText, settings });
               void createPod();
             }}
-            disabled={loadingPool}
+            minimumDeckSize={cubeMinDeckSize ?? undefined}
+            disabled={loadingPool || cubeMinDeckSize === null}
           />
         )}
 
@@ -820,7 +827,7 @@ function BetweenGamesView({
               capabilities: { kind: "fixed-pool" },
               onWorkspaceChange: setIntergameWorkspaceState,
               onPreferencesChange: handlePreferencesChange,
-              onSubmitDeck: () => {
+              onSubmitDeck: (_commanders) => {
                 const partition = projectWorkspacePartition(intergameWorkspace, view.pool);
                 submitSideboard(
                   sideboardPrompt.matchId,
@@ -1321,7 +1328,7 @@ function DraftPodPageContent() {
     onClick: handleEndDraft,
   }), [endingDraft, handleEndDraft, t]);
   const hostDraftTopActions = useHostDraftTopActions({
-    enabled: phase === "drafting",
+    enabled: phase === "drafting" || phase === "deckbuilding",
     endDraftAction,
   });
   const betweenGamesEditorActive = screen === "betweenGames"
@@ -1520,7 +1527,7 @@ function DraftPodPageContent() {
         </DialogShell>
       )}
 
-      {!(phase === "drafting" && compactHostControlsLayout) && (
+      {!((phase === "drafting" || phase === "deckbuilding") && compactHostControlsLayout) && (
         <HostControls
           draftTopActions={hostDraftTopActions}
           endDraftAction={endDraftAction}

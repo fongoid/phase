@@ -12830,6 +12830,43 @@ fn static_cant_cause_sacrifice_or_exile_creature_tokens() {
 }
 
 #[test]
+fn static_cant_cause_forced_action_sacrifice_only() {
+    // CR 701.21a + CR 609.3 + CR 109.5: Sigarda, Host of Herons / Tajuru
+    // Preserver — protects the player wholesale against ANY opponent-
+    // controlled spell or ability forcing a sacrifice, with no affected-object
+    // filter (unlike CantCauseSacrificeOrExile).
+    let def = parse_static_line(
+        "Spells and abilities your opponents control can't cause you to sacrifice permanents.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::CantCauseForcedAction {
+            cause: ProhibitionScope::Opponents,
+            actions: vec![CostCategory::SacrificesPermanent],
+        }
+    );
+    assert!(def.affected.is_none());
+}
+
+#[test]
+fn static_cant_cause_forced_action_discard_or_sacrifice() {
+    // CR 701.9a + CR 701.21a + CR 609.3: Tamiyo, Collector of Tales — the same
+    // static family, listing two forced actions in one clause.
+    let def = parse_static_line(
+        "Spells and abilities your opponents control can't cause you to discard cards or sacrifice permanents.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::CantCauseForcedAction {
+            cause: ProhibitionScope::Opponents,
+            actions: vec![CostCategory::Discards, CostCategory::SacrificesPermanent],
+        }
+    );
+}
+
+#[test]
 fn static_legend_rule_defers_unparseable_scopes() {
     // CR 704.5j: scopes this parser cannot resolve precisely, and conditional
     // forms, must NOT be emitted as a LegendRuleDoesntApply static — they are

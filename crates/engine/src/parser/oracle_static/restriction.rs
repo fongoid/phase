@@ -704,6 +704,72 @@ pub(crate) fn parse_cant_cause_sacrifice_or_exile(
     )
 }
 
+/// CR 701.9a (discard) + CR 701.21a (sacrifice) + CR 109.5: One action phrase
+/// inside a "can't cause you to <action list>" forced-action prohibition. A
+/// future forced action (e.g. "can't cause you to pay life") slots in as an
+/// additional `alt()` branch here without restructuring the caller.
+fn parse_forced_action_phrase(input: &str) -> OracleResult<'_, CostCategory> {
+    alt((
+        value(
+            CostCategory::SacrificesPermanent,
+            tag("sacrifice permanents"),
+        ),
+        value(CostCategory::Discards, tag("discard cards")),
+    ))
+    .parse(input)
+}
+
+/// A list of 1+ forced-action phrases joined by ", "/" or "/" and " (Tamiyo,
+/// Collector of Tales: "discard cards or sacrifice permanents").
+fn parse_forced_action_list(input: &str) -> OracleResult<'_, Vec<CostCategory>> {
+    separated_list1(
+        alt((
+            tag(", and "),
+            tag(", or "),
+            tag(" and "),
+            tag(" or "),
+            tag(", "),
+        )),
+        parse_forced_action_phrase,
+    )
+    .parse(input)
+}
+
+/// CR 701.9a (discard) + CR 701.21a (sacrifice) + CR 609.3 + CR 109.5: Parse
+/// "Spells and abilities <scope> can't cause you to <action list>." statics —
+/// a player-level protection distinct from `CantCauseSacrificeOrExile` (The
+/// Master, Multiplied — triggered abilities ONLY, filtered to a specific
+/// affected-object subset): this protects the player wholesale against ANY
+/// spell or ability, regardless of which permanent/card would be affected.
+///
+/// Supported Oracle classes:
+/// - "Spells and abilities your opponents control can't cause you to
+///   sacrifice permanents." (Sigarda, Host of Herons; Tajuru Preserver)
+/// - "Spells and abilities your opponents control can't cause you to discard
+///   cards or sacrifice permanents." (Tamiyo, Collector of Tales)
+pub(crate) fn parse_cant_cause_forced_action(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    let rest_tp = nom_tag_tp(tp, "spells and abilities ")?;
+    // Scope rides on the controller-possessive suffix, mirroring
+    // `parse_cant_search_library` (Ashiok class) and
+    // `parse_cant_cause_sacrifice_or_exile` (The Master, Multiplied class).
+    let (cause, predicate) = strip_controller_possessive_scope(rest_tp.original)?;
+    let predicate_lower = predicate.to_lowercase();
+    let (actions, _) = nom_on_lower(predicate, &predicate_lower, |i| {
+        let (i, _) = tag("can't cause you to ").parse(i)?;
+        let (i, actions) = parse_forced_action_list(i)?;
+        let (i, _) = opt(tag(".")).parse(i)?;
+        let (i, _) = eof(i)?;
+        Ok((i, actions))
+    })?;
+    Some(
+        StaticDefinition::new(StaticMode::CantCauseForcedAction { cause, actions })
+            .description(text.to_string()),
+    )
+}
+
 /// CR 603.2g + CR 603.6a + CR 700.4: Parse Torpor Orb / Hushbringer-class
 /// "Creatures entering [the battlefield] [and dying] don't cause abilities to trigger."
 ///
