@@ -30580,14 +30580,22 @@ pub(crate) struct PrintedColorCarrier {
 ///     itself), which is the shape this arm sees; CR 607.2d is the "choose a
 ///     [value]" / "the chosen [value]" linkage itself. Each printed "of the
 ///     color of your choice" is its OWN choice, linked to its own filter. One
-///     injected chooser writes ONE `ChosenAttribute::Color`, and both
-///     `game/filter.rs` readers take the FIRST one, so a single wrap would bind
-///     BOTH stamped filters to the FIRST answer and silently discard the second
-///     — with no `Effect::Unimplemented` and no parse warning. (The runtime half
-///     of that first-wins read — a source ACCUMULATING colours across two
-///     resolutions — is closed: `apply_choice_attributes` in
-///     `game/effects/choose.rs` now replaces `ChosenAttribute::Color` on
-///     re-choose, so a source holds at most one.)
+///     injected chooser writes ONE `ChosenAttribute::Color`, so a single wrap
+///     would bind BOTH stamped filters to that one answer and silently discard
+///     the second — with no `Effect::Unimplemented` and no parse warning. The
+///     refusal is about the PARSER emitting one chooser for two printed
+///     choices; it does not depend on which end of the attribute list a reader
+///     takes.
+///     (Runtime shape, corrected — an earlier revision of this paragraph
+///     described the opposite and was the stated rationale for this arm, so it
+///     is spelled out rather than merely deleted: `apply_choice_attributes`
+///     ACCUMULATES `ChosenAttribute::Color` rather than replacing it — see
+///     `game/effects/choose.rs` and its unit test
+///     `apply_choice_attributes_accumulates_color_and_preserves_the_accumulating_kinds`
+///     — and both `game/filter.rs` readers now take the LAST entry, via
+///     `current_chosen_color()` and a `.rev()` scan. A source can therefore hold
+///     several answers, and each reader takes the end its own rule entitles it
+///     to: CR 608.2d the newest, CR 607.2d the one its linked ability chose.)
 ///     The parser cannot model that shape until follow-up
 ///     **F6** gives each carrying clause its own wrap at its own node, so the
 ///     chain is REFUSED here: the definition becomes

@@ -115,7 +115,7 @@ pub(crate) fn resolve_source_filter(
             if !has_chosen_ref {
                 return filter.clone();
             }
-            // CR 608.2d (@2799): Resolve IsChosenColor -> concrete HasColor using
+            // CR 608.2d: Resolve IsChosenColor -> concrete HasColor using
             // the source's CURRENT chosen color. The shield is resolved into a
             // concrete filter once, when it is CREATED (this function), so it
             // must read whichever answer is current at that moment — the same

@@ -2972,7 +2972,7 @@ impl GameObject {
         !super::coverage::unimplemented_mechanics(self).is_empty()
     }
 
-    /// CR 607.2d (@2748): the LINKED read — "the chosen color" as a linked
+    /// CR 607.2d: the LINKED read — "the chosen color" as a linked
     /// anaphoric reader means "what did this object's own supplier choose".
     /// Oldest-since-entry (first match): `chosen_attributes` is cleared only
     /// on leave-battlefield, so this is the object's FIRST recorded colour.
@@ -2985,7 +2985,7 @@ impl GameObject {
         })
     }
 
-    /// CR 608.2d (@2799): "the current answer" — the most recently chosen
+    /// CR 608.2d: "the current answer" — the most recently chosen
     /// colour. Newest (last match), the `.rev()` idiom `chosen_card_name`
     /// already uses. Read by `game/filter.rs`'s two `IsChosenColor` arms and
     /// `game/effects/prevent_damage.rs`'s prevention-shield read, both of

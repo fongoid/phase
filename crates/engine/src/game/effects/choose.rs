@@ -343,7 +343,7 @@ pub(crate) fn bind_named_choice(
         }
     }
 
-    // CR 608.2d (@2799) then CR 607.2d (@2748): record the colour THIS
+    // CR 608.2d then CR 607.2d: record the colour THIS
     // resolution announced, for `resolution_chosen_color`'s primary read.
     // Gated on the exact-object binding captured above, so a `persist: false`
     // printed `Choose a color.` (the F1 class) still writes nothing here and
@@ -360,7 +360,7 @@ pub(crate) fn bind_named_choice(
     updated_context
 }
 
-/// CR 608.2d (@2799) then CR 607.2d (@2748), in that order: the colour a grant
+/// CR 608.2d then CR 607.2d, in that order: the colour a grant
 /// created by THIS resolution must use.
 ///
 /// The resolution slot answers "what did the effect being applied announce"; the

@@ -904,7 +904,7 @@ pub(crate) struct ClauseIr {
     /// chooser injected — a fail-closed, match-NOTHING filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) printed_color_choice: Option<ChoiceType>,
-    /// CR 607.2d (@2748) + CR 608.2d (@2799): which KIND of chosen-colour
+    /// CR 607.2d + CR 608.2d: which KIND of chosen-colour
     /// reference this clause's KEYWORD GRANT printed, DERIVED ONCE from this
     /// clause's own verbatim `source_text` at `ClauseDraft::push` — the sealed
     /// single construction gate.

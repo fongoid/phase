@@ -18617,7 +18617,7 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_counter_kind_this_resolution: Option<CounterType>,
 
-    /// CR 608.2d (@2799): the colour a PERSISTING chooser bound during the current
+    /// CR 608.2d: the colour a PERSISTING chooser bound during the current
     /// resolution. Separate from `last_named_choice` (set for every named choice,
     /// persisting or not, and not resolution-scoped) and from the source's
     /// `ChosenAttribute::Color` history (which CR 607.2d readers own).

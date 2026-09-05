@@ -528,7 +528,7 @@ pub(crate) fn parse_printed_color_choice_qualifier(input: &str) -> OracleResult<
     .parse(input)
 }
 
-/// CR 607.2d (@2748) + CR 608.2d (@2799): which KIND of chosen-colour reference a
+/// CR 607.2d + CR 608.2d: which KIND of chosen-colour reference a
 /// KEYWORD GRANT printed. CR 607.2d links only a reader saying "the chosen
 /// [value]", "the last chosen [value]", "or similar"; "the color of your choice"
 /// is a FRESH CR 608.2d choice the player announces while applying the effect.

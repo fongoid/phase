@@ -1363,7 +1363,7 @@ fn finalize_document_relations(mut doc: OracleDocIr, types: &[String]) -> Oracle
 /// derived at `ClauseDraft::push` from the clause's own verbatim printed
 /// fragment, before any description is synthesized.
 ///
-/// CR 614.15 (@3126) + CR 608.2d (@2799): a self-replacement override does NOT
+/// CR 614.15 + CR 608.2d: a self-replacement override does NOT
 /// read its base's choice. `game/ability_utils.rs::apply_instead_swap` assigns
 /// `overridden.effect = sub.effect`, so when the override applies, the base's
 /// effect — including a chooser injected above it — is discarded before it
@@ -1394,7 +1394,7 @@ fn detect_linked_choice_linked_color(
     ));
 }
 
-/// CR 607.2d (@2748) vs CR 608.2d (@2799): whether every chosen-colour keyword
+/// CR 607.2d vs CR 608.2d: whether every chosen-colour keyword
 /// grant this item prints is an ANAPHORIC reader of a choice made elsewhere on
 /// the object.
 ///

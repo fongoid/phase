@@ -4685,7 +4685,7 @@ fn spell_object_matches_property(
                 })
         }),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
-        // CR 608.2d (@2799): "the chosen color" for this filter form wants the
+        // CR 608.2d: "the chosen color" for this filter form wants the
         // CURRENT answer, not the CR 607.2d linked one — mirrors
         // `GameObject::current_chosen_color`.
         FilterProp::IsChosenColor => context.is_some_and(|context| {

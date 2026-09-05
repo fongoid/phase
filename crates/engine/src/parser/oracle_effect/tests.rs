@@ -59866,10 +59866,13 @@ fn printed_color_choice_over_an_existing_color_chooser_is_refused() {
 /// print "of the color of your choice" print TWO INDEPENDENT choices, each
 /// linked to its own filter.
 ///
-/// One injected chooser writes ONE `ChosenAttribute::Color` and both
-/// `game/filter.rs` readers take the FIRST, so binding both stamped filters to
-/// a single wrap would silently discard the second printed choice — no
-/// `Effect::Unimplemented`, no parse warning, coverage still green. The parser
+/// One injected chooser writes ONE `ChosenAttribute::Color`, so binding both
+/// stamped filters to a single wrap would silently discard the second printed
+/// choice — no `Effect::Unimplemented`, no parse warning, coverage still green.
+/// (The refusal is about the parser emitting one chooser for two printed
+/// choices. It does not depend on which end of the attribute list a reader
+/// takes: `apply_choice_attributes` ACCUMULATES colours and both
+/// `game/filter.rs` readers now take the LAST.) The parser
 /// cannot model the shape until follow-up **F6** wraps each carrying clause at
 /// its own node, so `inject_printed_color_choice_filter` REFUSES the chain
 /// instead of collapsing it.
