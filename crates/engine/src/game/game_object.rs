@@ -2987,7 +2987,10 @@ impl GameObject {
 
     /// CR 608.2d: "the current answer" — the most recently chosen
     /// colour. Newest (last match), the `.rev()` idiom `chosen_card_name`
-    /// already uses. Read by `game/filter.rs`'s two `IsChosenColor` arms and
+    /// already uses. Called by ONE of `game/filter.rs`'s two `IsChosenColor`
+    /// arms; the other inlines the same `.rev()` scan because its `source` is a
+    /// `SourceContext` carrying its own `chosen_attributes`, not a `GameObject`,
+    /// so it cannot reach this accessor. Also read by
     /// `game/effects/prevent_damage.rs`'s prevention-shield read, both of
     /// which want the current answer rather than the historical (CR 607.2d)
     /// one `chosen_color` returns. Drift guard: if this object can hold more

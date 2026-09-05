@@ -59760,9 +59760,9 @@ fn chosen_color_filter_is_always_paired_with_a_color_chooser() {
 /// V-DOUBLE (SHAPE) — CR 105.4 + CR 607.2d. A sole-clause carrier whose chain
 /// head is ALREADY an `Effect::Choose(Color)` is REFUSED, not silently skipped.
 ///
-/// Wrapping would raise TWO colour prompts and the `find_map` over
-/// `chosen_attributes` reads the FIRST one, silently discarding the player's
-/// answer to the printed prompt. Skipping is no better: it leaves the stamped
+/// Wrapping would raise TWO colour prompts for ONE printed choice, so one of
+/// the two answers is spurious whichever end of `chosen_attributes` a reader
+/// takes. Skipping is no better: it leaves the stamped
 /// `FilterProp::IsChosenColor` bound to a `persist: false` chooser that writes no
 /// `ChosenAttribute::Color` at all (follow-up **F1**), so the filter's fail-closed
 /// read matches NOTHING with no `Effect::Unimplemented` and no parse warning.

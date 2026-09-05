@@ -8118,10 +8118,13 @@ fn apply_continuous_effect_filtered(
     // Caveat (mirrors `chosen_color` semantics): if the same source has
     // multiple concurrent `RemoveChosenKeyword` effects (e.g., Urborg
     // activated twice in the same turn), each currently reads the FIRST
-    // `ChosenAttribute::Keyword` on the source. Same limitation applies to
-    // `chosen_color` / `chosen_card_type` upstream; documented here for
-    // symmetry. Acceptable for v1 — fix paired with the broader
-    // chosen-attribute scoping refactor.
+    // `ChosenAttribute::Keyword` on the source, which is genuinely a
+    // limitation. It is NOT the same for `chosen_color`: since the accessor
+    // split that read is deliberately oldest-since-entry (CR 607.2d, the linked
+    // ability's own choice), with `current_chosen_color()` for CR 608.2d's
+    // "current answer". `chosen_card_type` remains in the Keyword case.
+    // Acceptable for v1 — fix paired with the broader chosen-attribute scoping
+    // refactor.
     let chosen_keyword = if matches!(
         effect.modification,
         ContinuousModification::RemoveChosenKeyword

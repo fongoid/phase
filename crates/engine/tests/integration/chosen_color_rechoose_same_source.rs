@@ -401,8 +401,9 @@ fn knight_of_dawn_second_activation_uses_its_own_color() {
     runner
         .act(engine::types::actions::GameAction::PassPriority)
         .expect("pass priority to the Knight's controller");
-    // CR 500.4: the pool emptied at each step/phase boundary — refill exactly
-    // the second activation's cost.
+    // CR 500.5 + CR 703.4q: unspent mana empties as a step or phase ENDS, as a
+    // turn-based action — refill exactly the second activation's cost. (CR 500.4
+    // is the step/phase BEGINS rule and covers effect expiry, not the pool.)
     for unit in white_mana(2) {
         let _ = runner.state_mut().add_mana_to_pool(P0, unit);
     }

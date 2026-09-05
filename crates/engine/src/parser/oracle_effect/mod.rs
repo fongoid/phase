@@ -30556,8 +30556,8 @@ pub(crate) struct PrintedColorCarrier {
 ///   * **exactly one, `SoleClause`, head is not already a colour chooser** — the
 ///     live case (Wash Out, Root Greevil): wrap.
 ///   * **exactly one, `SoleClause`, head IS already an `Effect::Choose(Color)`**
-///     — CR 105.4 + CR 607.2d. Wrapping would raise TWO prompts and the
-///     FIRST-match read would discard the player's second answer; SKIPPING would
+///     — CR 105.4 + CR 607.2d. Wrapping would raise TWO prompts for ONE printed
+///     choice, so one answer is spurious whichever end a reader takes; SKIPPING would
 ///     leave the stamped `FilterProp::IsChosenColor` bound to a chooser that —
 ///     with `ChoiceType::Color` still absent from the `persist:` match in
 ///     `oracle_effect/imperative.rs` (follow-up **F1**) — writes no

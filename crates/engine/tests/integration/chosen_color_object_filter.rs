@@ -368,11 +368,16 @@ fn wash_out_raises_one_five_option_color_prompt_before_the_bounce() {
 /// `chosen_color_rechoose_same_source::wash_out_recast_on_the_same_object_uses_its_own_color`,
 /// which moves the resolved sorcery back to hand and recasts the same object.
 ///
-/// That seam was the former follow-up **F7** and is now closed:
-/// `apply_choice_attributes` (`game/effects/choose.rs`) replaces
-/// `ChosenAttribute::Color` on re-choose (CR 607.2d + CR 400.7 + CR 608.2d), so a
-/// source holds AT MOST ONE chosen colour and the first-match readers in
-/// `game/filter.rs` are unambiguous.
+/// That seam was the former follow-up **F7** and is now closed — but NOT by
+/// replace-on-rechoose, which this PR deleted. `apply_choice_attributes`
+/// (`game/effects/choose.rs`) ACCUMULATES `ChosenAttribute::Color`, so a source
+/// can hold several answers. F7 is closed by the ACCESSOR SPLIT instead: each
+/// reader takes the end of the list its own rule entitles it to — CR 608.2d the
+/// newest via `current_chosen_color()`, CR 607.2d the linked ability's via
+/// `chosen_color()` (oldest-since-entry). Both `game/filter.rs` `IsChosenColor`
+/// arms read the NEWEST, so a recast binds its own answer. This matches
+/// `docs/parser-misparse-backlog.md`'s F7 entry; an earlier revision of this
+/// comment asserted the opposite and was wrong.
 #[test]
 fn two_wash_outs_bind_their_own_choices_independently() {
     let mut scenario = GameScenario::new();
