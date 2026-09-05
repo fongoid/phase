@@ -15139,6 +15139,10 @@ fn parse_open_booster_pack_ir(
         actor: ctx.actor.clone(),
         in_trigger: ctx.in_trigger,
         repeat_until: None,
+        // Merge-down default: Booster Tutor's initializer landed on main before
+        // this branch added `injected_color_choice`, so the merge kept both
+        // texts and only rustc saw the missing field.
+        injected_color_choice: InjectedColorChoice::Permitted,
     })
 }
 
