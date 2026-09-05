@@ -4004,7 +4004,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Harbor Serpent
 - Haunting Wind
 - Havengul Mystery
-- Havi, the All-Father
 - Intercessor's Arrest
 - Intrepid Ace
 - Invader Parasite
