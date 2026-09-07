@@ -7853,8 +7853,41 @@ pub struct PendingManaAbility {
     /// already-live outer payment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_move_resume: Option<ManaAbilityResume>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub chosen_tappers: Vec<ObjectId>,
+    /// CR 107.3a + CR 601.2h: the tappers chosen for this activation's
+    /// `TapCreatures` cost. `None` means the selection stage has not been
+    /// answered yet; `Some(vec![])` is a legal, ANSWERED zero-tapper payment of
+    /// the CR 107.3a X-sentinel form (X=0, e.g. Hazel of the Rootbloom's
+    /// `Tap X untapped tokens you control` with no eligible token chosen).
+    /// A bare `Vec` conflates the two states, so `advance_mana_ability_activation`
+    /// re-surfaces the same `WaitingFor::PayCost` forever. Mirrors
+    /// [`Self::chosen_mana_payment`], two fields below, and the already-correct
+    /// `chosen_x.is_none()` presence gate.
+    ///
+    /// **WIRE ASYMMETRY — this retype is NOT wire-compatible in both
+    /// directions.** Old→new is safe: an absent field decodes to `None`
+    /// (unanswered) and a non-empty array decodes to `Some`. New→old is
+    /// SILENTLY INVERTED: `Some(vec![])` serializes as `chosen_tappers: []`,
+    /// which an old build decodes to `Vec::new()` and its `is_empty()` gate
+    /// reads as *unanswered* — re-prompting forever, the exact livelock this
+    /// field's `Option` fixes. The path is serialized, not theoretical:
+    /// `game::mana_abilities::handle_tap_creatures_for_mana_ability` writes this
+    /// field before the composite cost walk, and Hazel of the Rootbloom's cost
+    /// order `[Tap, PayLife(2), TapCreatures]` lets the later `PayLife` return
+    /// `PayLifeCostResult::DeferredReplacementChoice` → `pause_mana_ability_cost_payment`,
+    /// which stores into [`GameState::pending_cost_move_resume`] — documented as
+    /// serialized so a host checkpoint can resume the same cost-payment action.
+    /// A retype like this is normally version-backed rather than left silent:
+    /// see the `tap_creatures_pre_mode_wire_shape_is_rejected` doc block in this
+    /// file for the immediately preceding `PayCostKind::TapCreatures::mode`
+    /// retype, a deliberate break backed by `lobby_broker::PROTOCOL_VERSION` /
+    /// `WIRE_PROTOCOL_VERSION` under the convention entry 23
+    /// (`PayableResource::ManaGeneric`) established, whose test proves that break
+    /// is a clean, non-silent deserialize failure. Whether to accept this
+    /// asymmetry or bump the protocol versions to match that convention is an
+    /// OPEN, maintainer-owned decision — deliberately not taken here, and not a
+    /// claimed exemption from the convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_tappers: Option<Vec<ObjectId>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chosen_discards: Vec<ObjectId>,
     /// CR 107.4e + CR 605.3a: Pre-resolved hybrid-color choices for a `Mana` sub-cost
@@ -7868,11 +7901,24 @@ pub struct PendingManaAbility {
     /// in a mana-ability cost. The amount is chosen before mana production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_counter_count: Option<u32>,
-    /// CR 107.3a + CR 601.2b + CR 702.179e/f: Announced value of X for a
-    /// `Pay X speed` mana-ability cost (Chicago Loop's `Pay X speed: Add X mana
-    /// in any combination of colors`). Chosen before cost payment and mana
-    /// production; bound to BOTH the speed cost and the produced-mana count via
-    /// `set_chosen_x_recursive`. `None` until the player announces X.
+    /// CR 107.3a + CR 601.2b + CR 702.179e/f: Announced value of X for this
+    /// mana ability. Two writers, both binding the same CR 107.3a announcement:
+    ///
+    /// * a `Pay X speed` cost (Chicago Loop's `Pay X speed: Add X mana in any
+    ///   combination of colors`), announced before cost payment and bound to
+    ///   BOTH the speed cost and the produced-mana count via
+    ///   `set_chosen_x_recursive`;
+    /// * the X-sentinel `TapCreatures` form (Hazel of the Rootbloom's
+    ///   `Tap X untapped tokens you control`), where
+    ///   `handle_tap_creatures_for_mana_ability` binds X to the size of the
+    ///   completed tapper selection. Both the cost-application loop in
+    ///   `pay_mana_ability_cost_with_choices` and the cursor advance in
+    ///   `advance_mana_ability_selection_cursor` read that single stored value
+    ///   rather than re-deriving it from `requirement.fixed_count()`.
+    ///
+    /// `None` until X is announced. Because this slot is shared by two costs, it
+    /// is NOT a stage-completion marker — each selection stage owns its own
+    /// typed presence field (see [`Self::chosen_tappers`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_x: Option<u32>,
     /// CR 605.2 + CR 701.59: Cards exiled to pay a `Collect evidence N`
@@ -34483,7 +34529,7 @@ mod tests {
                     color_override: None,
                     resume: ManaAbilityResume::Priority,
                     cost_move_resume: None,
-                    chosen_tappers: Vec::new(),
+                    chosen_tappers: None,
                     chosen_discards: Vec::new(),
                     chosen_mana_payment: None,
                     chosen_counter_count: None,
