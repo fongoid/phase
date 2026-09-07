@@ -15,7 +15,10 @@
 #       interleaved handlers are documented as `| — |` rows, which the count
 #       ignores.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Resolved BEFORE the cd: a relative $0 re-resolves against the new working
+# directory, and the self-test block below would then silently find no suite.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SELF_DIR/.."
 
 SKILL=".claude/skills/oracle-parser/SKILL.md"
 ORACLE="crates/engine/src/parser/oracle.rs"
@@ -115,6 +118,13 @@ EOF
 #     also matches `parse_target_with_ctx`), so a row keeps passing after the
 #     symbol it names has been renamed away -- the exact drift this invariant
 #     exists to catch.
+#
+#     A row body must contain no unescaped ERE metacharacter. Under the old
+#     substring match a row like `fn peel_clause(` was a valid literal; under
+#     -E it is a regex syntax error, and grep's exit 2 is reported by the `||`
+#     below as documented-symbol-missing -- a regex bug wearing a doc-drift
+#     message. Escape the character, or pin the row with the declaration
+#     keyword instead (`const FOO`, `struct Bar`).
 # ---------------------------------------------------------------------------
 while IFS=$'\t' read -r pat file; do
   grep -qE "$pat" "$file" || err "documented symbol missing: '$pat' in $file"
@@ -226,19 +236,63 @@ done < <(grep -oE '// Priority [^:]+:' "$ORACLE" | sed -E 's#// Priority ##; s#:
 # Each entry is a symbol REMOVED or RENAMED by a landed refactor. If a future
 # rename retires a name the doc cites, add it here in the same commit.
 # ---------------------------------------------------------------------------
+# Both greps anchor the retired name with a trailing \b. Unanchored, a dead
+# name matches its own longer siblings, and both guards then fire on a tree that
+# is not stale: a NEW `parse_keyword_from_oracle_v2()` anywhere under the parser
+# trips the non-vacuity guard, and a SKILL.md citation of
+# `extract_keyword_line_v2()` trips the dead-cite guard. Both fail closed (a
+# spurious red, never a silent green), which is why this trailed invariant (2).
+#
+# Anchored on BOTH edges. Trailing alone still absorbs on the leading side, so a
+# legitimate citation of `new_extract_keyword_line()` matched retired
+# `extract_keyword_line` and redded a tree that was not stale. The non-vacuity
+# guard needs no leading `\b`: `fn ` already pins that edge, and a leading
+# boundary there would reject the `pub fn ` and `fn ` forms it must match.
+#
+# As with invariant (2), these are EREs now: an entry below must be a bare
+# identifier with no unescaped ERE metacharacter, or grep exits 2 and the `||`
+# reports a regex bug as doc drift.
 while IFS= read -r dead; do
   [ -n "$dead" ] || continue
-  if grep -q "$dead" "$SKILL"; then
+  if grep -qE "\b$dead\b" "$SKILL"; then
     err "SKILL.md cites '$dead', which no longer exists in the parser tree (renamed/removed)"
   fi
   # Non-vacuity: if the symbol came BACK, this list is the stale thing.
-  if grep -rq "fn $dead" crates/engine/src/parser/; then
+  if grep -rqE "fn $dead\b" crates/engine/src/parser/; then
     err "'$dead' is listed as dead but exists in the parser tree — update this list, not the doc"
   fi
 done <<'EOF'
 parse_keyword_from_oracle
 extract_keyword_line
 EOF
+
+# ---------------------------------------------------------------------------
+# (5) This gate's own regression suite, run ahead of the verdict.
+#
+# Every invariant above stands on its patterns discriminating: a row that keeps
+# matching after the symbol it names is renamed away reports green while the doc
+# it guards has rotted. That has shipped twice (an unanchored row absorbing its
+# longer siblings, and a row with no declaration keyword satisfied by a comment),
+# and neither was visible from this script's own output. The suite pins those as
+# properties, so it runs where the gate runs.
+#
+# The guard is also the recursion stop: the throwaway repos the suite builds
+# copy only this script, so the file is absent there and the fixture's own
+# invocation skips this block.
+#
+# Skipped when the tree is already failing. The fixtures copy the LIVE tree, so
+# genuine drift breaks them too, and reporting it a second time as "self-tests
+# failed" points at the suite rather than at the drift that actually caused it.
+# ---------------------------------------------------------------------------
+if [ "$fail" -eq 0 ] && [ -f "$SELF_DIR/check_skill_doc_tests.py" ]; then
+  # Invoked through the repo-relative path (we are at the repo root by now), so
+  # the interpreter never sees $SELF_DIR's shell-native spelling -- which is not
+  # the same string as a native path on every host.
+  if ! self_test_output="$(python3 scripts/check_skill_doc_tests.py 2>&1)"; then
+    printf '%s\n' "$self_test_output" >&2
+    err "gate self-tests failed — rerun: python3 scripts/check_skill_doc_tests.py"
+  fi
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "✗ STALE — update .claude/skills/oracle-parser/SKILL.md (see §12)" >&2

@@ -56,6 +56,18 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 67 — `DerivedViews::DungeonRoomView` gained required `card`
+///      (`DungeonCardView`) and `rooms` (`Vec<DungeonRoomNodeView>`) fields,
+///      publishing the dungeon card's Scryfall identity and the full room
+///      graph with each room's outgoing edges and its position on the card
+///      face. A PARSE bump like 66, not a silent capability loss like 24:
+///      neither field carries a serde default, so a v66 peer cannot
+///      deserialize a snapshot in which anyone is venturing. The break is
+///      symmetric — a v67 client reading a v66 host's `dungeon_rooms` entry
+///      finds no `card` and throws in render rather than degrading. Follows
+///      the same reasoning as the earlier dungeon-projection bump, which
+///      chose a parse break over letting a mismatched peer play on with a
+///      dead panel.
 /// 66 — `ReplacementCondition::FirstTokenCreationEachTurn` moved its required
 ///      `player` field to an optional `active_player_req`, and
 ///      `CopyTargetPurpose` gained a `CopyTokenSource` variant. Both are
@@ -400,7 +412,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 66;
+pub const PROTOCOL_VERSION: u32 = 67;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -427,6 +439,28 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 /// broker's window went disjoint from the shipped client's. This constant is
 /// the fix — it moves only for reasons the lobby can actually observe.
 ///
+/// 7 — Tournament game-format label and an "automatic + N" round option. Three
+///     fields are added, all `#[serde(default)]` and OPTIONAL, so this is the
+///     "a lobby field is added" trigger and nothing else. (a)
+///     `CreateTournament` gains `format: Option<GameFormat>` — a display label
+///     for the event's format, mirroring the `format: Option<GameFormat>`
+///     [`LobbyGame`] already carries — and (b) `plus_rounds: Option<u32>`,
+///     which adds N to the bracket- and arity-derived default round count for
+///     the "Swiss plus N" community shape (mutually exclusive with the existing
+///     `total_rounds` override, rejected at validation). (c) [`TournamentSummary`]
+///     gains `format: Option<GameFormat>`, server → client, so a browsing or
+///     spectating client sees the resolved label without recomputing it. This
+///     entry is one unbroken paragraph on purpose, for the reason entry 5 below
+///     spells out — a blank `///` line before 4-space-indented prose is a
+///     rustdoc code block. Purely ADDITIVE in BOTH directions, so
+///     [`MIN_SUPPORTED_LOBBY_PROTOCOL`] does **not** move and — unlike 6(c) — no
+///     client-side capability floor is needed. A new client's `format`/`plus_rounds`
+///     reaching a pre-7 broker deserialize away as unknown fields (no enum here
+///     sets `deny_unknown_fields`), so the event is created with no label and
+///     the auto round count, a silent capability loss rather than a parse error.
+///     A pre-7 broker's summary omitting `format` is inert against a new client
+///     whose consumer is `JSON.parse`. [`PROTOCOL_VERSION`] does **not** move:
+///     no variant here carries `GameState` or `GameAction`.
 /// 6 — Broker-owned tournament action legality, broker-owned default scoring,
 ///     and expiring/rotating tournament credentials. Three triggers fire at
 ///     once and any one of them alone would be mandatory. (a) Two
@@ -546,7 +580,7 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 ///     that direction can reject — into one legible handshake refusal.
 /// 1 — Initial lobby-owned version, covering the `LobbyClientMessage` /
 ///     `LobbyServerMessage` variant sets, unchanged since #1880.
-pub const LOBBY_PROTOCOL_VERSION: u32 = 6;
+pub const LOBBY_PROTOCOL_VERSION: u32 = 7;
 
 /// Lowest [`LOBBY_PROTOCOL_VERSION`] a broker accepts from a client.
 ///
@@ -759,6 +793,13 @@ pub struct TournamentSummary {
     /// fetching a full view, and because the summary already carries `status`,
     /// `current_round` and `total_rounds` — the very inputs the gate reads.
     pub open_actions: std::collections::BTreeSet<crate::tournament::TournamentAction>,
+    /// The event's game format, a display label only (Standard, Commander, …).
+    /// `None` when the organizer named none. Mirrors [`LobbyGame::format`]: the
+    /// tournament never touches `GameState`, so it carries the `GameFormat`
+    /// label rather than a full [`FormatConfig`], and enforces no deck legality.
+    /// Additive in lobby protocol 7; absent from a pre-7 broker's summary.
+    #[serde(default)]
+    pub format: Option<GameFormat>,
 }
 
 impl From<&crate::tournament::TournamentMeta> for TournamentSummary {
@@ -775,6 +816,7 @@ impl From<&crate::tournament::TournamentMeta> for TournamentSummary {
             created_at: meta.created_at,
             scoring: meta.scoring,
             open_actions: meta.open_actions(),
+            format: meta.format,
         }
     }
 }
@@ -942,10 +984,26 @@ pub enum LobbyClientMessage {
         #[serde(default)]
         scoring: Option<crate::tournament::ScoringPolicy>,
         bracket: crate::tournament::BracketShape,
-        /// Organizer override for the scheduled round count. `None` uses the
-        /// bracket- and arity-selected default.
+        /// Organizer override for the scheduled round count, an EXACT count that
+        /// wins outright. `None` uses the bracket- and arity-selected default.
+        /// Mutually exclusive with `plus_rounds` below — supplying both is
+        /// rejected at [`crate::validation`].
         #[serde(default)]
         total_rounds: Option<u32>,
+        /// "Automatic + N": add N to the bracket- and arity-derived default
+        /// round count (the "Swiss plus N" community shape). `None` adds
+        /// nothing. Kept a separate field from `total_rounds` rather than folded
+        /// into it because the broker still owns the base default — a client
+        /// that resolved `default + N` itself would be the recomputed rule the
+        /// resolver exists to keep server-side. Additive in lobby protocol 7.
+        #[serde(default)]
+        plus_rounds: Option<u32>,
+        /// The event's game-format label (Standard, Commander, …), sent back
+        /// resolved on [`TournamentSummary::format`]. Display metadata only: the
+        /// tournament never touches `GameState` and enforces no deck legality.
+        /// `None` names no format. Additive in lobby protocol 7.
+        #[serde(default)]
+        format: Option<GameFormat>,
     },
     /// Register as an entrant. `player_key` is **client-supplied** and opaque
     /// to the broker — the stable per-entrant identity, following
@@ -1373,7 +1431,7 @@ mod tests {
     /// rather than silently re-coupling the lobby to full-game churn.
     #[test]
     fn lobby_protocol_version_is_independent_of_the_full_game_one() {
-        assert_eq!(LOBBY_PROTOCOL_VERSION, 6);
+        assert_eq!(LOBBY_PROTOCOL_VERSION, 7);
         // Deliberately still 2, not 6: lobby versions 3, 4 and 5 are purely
         // additive, and 6 is additive in the only direction this floor governs
         // — its server → client fields are ignored by a consumer that does not
@@ -1399,12 +1457,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 65);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 66);
     }
 
     #[test]
@@ -1492,6 +1550,8 @@ mod tests {
             bracket: BracketShape::Swiss,
             total_rounds_override: Some(3),
             resolved_total_rounds: None,
+            plus_rounds: None,
+            format: None,
             current_round: 1,
             status: TournamentStatus::InProgress,
             players: vec![
@@ -1540,15 +1600,17 @@ mod tests {
     /// correlation took 5. Retargeting its number alone would have left a test
     /// whose name states a relationship it no longer checks, so the span is
     /// what it pins now, and the name says so. The same reasoning applies
-    /// again at 6: the chain grows a step and the name grows with it, rather
-    /// than the tail constant being quietly re-pointed.
+    /// again at 6, and once more at 7 for the format label and the "automatic +
+    /// N" round option: the chain grows a step and the name grows with it,
+    /// rather than the tail constant being quietly re-pointed.
     #[test]
-    fn the_tournament_surface_spans_lobby_versions_four_through_six() {
+    fn the_tournament_surface_spans_lobby_versions_four_through_seven() {
         const PRE_TOURNAMENT_LOBBY_VERSION: u32 = 3;
         const TOURNAMENT_SET_LOBBY_VERSION: u32 = PRE_TOURNAMENT_LOBBY_VERSION + 1;
         const CORRELATED_SETTLEMENT_LOBBY_VERSION: u32 = TOURNAMENT_SET_LOBBY_VERSION + 1;
         const BROKER_OWNED_POLICY_LOBBY_VERSION: u32 = CORRELATED_SETTLEMENT_LOBBY_VERSION + 1;
-        assert_eq!(LOBBY_PROTOCOL_VERSION, BROKER_OWNED_POLICY_LOBBY_VERSION);
+        const FORMAT_AND_PLUS_ROUNDS_LOBBY_VERSION: u32 = BROKER_OWNED_POLICY_LOBBY_VERSION + 1;
+        assert_eq!(LOBBY_PROTOCOL_VERSION, FORMAT_AND_PLUS_ROUNDS_LOBBY_VERSION);
     }
 
     /// The guard for [`is_known_lobby_tag`], which is a string `matches!` and
@@ -1666,6 +1728,8 @@ mod tests {
                 scoring: Some(ScoringPolicy::default_for_arity(MatchArity::COMMANDER_POD)),
                 bracket: BracketShape::Swiss,
                 total_rounds: Some(4),
+                plus_rounds: None,
+                format: None,
             },
             LobbyClientMessage::JoinTournament {
                 code: "TOUR01".to_string(),
@@ -2052,6 +2116,8 @@ mod tests {
             scoring: Some(ScoringPolicy::default_for_arity(MatchArity::HEAD_TO_HEAD)),
             bracket: BracketShape::Swiss,
             total_rounds: Some(3),
+            plus_rounds: None,
+            format: None,
         };
         let json = serde_json::to_string(&msg).expect("serializes");
         assert!(
@@ -2067,6 +2133,8 @@ mod tests {
             scoring: None,
             bracket: BracketShape::Swiss,
             total_rounds: Some(3),
+            plus_rounds: None,
+            format: None,
         };
         let omitted_json = serde_json::to_string(&omitted).expect("serializes");
         assert!(!omitted_json.contains(r#""win_points""#), "{omitted_json}");
@@ -2288,5 +2356,106 @@ mod tests {
             parse_lobby_client_message(&frame),
             ParsedFrame::Malformed(_)
         ));
+    }
+
+    /// Phase 1d: `FormatConfig::deserialize`'s admission gate now runs
+    /// through this exact wire chokepoint (`parse_lobby_client_message` ->
+    /// `serde_json::from_str::<LobbyClientMessage>` -> the embedded
+    /// `Option<FormatConfig>` field's own `Deserialize` impl), not just as an
+    /// engine-crate unit test. A single-field-varied host-configured
+    /// Commander config (max_players, starting_life,
+    /// commander_damage_threshold each on its own, then all three together)
+    /// must reach `ParsedFrame::Message`; a value outside the format's own
+    /// registry range must still route to `ParsedFrame::Malformed`.
+    fn create_game_with_settings_frame(format_config: FormatConfig) -> String {
+        let message = LobbyClientMessage::CreateGameWithSettings {
+            deck: DeckData::default(),
+            display_name: "Host".to_string(),
+            public: true,
+            password: None,
+            timer_seconds: None,
+            player_count: 2,
+            match_config: MatchConfig::default(),
+            format_config: Some(format_config),
+            room_name: None,
+            host_peer_id: None,
+            draft_metadata: None,
+            start_when_full: true,
+            ranked: false,
+        };
+        serde_json::to_string(&message).expect("message serializes")
+    }
+
+    #[test]
+    fn wire_frame_admits_a_single_field_varied_host_chosen_commander_config() {
+        let mut max_players_varied = FormatConfig::commander();
+        max_players_varied.max_players = 2;
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(max_players_varied)),
+                ParsedFrame::Message(_)
+            ),
+            "a Commander config with only max_players varied to 2 must parse as a message"
+        );
+
+        let mut starting_life_varied = FormatConfig::commander();
+        starting_life_varied.starting_life = 25;
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(starting_life_varied)),
+                ParsedFrame::Message(_)
+            ),
+            "a Commander config with only starting_life varied to 25 must parse as a message"
+        );
+
+        let mut threshold_varied = FormatConfig::commander();
+        threshold_varied.commander_damage_threshold = Some(30);
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(threshold_varied)),
+                ParsedFrame::Message(_)
+            ),
+            "a Commander config with only commander_damage_threshold varied to Some(30) must \
+             parse as a message"
+        );
+    }
+
+    #[test]
+    fn wire_frame_admits_the_untouched_commander_config_proving_the_envelope_is_fine() {
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(
+                    FormatConfig::commander()
+                )),
+                ParsedFrame::Message(_)
+            ),
+            "the untouched FormatConfig::commander() must parse as a message, proving the \
+             envelope itself is fine"
+        );
+    }
+
+    #[test]
+    fn wire_frame_admits_all_three_host_choices_combined_and_rejects_an_out_of_range_value() {
+        let mut combined = FormatConfig::commander();
+        combined.max_players = 2;
+        combined.starting_life = 25;
+        combined.commander_damage_threshold = Some(30);
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(combined)),
+                ParsedFrame::Message(_)
+            ),
+            "the realistic combined case (all three host choices at once) must parse as a message"
+        );
+
+        let mut out_of_range = FormatConfig::commander();
+        out_of_range.max_players = 9;
+        assert!(
+            matches!(
+                parse_lobby_client_message(&create_game_with_settings_frame(out_of_range)),
+                ParsedFrame::Malformed(_)
+            ),
+            "max_players: 9 is outside Commander's registry range and must route to Malformed"
+        );
     }
 }

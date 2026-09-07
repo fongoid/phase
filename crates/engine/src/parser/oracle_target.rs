@@ -386,9 +386,10 @@ pub(crate) fn parse_target_with_disjunctive_restriction(text: &str) -> (TargetFi
     (filter, &rest[consumed..])
 }
 
-/// CR 205.2a + CR 601.2h: Fold an INDEFINITE-ARTICLE-led right conjunct onto an
+/// CR 205.2a + CR 601.2h: Fold a DETERMINER-led right conjunct onto an
 /// already-parsed left conjunct — "another creature or an artifact"
-/// (Mold Folk's `{1}, Sacrifice another creature or an artifact:`).
+/// (Mold Folk's `{1}, Sacrifice another creature or an artifact:`) and the
+/// mirror-image "an artifact or another creature" (Malevolent Noble).
 ///
 /// Takes `base` and `rest` rather than parsing the phrase itself, and that split
 /// is LOAD-BEARING, not a style choice. In this surface "another" scopes only the
@@ -483,12 +484,26 @@ pub(crate) fn fold_article_led_type_union(base: TargetFilter, rest: &str) -> (Ta
     )
 }
 
-/// The connector of an article-led type union: `" or an "` / `" and/or a "`,
-/// returning the byte count consumed through the article. Requires a bare type
-/// word after the article and refuses the article-led BARE-card branch
+/// The connector of a determiner-led type union: `" or an "` / `" and/or a "` /
+/// `" or another "`, returning the byte count consumed up to the point where
+/// `parse_type_phrase_folding` should resume. Requires a bare type word after
+/// the determiner and refuses the article-led BARE-card branch
 /// ("or a card with disturb" — Shipwreck Sifters), which is a
 /// keyword-membership disjunct folded at the trigger layer rather than a
 /// card-type union. `input` is already lowercased.
+///
+/// THE INDEFINITE ARTICLE IS CONSUMED, "ANOTHER" IS NOT, and that asymmetry is
+/// load-bearing. "a"/"an" carry no filter content, and `parse_type_phrase_folding`
+/// has no article arm, so they must be eaten here. "another" DOES carry filter
+/// content — it excludes the ability's source from the leg it determines — and
+/// `parse_type_phrase_folding` is the single authority that turns that word into
+/// `FilterProp::Another`. Eating it here would silently drop the restriction from
+/// the right conjunct and let the source pay for itself: Malevolent Noble's
+/// "Sacrifice an artifact or another creature" would accept Malevolent Noble as
+/// its own creature leg. So the offset stops before "another" and hands the word
+/// on. Only the RIGHT conjunct is affected; the caller
+/// ([`fold_article_led_type_union`]) applies the left conjunct's own scoping
+/// before folding, exactly as its doc comment requires.
 fn parse_article_led_type_union_connector(input: &str) -> Option<usize> {
     let total = input.len();
     let (rest, _) = multispace0::<_, OracleError<'_>>(input).ok()?;
@@ -498,13 +513,18 @@ fn parse_article_led_type_union_connector(input: &str) -> Option<usize> {
     if is_article_led_bare_card(rest) {
         return None;
     }
-    let (after_article, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
-        .parse(rest)
-        .ok()?;
-    if !starts_with_type_word(after_article) {
-        return None;
-    }
-    Some(total - after_article.len())
+    // Longest-match-first: "another " is tried before "an ", which cannot match
+    // it anyway ("another"[2] is not a space) but the order documents intent.
+    let resume_at =
+        if let Ok((after_another, _)) = tag::<_, _, OracleError<'_>>("another ").parse(rest) {
+            starts_with_type_word(after_another).then_some(rest)?
+        } else {
+            let (after_article, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+                .parse(rest)
+                .ok()?;
+            starts_with_type_word(after_article).then_some(after_article)?
+        };
+    Some(total - resume_at.len())
 }
 
 /// One disjunct of a heterogeneous relative-clause restriction (see
@@ -1250,6 +1270,67 @@ pub fn parse_target_with_syntax<'a>(
                         }
                         leg_text = &rest[rest_lower.len() - next_leg.len()..];
                     }
+                }
+            }
+            // CR 115.1 + CR 601.2c + CR 603.3d: a `who`-headed relative clause
+            // narrows the PLAYER TARGET's legal domain, and every conjunct of it
+            // is load-bearing at announcement. Discarding it here — leaving the
+            // broad player noun behind and letting the caller drop the remainder
+            // — is what let the Exodus Oath cycle announce ANY player and resolve
+            // on every upkeep regardless of the printed comparison (Oath of
+            // Druids, Oath of Lieges). This is the target-position mirror of the
+            // trigger-event hook in `oracle_trigger`, and it shares that hook's
+            // two rules: the clause must be modelled in FULL, and it must end at
+            // a real clause boundary.
+            //
+            // Each conjunct becomes its own `PlayerMatching` leg; a single
+            // conjunct stays unwrapped so the common one-restriction shape does
+            // not grow a redundant `And`. The bare `TargetFilter::Player` head
+            // noun is the identity for a player population (CR 102.1) and is
+            // dropped from the conjunction; any narrower head noun ("target
+            // opponent") is kept as its own leg so the base and predicate axes
+            // compose instead of one shadowing the other.
+            //
+            // The attempt is SPECULATIVE, so it runs against a cloned
+            // `ParseContext` and commits with `*ctx = tentative_ctx` only once the
+            // clause is accepted — the same discipline the damage-chain
+            // recognizers use. The inner type-phrase parse mutates `ctx`
+            // (`relative_player_scope`, the printed-colour choice, …), and a
+            // declined clause must not leak those writes into the fallback parse.
+            // Every head-noun tag above stops before the separating space, so the
+            // remainder begins with the character AFTER the noun: a space before
+            // a relative clause, or ","/"."/eof otherwise. Peel that one space
+            // with the same `tag(" ")` the trigger-side hook uses, so both seams
+            // hand the predicate grammar an identically normalized slice.
+            let after_noun_orig = &text[lower.len() - after_player.len()..];
+            let after_noun = tag::<_, _, OracleError<'_>>(" ")
+                .parse(after_noun_orig)
+                .map_or(after_noun_orig, |(after, _)| after);
+            let mut tentative_ctx = ctx.clone();
+            if let Ok((clause_rest, predicates)) =
+                super::oracle_effect::parse_target_player_relative_clause(
+                    after_noun,
+                    &mut tentative_ctx,
+                )
+            {
+                let clause_rest_lower = clause_rest.to_lowercase();
+                if nom_primitives::peek_clause_terminator(&clause_rest_lower).is_ok() {
+                    *ctx = tentative_ctx;
+                    let mut legs: Vec<TargetFilter> = Vec::new();
+                    if !matches!(player_filter, TargetFilter::Player) {
+                        legs.push(player_filter.clone());
+                    }
+                    legs.extend(predicates.into_iter().map(|player| {
+                        TargetFilter::PlayerMatching {
+                            player: Box::new(player),
+                        }
+                    }));
+                    let bound = if legs.len() == 1 {
+                        legs.remove(0)
+                    } else {
+                        TargetFilter::And { filters: legs }
+                    };
+                    return (bound, clause_rest, syntax);
                 }
             }
             return (

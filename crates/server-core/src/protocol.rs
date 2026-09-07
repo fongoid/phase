@@ -5,7 +5,7 @@ use engine::types::ability::AbilityBlockEntry;
 use engine::types::action_rejection::ActionRejection;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::format::FormatConfig;
+use engine::types::format::{FormatConfig, GameFormat};
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::interaction::{
@@ -548,6 +548,17 @@ pub enum ClientMessage {
         bracket: BracketShape,
         #[serde(default)]
         total_rounds: Option<u32>,
+        /// "Automatic + N" round addend, mirroring
+        /// [`lobby_broker::LobbyClientMessage::CreateTournament`]'s field in the
+        /// same position with the same serde attribute (added in lockstep for
+        /// lobby protocol 7). Mutually exclusive with `total_rounds`.
+        #[serde(default)]
+        plus_rounds: Option<u32>,
+        /// The event's game-format label, mirroring
+        /// [`lobby_broker::LobbyClientMessage::CreateTournament`]'s field. A
+        /// display label only; the tournament enforces no deck legality.
+        #[serde(default)]
+        format: Option<GameFormat>,
     },
     JoinTournament {
         code: String,
@@ -3194,8 +3205,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_66_for_token_copy_source_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+    fn protocol_version_is_67_for_dungeon_card_and_room_graph() {
+        assert_eq!(PROTOCOL_VERSION, 67);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3206,7 +3217,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_66_for_token_copy_source_shapes` stays
+    /// `protocol_version_is_67_for_dungeon_card_and_room_graph` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
