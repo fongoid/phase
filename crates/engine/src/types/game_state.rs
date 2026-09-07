@@ -7888,10 +7888,11 @@ pub struct PendingManaAbility {
     /// [`Self::chosen_mana_payment`], two fields below, and the already-correct
     /// `chosen_x.is_none()` presence gate.
     ///
-    /// **WIRE ASYMMETRY — this retype is NOT wire-compatible in both
-    /// directions.** Old→new is safe: an absent field decodes to `None`
-    /// (unanswered) and a non-empty array decodes to `Some`. New→old is
-    /// SILENTLY INVERTED: `Some(vec![])` serializes as `chosen_tappers: []`,
+    /// **WIRE BREAK — this retype is deliberately not wire-compatible.** A
+    /// pre-68 unanswered payload omits this field, and the custom deserializer
+    /// rejects that shape rather than silently decoding it as `None`; a
+    /// non-empty old array is the only old shape that decodes to `Some`. New→old
+    /// is SILENTLY INVERTED: `Some(vec![])` serializes as `chosen_tappers: []`,
     /// which an old build decodes to `Vec::new()` and its `is_empty()` gate
     /// reads as *unanswered* — re-prompting forever, the exact livelock this
     /// field's `Option` fixes. The path is serialized, not theoretical:
