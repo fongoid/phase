@@ -335,7 +335,8 @@ fn a_delayed_any_opponent_permission_fans_out_in_apnap_order_at_the_delayed_trig
     let source = scenario
         .add_creature(PROTECTED, "Delayed Permission Source", 1, 1)
         .with_trigger_definition(
-            TriggerDefinition::new(TriggerMode::ChangesZone)
+            TriggerDefinition::new(TriggerMode::DamageDone)
+                .valid_source(TargetFilter::SelfRef)
                 .execute(wrapper)
                 .trigger_zones(vec![Zone::Battlefield]),
         )
@@ -354,6 +355,12 @@ fn a_delayed_any_opponent_permission_fans_out_in_apnap_order_at_the_delayed_trig
         }],
     );
     runner.advance_until_stack_empty();
+
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach-guard: the DamageDone creator matched its DamageDealt event and installed the delayed trigger"
+    );
 
     // Reach-guard: the permission was NOT offered at creation time. If the
     // parser had lifted `optional` to the wrapper, the cascade would have fired
