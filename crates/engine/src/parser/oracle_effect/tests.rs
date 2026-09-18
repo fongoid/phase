@@ -64226,17 +64226,37 @@ fn they_may_trigger_head_still_covers_the_shapes_assembly_cannot_see() {
             &["Enchantment".to_string()],
             &[],
         );
+        // Select by the TRIGGER'S OWN condition — "a creature an opponent
+        // controls dies" — never by the value under assertion. Meathook has two
+        // optional PayCost triggers: the sibling "you may pay 3 life" fires on a
+        // creature YOU control dying and is also `optional: true`, so a selector
+        // keyed on `optional_player` (or on the effect shape, which is `PayCost`
+        // for both) would pick the sibling on a mis-stamp and still pass.
         let node = parsed
             .triggers
             .iter()
             .find(|t| {
-                t.execute
+                // Condition AND effect identity together: `valid_card` controller
+                // separates the two PayCost triggers ("a creature an opponent
+                // controls dies" vs "a creature you control dies"), and the
+                // `PayCost` shape pins which effect we are asserting about.
+                matches!(
+                    &t.valid_card,
+                    Some(TargetFilter::Typed(tf))
+                        if tf.controller == Some(ControllerRef::Opponent)
+                ) && t
+                    .execute
                     .as_deref()
-                    .is_some_and(|e| e.optional_player == Some(TargetFilter::TriggeringPlayer))
+                    .is_some_and(|e| matches!(&*e.effect, Effect::PayCost { .. }))
             })
             .and_then(|t| t.execute.as_deref())
-            .expect("Meathook Massacre II: expected a trigger stamped Some(TriggeringPlayer) by the detector");
+            .expect("Meathook Massacre II: expected the opponent-creature-dies trigger");
         assert!(node.optional, "reach-guard: the clause carries a may");
+        assert_eq!(
+            node.optional_player,
+            Some(TargetFilter::TriggeringPlayer),
+            "CR 608.2c + CR 608.2d: \"they may pay 3 life\" names the triggering player"
+        );
     }
 
     // Game Knights Live ×2 — unparsed `Effect::Unimplemented` bodies. The

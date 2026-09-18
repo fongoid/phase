@@ -1691,7 +1691,18 @@ fn subject_anchored_optional_actor(
     def: &AbilityDefinition,
     window: ActorBindingWindow,
 ) -> Option<TargetFilter> {
-    if !def.optional {
+    // CR 608.2d + CR 101.4: an any-opponent permission (`optional_for`) already
+    // names its own announcing seats and fans them out in APNAP order. That
+    // fan-out is gated on `ability.optional` (`effects::resolve_chain_body`), so
+    // a subject stamp here would be a SECOND announcer authority on the same
+    // node AND would hold `optional` down on the payload, silently skipping the
+    // cascade. Refuse, so the may and its scope lift together to the wrapper and
+    // the fan-out still fires. The clause-level call site carries this guard
+    // explicitly; asking it here too makes BOTH sites inherit it — the same
+    // call-site symmetry whose absence produced the Arcane Denial regression.
+    // Measured: zero corpus nodes reach the deferred window with `optional_for`
+    // set, so this is a forward guard, not a fix for a live card.
+    if !def.optional || def.optional_for.is_some() {
         return None;
     }
     // CR 608.2c: the clause's anaphor, read from wherever this node already
@@ -3294,39 +3305,70 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 // and the announcing player is the named one, not the wrapper's
                 // controller. Keep the flag on the payload and stamp the actor so
                 // `effects::optional_prompt_player` routes the prompt there.
-                let lifted_optional = match subject_anchored_optional_actor(
-                    &inner,
-                    ActorBindingWindow::DeferredDelayedTrigger,
-                ) {
-                    Some(actor) => {
-                        inner.optional_player = Some(actor);
-                        false
-                    }
-                    None => {
-                        // CR 603.7d + CR 603.7e: the may belongs to the delayed
-                        // ability's own controller — the player who controlled the
-                        // creating spell or ability as it resolved — so it lifts to
-                        // the wrapper. Any announcer the CLAUSE-LEVEL stamp wrote on
-                        // this payload named a player the deferred window refuses (an
-                        // event-context anaphor resolves against
-                        // `state.current_trigger_event`, which at that later
-                        // resolution is the DELAYED ability's own trigger event per
-                        // CR 603.7b — a different event, and a referent CR 608.2c
-                        // never licensed), and it must not outlive the gate it
-                        // belonged to. Not merely a stray `card-data.json` key:
-                        // `stack.rs`'s three batch-collapse proofs read
-                        // `!*optional && optional_player.is_none()`, and a payload
-                        // whose `optional` was just lifted to `false` now REACHES
-                        // that conjunct, so a residue would silently defeat a
-                        // collapse base performed. Clearing restores the base node
-                        // byte for byte. Safe unconditionally: the only writer that
-                        // can have run before this point is the clause-level stamp,
-                        // on this same node, in this same clause iteration.
-                        inner.optional_player = None;
-                        std::mem::replace(&mut inner.optional, false)
+                //
+                // CR 608.2d + CR 101.4: a delayed "any opponent/player may"
+                // permission is a THIRD case, and it keeps BOTH halves on the
+                // payload. Its APNAP fan-out (`effects::resolve_chain_body`) is
+                // gated on `ability.optional`, so the two are one unit: lifting
+                // `optional` to the wrapper would fire the cascade when the
+                // CREATING clause resolves — the wrong moment, since CR 603.7
+                // ("do something at a later time") plus CR 608.2d (choices are
+                // announced WHILE APPLYING the effect) put the permission at the
+                // delayed ability's own resolution —
+                // and lifting `optional_for` without it would strand a scope on a
+                // node whose gate never opens. The "harmlessly earlier moment"
+                // rationale above is specific to a CONTROLLER-held may; it does
+                // not extend to a permission whose eligible seats and timing are
+                // both determined at the delayed resolution. Subject-actor routing
+                // therefore applies only to the non-fan-out path.
+                // Measured: zero corpus payloads carry `optional_for`, so this is
+                // a forward guard rather than a fix for a live card.
+                let carries_delayed_fanout = inner.optional_for.is_some();
+                let lifted_optional = if carries_delayed_fanout {
+                    false
+                } else {
+                    match subject_anchored_optional_actor(
+                        &inner,
+                        ActorBindingWindow::DeferredDelayedTrigger,
+                    ) {
+                        Some(actor) => {
+                            inner.optional_player = Some(actor);
+                            false
+                        }
+                        None => {
+                            // CR 603.7d + CR 603.7e: the may belongs to the delayed
+                            // ability's own controller — the player who controlled the
+                            // creating spell or ability as it resolved — so it lifts to
+                            // the wrapper. Any announcer the CLAUSE-LEVEL stamp wrote on
+                            // this payload named a player the deferred window refuses (an
+                            // event-context anaphor resolves against
+                            // `state.current_trigger_event`, which at that later
+                            // resolution is the DELAYED ability's own trigger event per
+                            // CR 603.7b — a different event, and a referent CR 608.2c
+                            // never licensed), and it must not outlive the gate it
+                            // belonged to. Not merely a stray `card-data.json` key:
+                            // `stack.rs`'s three batch-collapse proofs read
+                            // `!*optional && optional_player.is_none()`, and a payload
+                            // whose `optional` was just lifted to `false` now REACHES
+                            // that conjunct, so a residue would silently defeat a
+                            // collapse base performed. Clearing restores the base node
+                            // byte for byte. Safe unconditionally: the only writer that
+                            // can have run before this point is the clause-level stamp,
+                            // on this same node, in this same clause iteration.
+                            inner.optional_player = None;
+                            std::mem::replace(&mut inner.optional, false)
+                        }
                     }
                 };
-                let lifted_optional_for = std::mem::take(&mut inner.optional_for);
+                // The wrapper never carries a fan-out scope: a permission keeps
+                // `optional_for` on its payload (above), and every other payload
+                // has none to lift. Kept as a named binding so the wrapper's
+                // field assignment below still reads uniformly with its siblings.
+                let lifted_optional_for = if carries_delayed_fanout {
+                    None
+                } else {
+                    std::mem::take(&mut inner.optional_for)
+                };
                 let lifted_repeat_for = std::mem::take(&mut inner.repeat_for);
                 let lifted_player_scope = std::mem::take(&mut inner.player_scope);
                 // CR 608.2c: The `CreateDelayedTrigger` wrapper — not its payload —
@@ -4613,6 +4655,78 @@ mod arena_tests {
 
     fn chain_len(def: &AbilityDefinition) -> usize {
         1 + def.sub_ability.as_deref().map_or(0, chain_len)
+    }
+
+    /// CR 608.2d + CR 101.4 + CR 603.7: a delayed "any opponent may" permission
+    /// keeps `optional` AND `optional_for` TOGETHER on the payload.
+    ///
+    /// This drives `assemble_effect_chain` directly, which is the only way to
+    /// reach the branch: `clause_shell`'s opponent-may peel drops its scope
+    /// before assembly on the delayed path, so no Oracle text produces the shape
+    /// (measured: zero corpus delayed payloads carry `optional_for`). The
+    /// runtime half — that the payload's shape then fans out in APNAP order at
+    /// the delayed trigger — is pinned by
+    /// `a_delayed_any_opponent_permission_fans_out_in_apnap_order_at_the_delayed_trigger`
+    /// in `tests/integration/subject_anchored_optional_announcer.rs`.
+    ///
+    /// Reverting the `carries_delayed_fanout` guard flips `optional` onto the
+    /// wrapper and empties the payload's scope, failing both halves below.
+    #[test]
+    fn a_delayed_fanout_permission_keeps_optional_and_optional_for_on_the_payload() {
+        use crate::types::ability::OpponentMayScope;
+        let mut builder = ClauseIrBuilder::new("any opponent may shuffle at the next end step");
+        builder
+            .clause(
+                "any opponent may shuffle at the next end step",
+                parsed_clause(shuffle_effect()),
+                Some(ClauseBoundary::Sentence),
+                ClauseDisposition::Emit {
+                    followup: None,
+                    intrinsic: None,
+                },
+            )
+            .is_optional(true)
+            .opponent_may_scope(Some(OpponentMayScope::AnyOpponent))
+            .delayed_condition(Some(DelayedTriggerCondition::AtNextPhase {
+                phase: Phase::End,
+            }))
+            .push();
+        let assembled = assemble_effect_chain(&chain_ir(builder.finish(), AbilityKind::Spell));
+
+        // Reach-guard: we really are looking at the delayed wrapper.
+        let Effect::CreateDelayedTrigger {
+            effect: payload, ..
+        } = &*assembled.effect
+        else {
+            panic!(
+                "reach-guard: the clause must assemble to a CreateDelayedTrigger, got {:?}",
+                assembled.effect
+            );
+        };
+
+        assert!(
+            payload.optional,
+            "CR 608.2d + CR 101.4: the permission's gate stays on the payload — lifting it \
+             to the wrapper fires the APNAP cascade when the CREATING clause resolves, not \
+             at the delayed trigger (CR 603.7 + CR 608.2d)"
+        );
+        assert_eq!(
+            payload.optional_for,
+            Some(OpponentMayScope::AnyOpponent),
+            "CR 101.4: the scope stays with the gate it belongs to"
+        );
+        assert!(
+            !assembled.optional,
+            "the wrapper must NOT carry the permission's gate"
+        );
+        assert_eq!(
+            assembled.optional_for, None,
+            "the wrapper must NOT carry the permission's scope"
+        );
+        assert_eq!(
+            payload.optional_player, None,
+            "CR 608.2d: a fan-out permission names its own seats; no subject stamp is added"
+        );
     }
 
     fn first_delayed_after(def: &AbilityDefinition) -> &AbilityDefinition {

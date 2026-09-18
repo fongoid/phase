@@ -2003,9 +2003,19 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // `TriggeringPlayer`, so the guard is byte-neutral on today's corpus; without
     // it, a future "they may"-headed trigger whose clause names a DIFFERENT anaphor
     // would have the correct stamp overwritten.
+    //
+    // CR 608.2d + CR 101.4: the `optional_for` conjunct keeps this writer inside
+    // the same single-announcer invariant `subject_anchored_optional_actor` now
+    // enforces at the other two sites — an any-opponent permission names its own
+    // seats in APNAP order, so a subject stamp beside it would be a second
+    // authority. Unreachable today (a `"they may "` body head and an
+    // `"any opponent may"` head are mutually exclusive) and runtime-inert if it
+    // were reached, because the fan-out returns before `optional_player` is read;
+    // the stamp would only land as a stray serialized key. Guarded for the
+    // invariant, not for a live card.
     if let Some(optional_player) = &modifiers.optional_player {
         if let Some(ability) = execute.as_deref_mut() {
-            if ability.optional_player.is_none() {
+            if ability.optional_player.is_none() && ability.optional_for.is_none() {
                 ability.optional_player = Some(optional_player.clone());
             }
         }

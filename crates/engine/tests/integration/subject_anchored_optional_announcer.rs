@@ -256,3 +256,169 @@ fn academy_loremaster_each_player_announces_their_own_additional_draw() {
         "reach-guard: turns advanced through PROTECTED's auto-answered draw step"
     );
 }
+
+/// CR 608.2d + CR 101.4 + CR 603.7: a DELAYED "any opponent may" permission
+/// fans out in APNAP order **when the delayed ability resolves**, not when the
+/// clause that created it resolves.
+///
+/// This is the runtime half of the parser's third delayed case. The fan-out in
+/// `effects::resolve_chain_body` is gated on `ability.optional`, so `optional`
+/// and `optional_for` are one unit: if the parser lifted `optional` to the
+/// `CreateDelayedTrigger` wrapper (as it does for an ordinary controller-held
+/// may, where asking earlier is harmless), the wrapper would fan out at
+/// CREATION time and the delayed payload's gate would never open — the
+/// permission would be offered at the wrong moment, to seats chosen at the
+/// wrong moment. Keeping both on the payload is what this test pins.
+///
+/// No printed card produces this shape today (measured: zero corpus delayed
+/// payloads carry `optional_for`), so the permission is constructed directly.
+/// The delayed trigger is still created and fired through the production
+/// pipeline (`process_triggers` → stack resolution → real turn advancement).
+///
+/// SCOPE, stated plainly: because the shape is hand-built, this test does NOT
+/// exercise the parser branch and does NOT fail if the parser's coupling guard
+/// is reverted — verified by disabling `carries_delayed_fanout` and watching it
+/// still pass. It is a characterization test for the RUNTIME contract the
+/// coupling exists to protect: given a payload carrying both halves, every
+/// eligible opponent is offered in APNAP order at the delayed trigger. The
+/// parser half — that assembly keeps both halves on the payload — is pinned,
+/// and does fail on revert, by
+/// `assembly::arena_tests::a_delayed_fanout_permission_keeps_optional_and_optional_for_on_the_payload`.
+/// The two together cover the claim; neither does alone.
+#[test]
+fn a_delayed_any_opponent_permission_fans_out_in_apnap_order_at_the_delayed_trigger() {
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, DelayedTriggerCondition, Effect, OpponentMayScope,
+        QuantityExpr, TargetFilter,
+    };
+    use engine::types::triggers::TriggerMode;
+    use engine::types::zones::Zone;
+    use engine::types::TriggerDefinition;
+
+    const THIRD: PlayerId = PlayerId(2);
+
+    // The delayed PAYLOAD: "any opponent may gain 2 life", carrying BOTH halves
+    // of the permission — the pair the parser must not split.
+    let mut payload = AbilityDefinition::new(
+        AbilityKind::Database,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Controller,
+        },
+    );
+    payload.optional = true;
+    payload.optional_for = Some(OpponentMayScope::AnyOpponent);
+
+    // The wrapper that creates it at the next end step. Deliberately NOT
+    // optional: the permission belongs to the payload.
+    let wrapper = AbilityDefinition::new(
+        AbilityKind::Database,
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            effect: Box::new(payload),
+            uses_tracked_set: false,
+        },
+    );
+
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    // Stock every library: `advance_to_end_step` walks real turns, and an empty
+    // library decks a player out (CR 704.5b), ending the game before the delayed
+    // trigger ever fires.
+    for &pid in &[PROTECTED, RESTRICTED, THIRD] {
+        scenario.with_library_top(
+            pid,
+            &[
+                "Lib A", "Lib B", "Lib C", "Lib D", "Lib E", "Lib F", "Lib G", "Lib H",
+            ],
+        );
+    }
+    let source = scenario
+        .add_creature(PROTECTED, "Delayed Permission Source", 1, 1)
+        .with_trigger_definition(
+            TriggerDefinition::new(TriggerMode::ChangesZone)
+                .execute(wrapper)
+                .trigger_zones(vec![Zone::Battlefield]),
+        )
+        .id();
+    let mut runner = scenario.build();
+
+    // Fire the creating trigger through the production path.
+    process_triggers(
+        runner.state_mut(),
+        &[GameEvent::DamageDealt {
+            source_id: source,
+            target: TargetRef::Player(RESTRICTED),
+            amount: 1,
+            is_combat: true,
+            excess: 0,
+        }],
+    );
+    runner.advance_until_stack_empty();
+
+    // Reach-guard: the permission was NOT offered at creation time. If the
+    // parser had lifted `optional` to the wrapper, the cascade would have fired
+    // here and this would be an `OpponentMayChoice` already.
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { .. }
+        ),
+        "CR 603.7 + CR 608.2d: the permission belongs to the DELAYED resolution, not to the clause that \
+         created it — got {:?}",
+        runner.state().waiting_for
+    );
+
+    // Now let the delayed trigger fire. Drive real turns past combat rather
+    // than calling `advance_to_end_step`, which stops on declare-attackers.
+    for _ in 0..400 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { .. }
+        ) {
+            break;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::DeclareAttackers { .. } => {
+                runner
+                    .act(GameAction::DeclareAttackers {
+                        attacks: vec![],
+                        bands: vec![],
+                    })
+                    .ok();
+            }
+            WaitingFor::DeclareBlockers { .. } => {
+                runner
+                    .act(GameAction::DeclareBlockers {
+                        assignments: vec![],
+                    })
+                    .ok();
+            }
+            _ => {
+                runner.act(GameAction::PassPriority).ok();
+            }
+        }
+    }
+
+    match runner.state().waiting_for.clone() {
+        WaitingFor::OpponentMayChoice {
+            player, remaining, ..
+        } => {
+            assert_eq!(
+                player, RESTRICTED,
+                "CR 101.4: APNAP order offers the first opponent after the controller"
+            );
+            assert!(
+                remaining.contains(&THIRD),
+                "CR 608.2d + CR 101.4: every eligible opponent is queued, got remaining {remaining:?}"
+            );
+            assert!(
+                !remaining.contains(&PROTECTED),
+                "CR 608.2d: AnyOpponent excludes the controller"
+            );
+        }
+        other => panic!(
+            "CR 608.2d + CR 101.4: the delayed permission must fan out to opponents in APNAP \
+             order at the delayed trigger, got {other:?}"
+        ),
+    }
+}
