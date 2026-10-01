@@ -16456,8 +16456,8 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
 /// `filter: None`.
 ///
 /// Controller scope ("creatures you control") does NOT narrow the class for
-/// counting purposes. The count subject's own `scope` already restricts the
-/// counted attackers by controller (`attackers_declared_count`), so a bare
+/// counting purposes. A `Controller` count subject's own `scope` already
+/// restricts counted attackers by controller (`attackers_declared_count`), so a bare
 /// `Creature`/`Permanent` filter with only a controller set still returns
 /// `false` here.
 fn filter_narrows_beyond_creature(filter: &TargetFilter) -> bool {
@@ -16585,7 +16585,7 @@ fn subject_attack_count_condition(
                 },
             }),
         },
-        // CR 508.1a + CR 603.2c: count only attackers of the SAME filtered
+        // CR 508.1a + CR 603.2: count only attackers of the SAME filtered
         // class (e.g. Dinosaurs), not every co-attacker — otherwise "two or
         // more Dinosaurs attack" over-fires on 1 Dinosaur + 1 unrelated
         // attacker. This head-noun form is not source-relative, so use the
