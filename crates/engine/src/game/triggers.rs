@@ -15456,9 +15456,11 @@ fn attackers_declared_count(
     match subject {
         crate::types::ability::AttackersDeclaredCountSubject::Controller { scope, filter } => {
             // `TriggeringPlayer` reads the controller of the first attacker in
-            // the (possibly per-attacker narrowed) event — the one attacking
-            // player a per-player form names (CR 805.10c). Falls back to None
-            // if unavailable.
+            // the (possibly per-attacker narrowed) event. Under shared team
+            // turns one combined declaration can hold several attacking
+            // players' creatures (CR 805.10b); CR 805.10c names one specific
+            // attacking player, which this first-attacker read only
+            // approximates. Falls back to None if unavailable.
             let triggering_player = attacker_ids
                 .iter()
                 .find_map(|id| state.objects.get(id).map(|o| o.controller));
