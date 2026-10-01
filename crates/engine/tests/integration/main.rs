@@ -1114,6 +1114,7 @@ mod mutable_pupa_perpetual_keyword_mirror;
 mod mycoloth_upkeep_trigger;
 mod myrkul_crew_phase1_incarnation;
 mod mystic_forge_regression;
+mod n_or_more_creatures_attack_any_player;
 mod name_sticker_goblin;
 mod named_choice_free_entry_contract;
 mod namor_attacking_that_player;

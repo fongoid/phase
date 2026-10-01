@@ -14,8 +14,8 @@ use super::oracle_effect::gap_diagnosis::clause_gap_unimplemented;
 use super::oracle_effect::{
     attach_terminal_die_result_branches_before_finalization, condition_text_is_rehomeable,
     lower_effect_chain_ir, parse_effect_chain_ir, parse_player_relative_clause,
-    rebind_event_context_amount_counts_in_ability, try_parse_reanimator_aura_etb_effect_ir,
-    try_parse_reanimator_aura_grant_etb_effect_ir,
+    rebind_event_context_amount_counts_in_ability, target_filter_controller_ref,
+    try_parse_reanimator_aura_etb_effect_ir, try_parse_reanimator_aura_grant_etb_effect_ir,
 };
 use super::oracle_ir::ast::parsed_clause;
 use super::oracle_ir::context::{ParseContext, TriggerConditionScope, TriggerZoneChangeProvenance};
@@ -16471,6 +16471,75 @@ fn filter_narrows_beyond_creature(filter: &TargetFilter) -> bool {
     }
 }
 
+/// Attacking-player gate and attacker-count scope named by a subject-led
+/// "N or more <subject> attack" trigger's controller clause.
+struct SubjectAttackScope {
+    /// `TriggerDefinition.valid_target` — read by `matching_you_attack_pairs`
+    /// as the attacking-player gate.
+    gate: Option<TargetFilter>,
+    /// CR 508.1a + CR 603.2c: `AttackersDeclaredCountSubject::Controller.scope`
+    /// — whose declared attackers are counted, once per declaration. Consumed
+    /// only when the quantifier's minimum count is greater than one.
+    count_scope: ControllerRef,
+}
+
+/// CR 506.2 + CR 508.1a: the active player is the attacking player and
+/// declares only creatures they control, so the controller scope a subject-led
+/// "N or more <subject> attack" trigger names on its subject IS the scope of
+/// attacking players it watches. Maps that scope to both the attacking-player
+/// gate and the attacker-count scope in ONE exhaustive decision, so the gate
+/// and the count can never accept different scopes. Returns `None` (decline
+/// the parse) for scopes neither runtime evaluator can read.
+fn subject_attack_scope(subject_scope: Option<&ControllerRef>) -> Option<SubjectAttackScope> {
+    match subject_scope {
+        // CR 603.2 + CR 506.2: an unscoped subject ("one or more creatures
+        // attack") watches every attacking player — pass-through gate, and the
+        // count reads the attacking player's own declaration (every attacker
+        // is controlled by the attacking player).
+        // CR 303.4e: this arm also covers attachment-relation subjects
+        // ("enchanted by an Aura / equipped by an Equipment you control"):
+        // "you control" binds to the attachment (carried as a `HasAttachment`
+        // property on `valid_card`), not the attacker — the enchanted/equipped
+        // creature may be controlled by an opponent (Killian, Decisive Mentor;
+        // #3314). The pass-through gate carries no attack-target restriction.
+        None => Some(SubjectAttackScope {
+            gate: Some(TargetFilter::Player),
+            count_scope: ControllerRef::TriggeringPlayer,
+        }),
+        // CR 109.5: "you" is the source's controller — the canonical YouAttack
+        // encoding (no gate ⇒ attacking player must be the source controller).
+        Some(ControllerRef::You) => Some(SubjectAttackScope {
+            gate: None,
+            count_scope: ControllerRef::You,
+        }),
+        Some(ControllerRef::Opponent) => Some(SubjectAttackScope {
+            gate: Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent),
+            )),
+            count_scope: ControllerRef::Opponent,
+        }),
+        // `player_matches_filter` (gate) and `attackers_declared_count` (count)
+        // cannot evaluate these scopes: accepting would fail open on the gate
+        // (fire on every attacking player) or never fire on the count. Decline
+        // at every quantifier so coverage stays honest.
+        Some(
+            ControllerRef::ScopedPlayer
+            | ControllerRef::TargetPlayer
+            | ControllerRef::TargetOpponent
+            | ControllerRef::ParentTargetController
+            | ControllerRef::EventTargetController
+            | ControllerRef::ParentTargetOwner
+            | ControllerRef::DefendingPlayer
+            | ControllerRef::ChosenPlayer { .. }
+            | ControllerRef::SourceChosenPlayer
+            | ControllerRef::TriggeringPlayer
+            | ControllerRef::EnchantedPlayer
+            | ControllerRef::ActivePlayer
+            | ControllerRef::SpecificPlayer { .. },
+        ) => None,
+    }
+}
+
 /// Append `attachment_prop` to a `TargetFilter::Typed`'s properties if present,
 /// else return the filter unchanged. Non-Typed filters are returned as-is.
 fn apply_attachment_prop(filter: TargetFilter, prop: Option<FilterProp>) -> TargetFilter {
@@ -16512,8 +16581,15 @@ fn try_parse_you_attack_with_commander(lower: &str) -> Option<(TriggerMode, Trig
     Some((TriggerMode::YouAttack, def))
 }
 
-/// Parse "whenever N or more creatures [you control] attack [a player]" patterns.
+/// Parse "whenever N or more <subject> attack [a player]" patterns.
 /// CR 508.1a: Handles both "one or more" and "two or more" quantifiers.
+///
+/// CR 506.2 + CR 508.1a: the attacking-player gate (`valid_target`) and the
+/// attacker-count scope are both derived from the subject's controller clause
+/// via `subject_attack_scope`: unscoped subjects ("one or more creatures
+/// attack") watch every attacking player, "you control" watches only the
+/// source's controller, "your opponents control" watches opponents. Subject
+/// scopes the runtime cannot evaluate decline the parse.
 fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
     for (prefix, min_count) in [
         ("whenever one or more ", 1u32),
@@ -16545,8 +16621,16 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
             continue;
         }
 
-        let has_attachment_clause = attachment_prop.is_some();
         let filter = apply_attachment_prop(filter, attachment_prop);
+
+        // CR 506.2 + CR 508.1a: the subject's controller scope is the
+        // attacking-player scope. Decided before any quantifier branch so an
+        // unevaluable scope declines at every count.
+        let Some(SubjectAttackScope { gate, count_scope }) =
+            subject_attack_scope(target_filter_controller_ref(&filter).as_ref())
+        else {
+            continue;
+        };
 
         let mut def = make_base();
         def.mode = TriggerMode::YouAttack;
@@ -16556,16 +16640,7 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
         if attacks_player {
             def.attack_target_filter = Some(AttackTargetFilter::Player);
         }
-        // CR 303.4e + CR 506.2: an attachment-relation subject ("enchanted by an
-        // Aura / equipped by an Equipment you control") binds "you control" to the
-        // attachment, not the attacker — the enchanted/equipped creature may be
-        // controlled by an opponent. Set the attacking-player gate to pass-through
-        // (any attacking player) WITHOUT an attack-target restriction, so the trigger
-        // fires regardless of whether the attack targets a player, planeswalker, or
-        // battle (Killian, Decisive Mentor; #3314).
-        if has_attachment_clause {
-            def.valid_target = Some(TargetFilter::Player);
-        }
+        def.valid_target = gate;
         if min_count > 1 {
             // CR 508.1a + CR 603.2c: the count condition must count only attackers
             // of the SAME filtered class (e.g. Dinosaurs), not every co-attacker —
@@ -16576,7 +16651,7 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
             let count_filter = filter_narrows_beyond_creature(&filter).then_some(filter.clone());
             def.condition = Some(TriggerCondition::AttackersDeclaredCount {
                 subject: AttackersDeclaredCountSubject::Controller {
-                    scope: ControllerRef::You,
+                    scope: count_scope,
                     filter: count_filter,
                 },
                 comparator: Comparator::GE,
