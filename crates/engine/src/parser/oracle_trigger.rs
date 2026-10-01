@@ -16481,7 +16481,7 @@ struct SubjectAttackScope {
     /// `TriggerDefinition.valid_target` — read by `matching_you_attack_pairs`
     /// as the attacking-player gate.
     gate: Option<TargetFilter>,
-    /// CR 508.1a + CR 603.2c: whose attackers the "two or more" count reads,
+    /// CR 508.1a: whose attackers the "two or more" count reads,
     /// relative to the trigger controller. `Some(scope)` is a player-anchored
     /// declaration count (`AttackersDeclaredCountSubject::Controller.scope`).
     /// `None` (an unscoped subject) counts every attacking object of the
