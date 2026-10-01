@@ -392,8 +392,11 @@ fn resolve_reveal(
         // CR 608.2f + CR 701.20a: "Put those cards onto/into <zone>" is one
         // action on multiple objects, processed simultaneously — every matched
         // card moves in ONE zone-change batch, so the move is a single logical
-        // zone change (one event for CR 603.2c "one or more" triggers; CR 603.6a
-        // newcomers see each other's entry).
+        // zone change: a batched "one or more" observer triggers once for the
+        // whole set (CR 603.2c), including one that is itself among the
+        // newcomers (CR 603.6a). Non-batched per-entry observers among the
+        // newcomers are still presence-gated by segment collection and see only
+        // entries at or after their own — a pipeline-wide gap outside this seam.
         match zone_pipeline::move_objects_simultaneously(state, reqs, events) {
             zone_pipeline::BatchMoveResult::Done => {}
             // CR 303.4f / CR 614.1c / CR 616.1: the batch parked an as-enters
