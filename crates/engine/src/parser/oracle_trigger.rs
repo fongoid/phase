@@ -43,7 +43,9 @@ use super::oracle_nom::primitives::{
 };
 use super::oracle_nom::target::parse_chosen_object_reference;
 use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
-use super::oracle_static::{parse_commander_subject_filter_prefix, typed_filter_for_subtype};
+use super::oracle_static::{
+    add_property, parse_commander_subject_filter_prefix, typed_filter_for_subtype,
+};
 use super::oracle_target::{
     attachment_kinds_filter_prop, parse_attachment_kind_disjunction, parse_type_phrase_folding,
     parse_type_phrase_folding_with_ctx, starts_with_type_list_continuation, starts_with_type_word,
@@ -16444,18 +16446,20 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
 }
 
 /// CR 508.1a: True when `filter` narrows the attacker class beyond a bare
-/// "creature[s]" head noun — i.e. it carries a subtype/negated-type/property
-/// constraint or a non-creature type. Used to decide whether a typed
-/// attacker-COUNT trigger ("two or more Dinosaurs attack") needs the
-/// condition-level type axis on `AttackersDeclaredCount`'s `Controller`
-/// subject, or whether the untyped "two or more creatures attack" path can
-/// keep `filter: None`.
+/// "creature[s]" head noun, i.e. it carries a subtype/negated-type/property
+/// constraint or a non-creature type. Used by the player-relative
+/// attacker-COUNT forms (subject-led "two or more Dinosaurs you control / your
+/// opponents control attack", and player-led "you / an opponent / a player
+/// attack(s) with two or more Dinosaurs") to decide whether the
+/// `AttackersDeclaredCount` subject (`Controller` or `AttackTarget`) needs the
+/// condition-level type axis, or whether the untyped form can keep
+/// `filter: None`.
 ///
 /// Controller scope ("creatures you control") does NOT narrow the class for
-/// counting purposes — it is already enforced by `matching_you_attack_pairs`'
-/// attacking-player gate, and every attacker in a CR 506.2 batch shares one
-/// controller — so a bare `Creature`/`Permanent` filter with only a controller
-/// set still returns `false` here.
+/// counting purposes. The count subject's own `scope` already restricts the
+/// counted attackers by controller (`attackers_declared_count`), so a bare
+/// `Creature`/`Permanent` filter with only a controller set still returns
+/// `false` here.
 fn filter_narrows_beyond_creature(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(tf) => {
@@ -16477,25 +16481,33 @@ struct SubjectAttackScope {
     /// `TriggerDefinition.valid_target` — read by `matching_you_attack_pairs`
     /// as the attacking-player gate.
     gate: Option<TargetFilter>,
-    /// CR 508.1a + CR 603.2c: `AttackersDeclaredCountSubject::Controller.scope`
-    /// — whose declared attackers are counted, once per declaration. Consumed
-    /// only when the quantifier's minimum count is greater than one.
-    count_scope: ControllerRef,
+    /// CR 508.1a + CR 603.2c: whose attackers the "two or more" count reads,
+    /// relative to the trigger controller. `Some(scope)` is a player-anchored
+    /// declaration count (`AttackersDeclaredCountSubject::Controller.scope`).
+    /// `None` (an unscoped subject) counts every attacking object of the
+    /// subject class (see `subject_attack_count_condition`). Consumed only when
+    /// the quantifier's minimum count is greater than one.
+    count_scope: Option<ControllerRef>,
 }
 
-/// CR 506.2 + CR 508.1a: the active player is the attacking player and
-/// declares only creatures they control, so the controller scope a subject-led
-/// "N or more <subject> attack" trigger names on its subject IS the scope of
-/// attacking players it watches. Maps that scope to both the attacking-player
-/// gate and the attacker-count scope in ONE exhaustive decision, so the gate
-/// and the count can never accept different scopes. Returns `None` (decline
-/// the parse) for scopes neither runtime evaluator can read.
+/// CR 508.1a + CR 805.10a: only creatures controlled by an attacking player
+/// are declared as attackers. The attacking player is the active player
+/// (CR 506.2), or under shared team turns any player on the active team
+/// (CR 506.2b). So the controller scope a subject-led "N or more <subject>
+/// attack" trigger names on its subject bounds the attacking players it
+/// watches. Maps that scope to both the attacking-player gate and the
+/// attacker-count scope in ONE exhaustive decision, so the gate and the count
+/// can never accept different scopes. Returns `None` (decline the parse) for
+/// scopes neither runtime evaluator can read.
 fn subject_attack_scope(subject_scope: Option<&ControllerRef>) -> Option<SubjectAttackScope> {
     match subject_scope {
-        // CR 603.2 + CR 506.2: an unscoped subject ("one or more creatures
-        // attack") watches every attacking player — pass-through gate, and the
-        // count reads the attacking player's own declaration (every attacker
-        // is controlled by the attacking player).
+        // CR 603.2: an unscoped subject ("one or more creatures attack")
+        // watches every attacking player through the pass-through gate. Its
+        // count names no attacking player, so it counts every attacking
+        // creature of the subject class. Under shared team turns each player
+        // on the active team is an attacking player and the team makes one
+        // combined attack (CR 805.10a + CR 805.10b), so one declaration can
+        // hold several players' attackers.
         // CR 303.4e: this arm also covers attachment-relation subjects
         // ("enchanted by an Aura / equipped by an Equipment you control"):
         // "you control" binds to the attachment (carried as a `HasAttachment`
@@ -16504,19 +16516,19 @@ fn subject_attack_scope(subject_scope: Option<&ControllerRef>) -> Option<Subject
         // #3314). The pass-through gate carries no attack-target restriction.
         None => Some(SubjectAttackScope {
             gate: Some(TargetFilter::Player),
-            count_scope: ControllerRef::TriggeringPlayer,
+            count_scope: None,
         }),
         // CR 109.5: "you" is the source's controller — the canonical YouAttack
         // encoding (no gate ⇒ attacking player must be the source controller).
         Some(ControllerRef::You) => Some(SubjectAttackScope {
             gate: None,
-            count_scope: ControllerRef::You,
+            count_scope: Some(ControllerRef::You),
         }),
         Some(ControllerRef::Opponent) => Some(SubjectAttackScope {
             gate: Some(TargetFilter::Typed(
                 TypedFilter::default().controller(ControllerRef::Opponent),
             )),
-            count_scope: ControllerRef::Opponent,
+            count_scope: Some(ControllerRef::Opponent),
         }),
         // `player_matches_filter` (gate) and `attackers_declared_count` (count)
         // cannot evaluate these scopes: accepting would fail open on the gate
@@ -16537,6 +16549,56 @@ fn subject_attack_scope(subject_scope: Option<&ControllerRef>) -> Option<Subject
             | ControllerRef::ActivePlayer
             | ControllerRef::SpecificPlayer { .. },
         ) => None,
+    }
+}
+
+/// CR 508.1a + CR 603.2: the trigger-event count qualifier of a subject-led
+/// "N or more <subject> attack" trigger (N > 1). A player-anchored subject
+/// keeps the player-relative declaration count — the same
+/// `AttackersDeclaredCount` the player-led "you / an opponent attacks with N
+/// or more" forms emit. An unscoped subject names no player: it compares the
+/// number of attacking objects of the subject class, read when attackers are
+/// declared (CR 508.1m) and never rechecked — the count is part of the
+/// trigger event, not an intervening "if" (CR 603.4).
+fn subject_attack_count_condition(
+    count_scope: Option<ControllerRef>,
+    filter: &TargetFilter,
+    min_count: u32,
+) -> TriggerCondition {
+    match count_scope {
+        // CR 508.1a + CR 805.10a + CR 805.10b: every attacker of the
+        // declaration counts — under shared team turns that is the active
+        // team's one combined attack.
+        None => TriggerCondition::EventTime {
+            condition: Box::new(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: add_property(
+                            filter.clone(),
+                            FilterProp::Attacking { defender: None },
+                        ),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed {
+                    value: min_count as i32,
+                },
+            }),
+        },
+        // CR 508.1a + CR 603.2c: count only attackers of the SAME filtered
+        // class (e.g. Dinosaurs), not every co-attacker — otherwise "two or
+        // more Dinosaurs attack" over-fires on 1 Dinosaur + 1 unrelated
+        // attacker. This head-noun form is not source-relative, so use the
+        // AttackersDeclared batch count rather than the source-excluding
+        // MinCoAttackers condition.
+        Some(scope) => TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope,
+                filter: filter_narrows_beyond_creature(filter).then_some(filter.clone()),
+            },
+            comparator: Comparator::GE,
+            count: min_count,
+        },
     }
 }
 
@@ -16584,12 +16646,13 @@ fn try_parse_you_attack_with_commander(lower: &str) -> Option<(TriggerMode, Trig
 /// Parse "whenever N or more <subject> attack [a player]" patterns.
 /// CR 508.1a: Handles both "one or more" and "two or more" quantifiers.
 ///
-/// CR 506.2 + CR 508.1a: the attacking-player gate (`valid_target`) and the
-/// attacker-count scope are both derived from the subject's controller clause
-/// via `subject_attack_scope`: unscoped subjects ("one or more creatures
-/// attack") watch every attacking player, "you control" watches only the
-/// source's controller, "your opponents control" watches opponents. Subject
-/// scopes the runtime cannot evaluate decline the parse.
+/// CR 508.1a + CR 805.10a: the attacking-player gate (`valid_target`) and the
+/// attacker count are both derived from the subject's controller clause via
+/// `subject_attack_scope`. Unscoped subjects ("one or more creatures attack")
+/// watch every attacking player and count every attacking creature of the
+/// subject class. "You control" watches only the source's controller, and
+/// "your opponents control" watches opponents. Subject scopes the runtime
+/// cannot evaluate decline the parse.
 fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
     for (prefix, min_count) in [
         ("whenever one or more ", 1u32),
@@ -16623,8 +16686,8 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
 
         let filter = apply_attachment_prop(filter, attachment_prop);
 
-        // CR 506.2 + CR 508.1a: the subject's controller scope is the
-        // attacking-player scope. Decided before any quantifier branch so an
+        // CR 508.1a + CR 805.10a: the subject's controller scope bounds the
+        // attacking players. Decided before any quantifier branch so an
         // unevaluable scope declines at every count.
         let Some(SubjectAttackScope { gate, count_scope }) =
             subject_attack_scope(target_filter_controller_ref(&filter).as_ref())
@@ -16642,21 +16705,11 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
         }
         def.valid_target = gate;
         if min_count > 1 {
-            // CR 508.1a + CR 603.2c: the count condition must count only attackers
-            // of the SAME filtered class (e.g. Dinosaurs), not every co-attacker —
-            // otherwise "two or more Dinosaurs attack" over-fires on 1 Dinosaur +
-            // 1 unrelated attacker. This head-noun form is not source-relative,
-            // so use the AttackersDeclared batch count rather than the
-            // source-excluding MinCoAttackers condition.
-            let count_filter = filter_narrows_beyond_creature(&filter).then_some(filter.clone());
-            def.condition = Some(TriggerCondition::AttackersDeclaredCount {
-                subject: AttackersDeclaredCountSubject::Controller {
-                    scope: count_scope,
-                    filter: count_filter,
-                },
-                comparator: Comparator::GE,
-                count: min_count,
-            });
+            def.condition = Some(subject_attack_count_condition(
+                count_scope,
+                &filter,
+                min_count,
+            ));
         }
         def.valid_card = Some(filter);
         // CR 603.2c: "One or more creatures ... attack" fires once per batch of

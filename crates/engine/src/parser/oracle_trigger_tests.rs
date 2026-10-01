@@ -23562,27 +23562,48 @@ fn trigger_two_or_more_typed_creatures_attack() {
         ),
         other => panic!("expected Typed valid_card with Dinosaur, got {other:?}"),
     }
-    match &def.condition {
-        // CR 508.1a + CR 603.2c: the count reads the attacking player's own
-        // declaration (`TriggeringPlayer`), not the source controller's.
-        Some(TriggerCondition::AttackersDeclaredCount {
-            subject:
-                AttackersDeclaredCountSubject::Controller {
-                    scope: ControllerRef::TriggeringPlayer,
-                    filter: Some(TargetFilter::Typed(tf)),
+    // CR 508.1a + CR 805.10b: no controller restriction; counts attacking
+    // Dinosaurs, read at the trigger event (CR 603.2).
+    let Some(TriggerCondition::EventTime { condition }) = &def.condition else {
+        panic!(
+            "expected EventTime {{ QuantityComparison {{ ObjectCount(Dinosaur + Attacking) GE 2 }} }}, got {:?}",
+            def.condition
+        );
+    };
+    match condition.as_ref() {
+        TriggerCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
                 },
             comparator: Comparator::GE,
-            count: 2,
-        }) => assert!(
-            tf.type_filters
-                .iter()
-                .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur")),
-            "expected Dinosaur subtype in condition filter, got {:?}",
-            tf.type_filters,
-        ),
-        other => {
-            panic!("expected AttackersDeclaredCount {{ Controller {{ TriggeringPlayer, Some(Dinosaur) }}, GE, 2 }}, got {other:?}")
+            rhs: QuantityExpr::Fixed { value: 2 },
+        } => {
+            assert_eq!(
+                filter,
+                &add_property(
+                    def.valid_card.clone().expect("valid_card"),
+                    FilterProp::Attacking { defender: None },
+                ),
+                "count = subject + Attacking"
+            );
+            match filter {
+                TargetFilter::Typed(tf) => {
+                    assert!(
+                        tf.type_filters
+                            .iter()
+                            .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur")),
+                        "expected Dinosaur subtype in count filter, got {:?}",
+                        tf.type_filters,
+                    );
+                    assert_eq!(tf.controller, None, "unscoped count: no controller");
+                }
+                other => panic!("expected Typed count filter, got {other:?}"),
+            }
         }
+        other => panic!(
+            "expected QuantityComparison {{ ObjectCount(Dinosaur + Attacking) GE 2 }}, got {other:?}"
+        ),
     }
 }
 
@@ -23634,7 +23655,8 @@ fn trigger_one_or_more_creatures_attack_roar_of_resistance_any_player() {
 }
 
 /// G4: Argent Dais trigger line (verbatim Oracle) — unscoped two-or-more: the
-/// gate is pass-through and the count reads the attacking player's declaration.
+/// gate is pass-through and the count reads every attacking creature at the
+/// trigger event.
 #[test]
 fn trigger_two_or_more_creatures_attack_argent_dais_any_player() {
     let def = parse_trigger_line(
@@ -23644,16 +23666,23 @@ fn trigger_two_or_more_creatures_attack_argent_dais_any_player() {
     assert_eq!(def.mode, TriggerMode::YouAttack);
     assert!(def.batched);
     assert_eq!(def.valid_target, Some(TargetFilter::Player));
-    // CR 508.1a + CR 603.2c: count the attacking player's declared attackers.
+    // CR 508.1a + CR 805.10b: no controller restriction; read at the event
+    // (CR 603.2).
     assert_eq!(
         def.condition,
-        Some(TriggerCondition::AttackersDeclaredCount {
-            subject: AttackersDeclaredCountSubject::Controller {
-                scope: ControllerRef::TriggeringPlayer,
-                filter: None,
-            },
-            comparator: Comparator::GE,
-            count: 2,
+        Some(TriggerCondition::EventTime {
+            condition: Box::new(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .properties(vec![FilterProp::Attacking { defender: None }])
+                        ),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            }),
         })
     );
 }
@@ -23761,6 +23790,60 @@ fn trigger_two_or_more_disjunctive_opponent_subject_attack() {
     }
 }
 
+/// H-Or-unscoped: a disjunctive subject with no controller clause — the gate
+/// is pass-through and the event-time count keeps the whole disjunction
+/// (`add_property` `And`-wraps a non-`Typed` subject; nothing is dropped).
+#[test]
+fn trigger_two_or_more_disjunctive_unscoped_subject_attack() {
+    let def = parse_trigger_line(
+        "Whenever two or more Elves or Warriors attack, draw a card.",
+        "Test Disjunction Watcher",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    // Reach-guard: the subject is disjunctive, so the count filter takes
+    // `add_property`'s `And`-wrap arm, not the `Typed` push arm.
+    assert!(
+        matches!(def.valid_card, Some(TargetFilter::Or { .. })),
+        "expected disjunctive valid_card, got {:?}",
+        def.valid_card
+    );
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
+    // CR 508.1a + CR 805.10b: no controller restriction; counts attacking
+    // Elves or Warriors, read at the trigger event (CR 603.2).
+    let Some(TriggerCondition::EventTime { condition }) = &def.condition else {
+        panic!(
+            "expected EventTime count condition, got {:?}",
+            def.condition
+        );
+    };
+    match condition.as_ref() {
+        TriggerCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        } => {
+            assert_eq!(
+                filter,
+                &add_property(
+                    def.valid_card.clone().expect("valid_card"),
+                    FilterProp::Attacking { defender: None },
+                ),
+                "count = subject + Attacking"
+            );
+            assert!(
+                matches!(filter, TargetFilter::And { .. }),
+                "disjunctive subject must not be silently dropped: {filter:?}"
+            );
+        }
+        other => panic!(
+            "expected QuantityComparison {{ ObjectCount(subject + Attacking) GE 2 }}, got {other:?}"
+        ),
+    }
+}
+
 /// F: a subject controller scope that neither the attacking-player gate
 /// (`player_matches_filter`) nor the count (`attackers_declared_count`) can
 /// evaluate declines the subject-led parse at EVERY quantifier, rather than
@@ -23821,14 +23904,10 @@ fn n_or_more_attacks_declines_uncountable_subject_scope() {
     // reaches the generic per-creature attack path (`Attacks` mode, no
     // attacking-player gate). No printed card carries this subject scope; the
     // assertion pins that the decline routes away from the YouAttack family.
-    assert_eq!(def.mode, TriggerMode::Attacks);
-    assert!(
-        !(def.mode == TriggerMode::YouAttack
-            && def.valid_target
-                == Some(TargetFilter::Typed(
-                    TypedFilter::default().controller(ControllerRef::TargetPlayer)
-                ))),
-        "exotic subject scope must not produce a fail-open YouAttack gate: {def:?}"
+    assert_eq!(
+        def.mode,
+        TriggerMode::Attacks,
+        "exotic subject scope must route away from the YouAttack family: {def:?}"
     );
 }
 

@@ -28926,6 +28926,11 @@ pub enum TriggerCondition {
     /// `if` beside it stays rechecked. Pugnacious Hammerskull's 2023-11-10
     /// ruling: a Dinosaur that enters after the attack declaration does not stop
     /// the stun counter.
+    /// The same event-time reading carries a count qualifier that is part of the
+    /// trigger event itself when no player anchors it — an unscoped subject-led
+    /// "Whenever two or more <subject> attack" (Argent Dais) compares the number
+    /// of attacking objects of the subject class when attackers are declared
+    /// (CR 508.1a + CR 603.2); there is no intervening "if" to recheck.
     EventTime { condition: Box<TriggerCondition> },
 }
 
