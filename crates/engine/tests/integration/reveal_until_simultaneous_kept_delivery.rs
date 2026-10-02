@@ -493,3 +493,218 @@ fn wild_magic_surge_kept_aura_pause_attaches_and_settles_rest_pile() {
         );
     }
 }
+
+const RAPH_AND_MIKEY: &str = "Trample, haste\n\
+Whenever Raph & Mikey attack, reveal cards from the top of your library until you reveal a creature card. Put that card onto the battlefield tapped and attacking and the rest on the bottom of your library in a random order.";
+
+const DESTROY_THE_EVIDENCE: &str = "Destroy target land. Its controller reveals cards from the top of their library until they reveal a land card, then puts those cards into their graveyard.";
+
+const DEVOURER_OF_MEMORY: &str = "Whenever one or more cards are put into your graveyard from your library, this creature gets +1/+1 until end of turn and can't be blocked this turn.\n\
+{1}{U}{B}: Mill a card.";
+
+/// CR 508.4 + CR 616.1 + CR 614.1c: Raph & Mikey's revealed creature is put
+/// onto the battlefield "tapped and attacking". Rhythm of the Wild grants it
+/// riot, so its entry pauses on a replacement choice. The attack placement
+/// rides the entry itself, so once the choice is answered the creature is an
+/// attacking creature — a placement made only after a synchronous batch would
+/// be skipped by the pause.
+#[test]
+fn raph_and_mikey_kept_creature_entering_through_a_riot_pause_is_attacking() {
+    use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareAttackers);
+
+    scenario
+        .add_creature_from_oracle(P0, "Rhythm of the Wild", 0, 0, RHYTHM_OF_THE_WILD)
+        .as_enchantment();
+    let raph = scenario
+        .add_creature_from_oracle(P0, "Raph & Mikey, Troublemakers", 7, 7, RAPH_AND_MIKEY)
+        .id();
+    let island = scenario.add_card_to_library_top(P0, "Island");
+    let dreadmaw = scenario.add_creature(P0, "Colossal Dreadmaw", 6, 6).id();
+    let filler = scenario.add_card_to_library_top(P0, "Filler");
+
+    let mut runner = scenario.build();
+    arrange_library_top_first(&mut runner, &[island, dreadmaw, filler]);
+
+    runner.state_mut().waiting_for = build_declare_attackers_waiting_for(runner.state());
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(raph, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("Raph & Mikey attacks P1");
+
+    // Resolve the attack trigger.
+    for _ in 0..10 {
+        if runner.state().stack.is_empty()
+            || !matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve the attack trigger");
+    }
+
+    // Reach guard: the revealed creature's entry pauses on its riot choice.
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "the revealed creature's entry must pause on its riot choice; waiting_for={}",
+        runner.waiting_for_kind()
+    );
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("choose riot's +1/+1 counter for the revealed creature");
+
+    // Reach guards: the revealed creature entered tapped with its riot counter,
+    // the miss went to the bottom, and Raph & Mikey is still attacking.
+    assert_zone(
+        &runner,
+        dreadmaw,
+        Zone::Battlefield,
+        "the revealed creature",
+    );
+    assert!(
+        runner.state().objects[&dreadmaw].tapped,
+        "the revealed creature enters tapped"
+    );
+    assert_eq!(plus_one_counters(&runner, dreadmaw), 1);
+    assert_eq!(
+        runner.state().players[P0.0 as usize]
+            .library
+            .back()
+            .copied(),
+        Some(island),
+        "the revealed miss goes to the bottom of the library"
+    );
+    let combat = runner.state().combat.as_ref().expect("combat in progress");
+    assert!(
+        combat.attackers.iter().any(|a| a.object_id == raph),
+        "Raph & Mikey itself attacks"
+    );
+
+    // Discriminating assertion (CR 508.4): the creature entered attacking.
+    let entrant = combat
+        .attackers
+        .iter()
+        .find(|a| a.object_id == dreadmaw)
+        .unwrap_or_else(|| {
+            panic!(
+                "the revealed creature must be attacking after its paused entry; attackers={:?}",
+                combat
+                    .attackers
+                    .iter()
+                    .map(|a| a.object_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(entrant.defending_player, P1);
+}
+
+/// CR 608.2f + CR 603.2c: "puts those cards into their graveyard" is one
+/// action on every revealed card — the matched land and the misses move in
+/// ONE simultaneous zone change, so a batched "one or more cards are put into
+/// your graveyard from your library" observer triggers exactly once.
+#[test]
+fn destroy_the_evidence_mills_the_whole_revealed_pile_as_one_event() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let devourer = scenario
+        .add_creature_from_oracle(P0, "Devourer of Memory", 2, 3, DEVOURER_OF_MEMORY)
+        .id();
+    let doomed_land = scenario
+        .add_creature(P0, "Doomed Land", 0, 0)
+        .as_land()
+        .id();
+    let filler = scenario.add_card_to_library_top(P0, "Filler");
+    let hit_land = scenario.add_land_to_library_top(P0, "Forest").id();
+    let miss_two = scenario.add_card_to_library_top(P0, "Miss Two");
+    let miss_one = scenario.add_card_to_library_top(P0, "Miss One");
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Destroy the Evidence", false, DESTROY_THE_EVIDENCE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+
+    let mut runner = scenario.build();
+    arrange_library_top_first(&mut runner, &[miss_one, miss_two, hit_land, filler]);
+
+    runner.cast(spell).target_object(doomed_land).resolve();
+    assert_stack_empty_priority(&runner);
+
+    // Reach guards: the target was destroyed and the whole revealed pile —
+    // both misses and the matched land — is in the graveyard.
+    assert_zone(&runner, doomed_land, Zone::Graveyard, "the destroyed land");
+    assert_zone(
+        &runner,
+        miss_one,
+        Zone::Graveyard,
+        "the first revealed miss",
+    );
+    assert_zone(
+        &runner,
+        miss_two,
+        Zone::Graveyard,
+        "the second revealed miss",
+    );
+    assert_zone(&runner, hit_land, Zone::Graveyard, "the revealed land");
+    assert_zone(&runner, filler, Zone::Library, "the unrevealed card");
+    for id in [miss_one, miss_two, hit_land] {
+        assert!(
+            !runner.state().revealed_cards.contains(&id),
+            "reveal markers must be cleared ({id:?})"
+        );
+    }
+
+    // Discriminating assertion: one event, one trigger (+1/+1, not +2/+2).
+    let devourer_obj = &runner.state().objects[&devourer];
+    assert_eq!(
+        (devourer_obj.power, devourer_obj.toughness),
+        (Some(3), Some(4)),
+        "Devourer of Memory must trigger exactly once for the one milled pile"
+    );
+}
+
+/// No double collection (CR 603.2c): a batched "one or more" observer with no
+/// once-per-turn limit triggers exactly once for the simultaneous entry of two
+/// matched Elves.
+#[test]
+fn kindred_summons_batched_observer_without_turn_limit_fires_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    scenario.add_enchantment_from_oracle(
+        P0,
+        "Elf Entry Observer",
+        "Whenever one or more Elves you control enter, you gain 1 life.",
+    );
+    add_vanilla_elf(&mut scenario, "Llanowar Elves");
+    add_vanilla_elf(&mut scenario, "Elvish Mystic");
+
+    let elf_a = add_vanilla_elf(&mut scenario, "Fyndhorn Elves");
+    let island = scenario.add_card_to_library_top(P0, "Island");
+    let elf_b = add_vanilla_elf(&mut scenario, "Elvish Visionary");
+    let spell = add_kindred_summons(&mut scenario);
+
+    let mut runner = scenario.build();
+    arrange_library_top_first(&mut runner, &[elf_a, island, elf_b]);
+    let life_before = runner.life(P0);
+
+    runner.cast(spell).choose_option("Elf").resolve();
+    assert_stack_empty_priority(&runner);
+
+    // Reach guards: both matched Elves entered.
+    assert_zone(&runner, elf_a, Zone::Battlefield, "Elf A");
+    assert_zone(&runner, elf_b, Zone::Battlefield, "Elf B");
+    assert_zone(&runner, island, Zone::Library, "the revealed Island");
+    assert_eq!(
+        runner.life(P0),
+        life_before + 1,
+        "the batched observer must trigger exactly once for the one entry event"
+    );
+}

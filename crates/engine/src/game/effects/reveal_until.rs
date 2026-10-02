@@ -264,13 +264,29 @@ fn resolve_reveal(
         return Ok(());
     }
 
-    // CR 701.20a + CR 608.2d: When all revealed cards are put on the bottom of the library
-    // (kept_destination == Library && rest_destination == Library), handle the entire
-    // revealed pile together. If "in any order" (PlayerChoice) is specified and 2+ cards
-    // were revealed, pause for the controller to announce their chosen bottom order.
-    if kept_destination == Zone::Library && rest_destination == Zone::Library {
+    // CR 701.20a + CR 608.2f: When every revealed card goes to the same zone —
+    // both piles on the bottom of the library, "then puts those cards into
+    // their graveyard" (Balustrade Spy, Mind Grind), "put all cards revealed
+    // this way into your hand" (Treasure Hunt) — the instruction is one action
+    // on the whole revealed pile, processed simultaneously as a single zone
+    // change, so a "one or more" observer triggers once for it (CR 603.2c). A
+    // per-card `kept_destination_if` split is not a whole-pile action, and a
+    // battlefield pile keeps the per-set path below, whose requests carry the
+    // entry modifiers (tap state, controller, attacking) this mover does not.
+    let whole_pile_destination = match (kept_destination, rest_destination) {
+        (Zone::Library, Zone::Library) => Some(Zone::Library),
+        (Zone::Battlefield, _) => None,
+        (kept, rest) if kept == rest && kept_destination_if.is_none() => Some(kept),
+        _ => None,
+    };
+    if let Some(pile_destination) = whole_pile_destination {
         let clear_markers = all_revealed.clone();
-        if rest_order == DigRestOrder::PlayerChoice && all_revealed.len() >= 2 {
+        // CR 608.2d + CR 401.4: a library pile "in any order" (PlayerChoice) of
+        // 2+ cards pauses for the library's owner to announce their bottom order.
+        if pile_destination == Zone::Library
+            && rest_order == DigRestOrder::PlayerChoice
+            && all_revealed.len() >= 2
+        {
             state.waiting_for = WaitingFor::RevealUntilBottomOrder {
                 player: revealing_player,
                 source_id: ability.source_id,
@@ -284,7 +300,7 @@ fn resolve_reveal(
         match move_rest_then(
             state,
             &all_revealed,
-            Zone::Library,
+            pile_destination,
             rest_order,
             None,
             events,
@@ -298,7 +314,7 @@ fn resolve_reveal(
                         player: revealing_player,
                         source_id: Some(ability.source_id),
                         rest_cards: Vec::new(),
-                        rest_destination: Zone::Library,
+                        rest_destination: pile_destination,
                         rest_order,
                         rest_split_top_count: None,
                         clear_markers,
@@ -370,6 +386,12 @@ fn resolve_reveal(
                     let mut req =
                         ZoneMoveRequest::effect(hit, Zone::Battlefield, ability.source_id);
                     req.mods.enter_tapped = enter_tapped;
+                    // CR 508.4: "put that card onto the battlefield tapped and
+                    // attacking" — the creature is attacking as it enters, and
+                    // its controller chooses what it attacks. The flag rides the
+                    // entry request, so the delivery tail places it in combat
+                    // before triggers are collected, and it survives a pause.
+                    req.mods.enters_attacking = enters_attacking;
                     match controller_override {
                         Some(controller) => req.under_control_of(controller),
                         None => req,
@@ -432,23 +454,6 @@ fn resolve_reveal(
                     },
                 );
                 return Ok(());
-            }
-        }
-        // CR 508.4: "put that card onto the battlefield tapped and
-        // attacking" — place it in combat alongside the trigger source
-        // (Raph & Mikey, Fireflux Squad). `enter_attacking` derives the
-        // defending player from the source attacker.
-        if enters_attacking {
-            for &(hit, _) in kept_routes
-                .iter()
-                .filter(|(_, hit_destination)| *hit_destination == Zone::Battlefield)
-            {
-                let controller = state
-                    .objects
-                    .get(&hit)
-                    .map(|obj| obj.controller)
-                    .unwrap_or(ability.controller);
-                crate::game::combat::enter_attacking(state, hit, ability.source_id, controller);
             }
         }
     }
