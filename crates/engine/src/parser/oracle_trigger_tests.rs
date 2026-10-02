@@ -26,6 +26,7 @@ use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
+use crate::types::phase::{PhaseGroup, TurnSegment};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::zones::Zone;
@@ -20485,8 +20486,8 @@ fn phase_trigger_enchanted_players_first_upkeep() {
     assert!(matches!(
         def.execute.as_ref().map(|ability| ability.effect.as_ref()),
         Some(Effect::AdditionalPhase {
-            target: TargetFilter::TriggeringPlayer,
-            phase: Phase::Upkeep,
+            recipient: crate::types::ability::ExtraPhaseRecipient::TriggeringPlayer,
+            segment: TurnSegment::Step(Phase::Upkeep),
             after: crate::types::ability::ExtraPhaseAnchor::ThisStep,
             followed_by,
             ..
@@ -24535,6 +24536,36 @@ fn trigger_dies_trailing_if_dealt_damage_stays_resolution_time() {
         execute.condition,
         Some(AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn),
         "the trailing condition must stay on the resolving effect"
+    );
+}
+
+#[test]
+fn trigger_dies_if_source_exploited_that_creature() {
+    // CR 702.110b + CR 608.2c: "Whenever another creature you control dies, put a +1/+1 counter on this creature. It gains haste until end of turn if it exploited that creature."
+    let def = parse_trigger_line(
+        "Whenever another creature you control dies, put a +1/+1 counter on this creature. It gains haste until end of turn if it exploited that creature.",
+        "Silumgar Scavenger",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Graveyard));
+    assert_eq!(
+        def.condition, None,
+        "a trailing resolution-time `if` must NOT be hoisted to an intervening-if (CR 603.4)"
+    );
+    let execute = def
+        .execute
+        .as_deref()
+        .expect("trigger must parse an execute");
+    // The chain has two parts: +1/+1 counter, then grant haste gated by TriggerEventTargetExploitedBySource
+    let sub = execute
+        .sub_ability
+        .as_deref()
+        .expect("must have sub_ability for haste");
+    assert_eq!(
+        sub.condition,
+        Some(AbilityCondition::TriggerEventTargetExploitedBySource),
+        "the trailing condition must stay on the haste effect"
     );
 }
 
@@ -31502,7 +31533,7 @@ fn triggered_additional_combat_folds_land_creature_attacker_restriction() {
             "no Unimplemented node may remain after the fold"
         );
         if let Effect::AdditionalPhase {
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             attacker_restriction: Some(TargetFilter::Typed(tf)),
             ..
         } = ability.effect.as_ref()
@@ -36265,6 +36296,92 @@ fn card_parking_hand_reveal_is_a_chosen_object_boundary_for_the_event_source_lif
         TargetFilter::None,
         false
     )));
+}
+
+#[test]
+fn rohgahh_plural_control_transfer_preserves_parent_operand() {
+    let parsed = parse_oracle_text(
+        "At the beginning of your upkeep, you may pay {R}{R}{R}. If you don't, tap Rohgahh and all creatures named Kobolds of Kher Keep, then an opponent gains control of them.",
+        "Rohgahh of Kher Keep",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.triggers.len(), 1);
+    let execute = parsed.triggers[0].execute.as_ref().expect("upkeep execute");
+    let mut pending = vec![execute.as_ref()];
+    let mut transfers = 0;
+    while let Some(ability) = pending.pop() {
+        if let Effect::GainControl { target } = ability.effect.as_ref() {
+            assert_eq!(target, &TargetFilter::ParentTarget);
+            transfers += 1;
+        }
+        if let Some(sub) = ability.sub_ability.as_deref() {
+            pending.push(sub);
+        }
+        if let Some(otherwise) = ability.else_ability.as_deref() {
+            pending.push(otherwise);
+        }
+    }
+    assert_eq!(
+        transfers, 1,
+        "printed plural control transfer must be reached"
+    );
+}
+
+#[test]
+fn akroan_horse_etb_parsed_trigger() {
+    let parsed = parse_oracle_text(
+        "Defender\nWhen this creature enters, an opponent gains control of it.\nAt the beginning of your upkeep, each opponent creates a 1/1 white Soldier creature token.",
+        "Akroan Horse",
+        &["Defender".to_string()],
+        &["Artifact".to_string(), "Creature".to_string()],
+        &["Horse".to_string()],
+    );
+    assert_eq!(parsed.extracted_keywords, vec![Keyword::Defender]);
+    assert_eq!(parsed.triggers.len(), 2);
+
+    let etb_trigger = &parsed.triggers[0];
+    assert_eq!(etb_trigger.mode, TriggerMode::ChangesZone);
+    assert_eq!(etb_trigger.destination, Some(Zone::Battlefield));
+    assert_eq!(etb_trigger.valid_card, Some(TargetFilter::SelfRef));
+    let etb_exec = etb_trigger.execute.as_ref().expect("ETB execute");
+    assert_eq!(
+        etb_exec.effect.as_ref(),
+        &Effect::Choose {
+            choice_type: crate::types::ability::ChoiceType::opponent(),
+            persist: false,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
+        }
+    );
+    let sub = etb_exec
+        .sub_ability
+        .as_ref()
+        .expect("GainControl sub-ability");
+    assert_eq!(
+        sub.effect.as_ref(),
+        &Effect::GainControl {
+            target: TargetFilter::SelfRef,
+        }
+    );
+
+    let upkeep_trigger = &parsed.triggers[1];
+    assert_eq!(upkeep_trigger.mode, TriggerMode::Phase);
+    assert_eq!(upkeep_trigger.phase, Some(Phase::Upkeep));
+    assert_eq!(
+        upkeep_trigger.constraint,
+        Some(TriggerConstraint::OnlyDuringYourTurn)
+    );
+    let upkeep_exec = upkeep_trigger.execute.as_ref().expect("Upkeep execute");
+    assert!(matches!(
+        upkeep_exec.effect.as_ref(),
+        Effect::Token {
+            name,
+            ref colors,
+            ..
+        } if name == "Soldier" && colors == &vec![ManaColor::White]
+    ));
+    assert_eq!(upkeep_exec.player_scope, Some(PlayerFilter::Opponent));
 }
 
 fn assert_block_count_shape(condition: &TriggerCondition, minimum: i32, noun: &str) {
