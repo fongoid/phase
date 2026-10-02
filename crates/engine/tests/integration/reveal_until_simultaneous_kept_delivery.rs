@@ -15,6 +15,7 @@
 //!   matched cards ride the same parked batch and still enter once the choice
 //!   is answered — none is stranded in the library.
 
+use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{TargetFilter, TargetRef, TypedFilter};
@@ -510,8 +511,6 @@ const DEVOURER_OF_MEMORY: &str = "Whenever one or more cards are put into your g
 /// be skipped by the pause.
 #[test]
 fn raph_and_mikey_kept_creature_entering_through_a_riot_pause_is_attacking() {
-    use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::DeclareAttackers);
 
@@ -618,8 +617,6 @@ const JACE_BELEREN: &str = "[+2]: Each player draws a card.\n\
 /// miss reaches the library bottom and the reveal markers are cleared.
 #[test]
 fn raph_and_mikey_kept_creature_entry_attack_choice_selects_a_planeswalker() {
-    use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::DeclareAttackers);
 
