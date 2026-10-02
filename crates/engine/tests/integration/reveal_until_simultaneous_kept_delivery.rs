@@ -606,6 +606,144 @@ fn raph_and_mikey_kept_creature_entering_through_a_riot_pause_is_attacking() {
     assert_eq!(entrant.defending_player, P1);
 }
 
+const JACE_BELEREN: &str = "[+2]: Each player draws a card.\n\
+[\u{2212}1]: Target player draws a card.\n\
+[\u{2212}10]: Target player mills twenty cards.";
+
+/// CR 508.4: a creature put onto the battlefield attacking has its
+/// controller choose what it attacks. With a defending planeswalker on the
+/// battlefield, Raph & Mikey's revealed creature entering inside the
+/// reveal-until batch parks that choice; answering it seats the creature
+/// against the chosen planeswalker and the parked batch then finishes — the
+/// miss reaches the library bottom and the reveal markers are cleared.
+#[test]
+fn raph_and_mikey_kept_creature_entry_attack_choice_selects_a_planeswalker() {
+    use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareAttackers);
+
+    let raph = scenario
+        .add_creature_from_oracle(P0, "Raph & Mikey, Troublemakers", 7, 7, RAPH_AND_MIKEY)
+        .id();
+    let jace = scenario
+        .add_planeswalker_from_oracle(P1, "Jace Beleren", "Jace", 3, JACE_BELEREN)
+        .id();
+    let island = scenario.add_card_to_library_top(P0, "Island");
+    let dreadmaw = scenario.add_creature(P0, "Colossal Dreadmaw", 6, 6).id();
+    let filler = scenario.add_card_to_library_top(P0, "Filler");
+
+    let mut runner = scenario.build();
+    arrange_library_top_first(&mut runner, &[island, dreadmaw, filler]);
+
+    runner.state_mut().waiting_for = build_declare_attackers_waiting_for(runner.state());
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(raph, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("Raph & Mikey attacks P1");
+
+    // Resolve the attack trigger.
+    for _ in 0..10 {
+        if runner.state().stack.is_empty()
+            || !matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve the attack trigger");
+    }
+
+    // Reach guard (CR 508.4): the revealed creature's entry parks its
+    // controller's choice between the defending player and the planeswalker.
+    match &runner.state().waiting_for {
+        WaitingFor::EntryAttackTargetChoice {
+            player,
+            object_id,
+            valid_targets,
+        } => {
+            assert_eq!(*player, P0, "the entrant's controller chooses");
+            assert_eq!(
+                *object_id, dreadmaw,
+                "the choice is for the revealed creature"
+            );
+            assert!(
+                valid_targets.contains(&AttackTarget::Player(P1))
+                    && valid_targets.contains(&AttackTarget::Planeswalker(jace)),
+                "both the defending player and the planeswalker are offered; got {valid_targets:?}"
+            );
+        }
+        _ => panic!(
+            "the revealed creature's entry must park an entry-attack choice; waiting_for={}",
+            runner.waiting_for_kind()
+        ),
+    }
+    runner
+        .act(GameAction::ChooseEntryAttackTarget {
+            target: AttackTarget::Planeswalker(jace),
+        })
+        .expect("the revealed creature attacks Jace Beleren");
+
+    let state = runner.state();
+    assert!(
+        !matches!(
+            state.waiting_for,
+            WaitingFor::EntryAttackTargetChoice { .. }
+        ),
+        "the entry-attack choice must be resolved"
+    );
+    assert_zone(
+        &runner,
+        dreadmaw,
+        Zone::Battlefield,
+        "the revealed creature",
+    );
+    assert!(
+        state.objects[&dreadmaw].tapped,
+        "the revealed creature enters tapped"
+    );
+    let combat = state.combat.as_ref().expect("combat in progress");
+    assert!(
+        combat.attackers.iter().any(|a| a.object_id == raph),
+        "Raph & Mikey itself attacks"
+    );
+    let entrant = combat
+        .attackers
+        .iter()
+        .find(|a| a.object_id == dreadmaw)
+        .expect("the revealed creature must be attacking");
+    assert_eq!(
+        entrant.attack_target,
+        AttackTarget::Planeswalker(jace),
+        "the revealed creature attacks the chosen planeswalker"
+    );
+    assert_eq!(entrant.defending_player, P1);
+
+    assert_zone(&runner, island, Zone::Library, "the revealed Island");
+    assert_eq!(
+        state.players[P0.0 as usize].library.back().copied(),
+        Some(island),
+        "the revealed miss goes to the bottom of the library"
+    );
+    assert_eq!(
+        state.players[P0.0 as usize].library.front().copied(),
+        Some(filler),
+        "the unrevealed card stays on top"
+    );
+    assert!(
+        state.active_batch_delivery().is_none(),
+        "the parked batch frame must be fully drained"
+    );
+    for id in [island, dreadmaw] {
+        assert!(
+            !state.revealed_cards.contains(&id),
+            "reveal markers must be cleared once the batch settles ({id:?})"
+        );
+    }
+}
+
 /// CR 608.2f + CR 603.2c: "puts those cards into their graveyard" is one
 /// action on every revealed card — the matched land and the misses move in
 /// ONE simultaneous zone change, so a batched "one or more cards are put into

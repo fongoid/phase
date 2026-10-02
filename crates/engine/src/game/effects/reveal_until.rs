@@ -273,10 +273,9 @@ fn resolve_reveal(
     // per-card `kept_destination_if` split is not a whole-pile action, and a
     // battlefield pile keeps the per-set path below, whose requests carry the
     // entry modifiers (tap state, controller, attacking) this mover does not.
-    let whole_pile_destination = match (kept_destination, rest_destination) {
-        (Zone::Library, Zone::Library) => Some(Zone::Library),
-        (Zone::Battlefield, _) => None,
-        (kept, rest) if kept == rest && kept_destination_if.is_none() => Some(kept),
+    let whole_pile_destination = match (kept_destination, rest_destination, kept_destination_if) {
+        (Zone::Battlefield, _, _) | (_, _, Some(_)) => None,
+        (kept, rest, None) if kept == rest => Some(kept),
         _ => None,
     };
     if let Some(pile_destination) = whole_pile_destination {
@@ -1916,10 +1915,10 @@ mod tests {
 
     /// CR 608.2c + CR 608.2f: with several matched cards, each card's
     /// `kept_destination_if` route is decided on its own characteristics, and
-    /// the differently-routed cards still move together in the one kept-set
-    /// batch. The count is reached before the last library card is revealed.
+    /// the differently-routed cards each reach their own destination.
+    /// The count is reached before the last library card is revealed.
     #[test]
-    fn reveal_until_multi_hit_routes_each_hit_by_kept_destination_if_in_one_batch() {
+    fn reveal_until_multi_hit_routes_each_hit_by_kept_destination_if() {
         let mut state = GameState::new_two_player(42);
         let creature_filter = TargetFilter::Typed(crate::types::ability::TypedFilter::creature());
         let land_filter = TargetFilter::Typed(crate::types::ability::TypedFilter::land());
@@ -1955,6 +1954,49 @@ mod tests {
         assert_eq!(state.objects[&shock].zone, Zone::Graveyard);
         assert_eq!(state.objects[&island].zone, Zone::Library);
         assert_eq!(state.players[0].library.front().copied(), Some(island));
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    /// CR 608.2c + CR 608.2f: a library/library reveal whose hit carries a
+    /// per-card `kept_destination_if` route is not a whole-pile library move —
+    /// the matching hit takes its conditional destination while the misses
+    /// still go to the bottom of the library.
+    #[test]
+    fn reveal_until_library_piles_honor_kept_destination_if_route() {
+        let mut state = GameState::new_two_player(42);
+        let land_filter = TargetFilter::Typed(crate::types::ability::TypedFilter::land());
+
+        // Library top→bottom: Shock (miss), Forest (hit), Bear (unrevealed).
+        let shock = library_card(&mut state, CardId(1), "Shock", CoreType::Instant);
+        let forest = library_card(&mut state, CardId(2), "Forest", CoreType::Land);
+        let bear = library_card(&mut state, CardId(3), "Bear", CoreType::Creature);
+
+        let mut ability = make_reveal_until_ability(
+            PlayerId(0),
+            land_filter.clone(),
+            Zone::Library,
+            Zone::Library,
+        );
+        if let Effect::RevealUntil {
+            kept_destination_if,
+            ..
+        } = &mut ability.effect
+        {
+            *kept_destination_if = Some((Box::new(land_filter), Zone::Battlefield));
+        }
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.battlefield.contains(&forest),
+            "the land hit takes its kept_destination_if route onto the battlefield"
+        );
+        assert_eq!(state.objects[&forest].zone, Zone::Battlefield);
+        assert_eq!(
+            state.players[0].library.iter().copied().collect::<Vec<_>>(),
+            vec![bear, shock],
+            "the miss goes to the bottom, under the unrevealed card"
+        );
         assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
     }
 
