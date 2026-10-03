@@ -559,9 +559,12 @@ pub fn resolve(
     //
     // CR 603.7a + CR 608.2c + CR 608.2h: a phase-delayed ability fires on a phase event that
     // carries no amount, when `last_effect_count` no longer holds the creating resolution's
-    // count (reset per player action in engine.rs, or overwritten by a resolution earlier in the
-    // same action). When the CREATING resolution's EventContextAmount cascade determined an
-    // amount (`quantity::determined_event_context_amount` is `Some`, zero included) — a preceding
+    // count (it is reset as each stack object begins resolving, in `stack::resolve_top`, and
+    // per player action in engine.rs). Because of that reset, a creator resolving from the stack
+    // reads here only a count its own resolution stamped, or none; a CR 615.5 rider reads the
+    // amount its own replacement application stamped. When the CREATING resolution's
+    // EventContextAmount cascade determined an amount
+    // (`quantity::determined_event_context_amount` is `Some`, zero included) — a preceding
     // instruction's count (Synthetic Destiny's exiled creatures) or the creating trigger's event
     // amount — the payload's FIRST instruction's "that many"/"that much" names it, so it is
     // frozen now. An amount the creating resolution did not determine stays live (pre-existing
@@ -5850,8 +5853,8 @@ mod tests {
     /// the end-step resolution has lost `last_effect_count`. The parent has no
     /// targets, so the freeze must not depend on `ability.targets`.
     /// (T-U1b) A determined zero (Synthetic Destiny exiling no creatures) is frozen
-    /// too: read live at the end step, a count another resolution stamped earlier
-    /// in the same action would leak into it.
+    /// too: the payload names the amount the creating resolution determined, never
+    /// whatever the end-step resolution's cascade would find.
     #[test]
     fn phase_delayed_first_instruction_that_many_freezes_creation_count() {
         for (last, expected) in [

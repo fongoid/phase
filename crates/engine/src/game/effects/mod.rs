@@ -3202,8 +3202,8 @@ fn is_public_zone(zone: crate::types::zones::Zone) -> bool {
 /// the triggering action (e.g. the number of Treasures sacrificed). At
 /// creation time `last_effect_count` (and the rest of the event-context
 /// cascade) is still live, so resolving `EventContextAmount` here captures the
-/// real count. The reflexive triggered ability resolves later in a fresh
-/// `apply()` where that scratch state has been cleared; `subject_match_count`
+/// real count. The reflexive triggered ability resolves later as its own stack
+/// object, after `stack::resolve_top` has cleared that scratch state; `subject_match_count`
 /// is rehydrated into `current_trigger_match_count` (CR 603.2c) and resolves
 /// the number of targets at target-assign time. Without this freeze the bound
 /// collapses to 0 — yielding "Unused selected target slots" or a silently

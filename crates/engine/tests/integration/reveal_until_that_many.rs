@@ -204,7 +204,7 @@ fn assert_parses_fully(name: &str, types: &[&str], oracle: &str) {
 
 /// Advance to the end step and stop once the delayed trigger is on the stack
 /// (mirrors `delayed_departure_lookback::pass_to_delayed_trigger`).
-fn pass_to_delayed_trigger(runner: &mut GameRunner) {
+pub(crate) fn pass_to_delayed_trigger(runner: &mut GameRunner) {
     runner.advance_to_end_step();
     for _ in 0..64 {
         match runner.state().waiting_for.clone() {
@@ -393,7 +393,7 @@ fn mass_polymorph_with_no_creatures_moves_nothing() {
 /// CR 603.7a + CR 608.2c + CR 608.2h: Synthetic Destiny's delayed reveal reads
 /// "that many" as the number of creatures the spell exiled (2), fixed when the
 /// spell resolved. A creature that arrives later does not change it, and the
-/// end-step resolution (whose per-action count was reset) does not read 0.
+/// end-step resolution (whose resolution-local count was reset) does not read 0.
 #[test]
 fn synthetic_destiny_end_step_reveal_uses_the_count_fixed_at_resolution() {
     let (mut runner, board) = build_board("Synthetic Destiny", true, SYNTHETIC_DESTINY, None);

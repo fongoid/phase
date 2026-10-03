@@ -269,6 +269,7 @@ mod deferred_target_cost_determination;
 mod delayed_departure_lookback;
 mod delayed_event_subject_anaphor_snapshot;
 mod delayed_parent_target_incarnation;
+mod delayed_that_many_resolution_scope;
 mod delayed_trigger_binds_added_combat;
 mod delayed_trigger_continuation;
 mod demilich_helbrute_graveyard_exile_cost;
