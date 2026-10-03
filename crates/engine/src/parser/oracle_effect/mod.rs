@@ -14633,9 +14633,10 @@ fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), OracleError<
 /// CR 701.20a + CR 608.2c: Parse the count phrase that follows
 /// "…until you reveal " — either the singular article ("a"/"an") for the
 /// dominant "reveal a [filter] card" form (yielding `Fixed(1)`), a spelled or
-/// numeric literal ("two"/"2"), or the variable `X` ("reveal X [filter] cards",
-/// bound by a trailing "where X is …" clause). Returns the count expression and
-/// the remaining input positioned at the filter phrase.
+/// numeric literal ("two"/"2"), the variable `X` ("reveal X [filter] cards",
+/// bound by a trailing "where X is …" clause), or the anaphoric "that many"
+/// ("reveal that many [filter] cards", an earlier instruction's count). Returns
+/// the count expression and the remaining input positioned at the filter phrase.
 fn parse_reveal_until_count(input: &str) -> OracleResult<'_, QuantityExpr> {
     alt((
         // CR 701.20a: singular article → exactly one match (the legacy form).
@@ -14651,6 +14652,13 @@ fn parse_reveal_until_count(input: &str) -> OracleResult<'_, QuantityExpr> {
                 },
             },
             (tag("x"), tag(" ")),
+        ),
+        // CR 608.2c + CR 608.2h: "until you reveal that many [filter] cards" — anaphoric count of
+        // an earlier instruction (Mass Polymorph, Synthetic Destiny). Delegates to the single
+        // demonstrative-amount authority, like search.rs's "for that many".
+        map(
+            terminated(nom_quantity::parse_that_much_or_many, tag(" ")),
+            |qty| QuantityExpr::Ref { qty },
         ),
         // "reveal two [filter] cards" / "reveal 2 [filter] cards".
         map(

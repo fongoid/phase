@@ -10767,16 +10767,17 @@ pub(crate) fn ability_pins_object_anaphor(ability: &ResolvedAbility) -> bool {
 /// immediately afterward", per prevented event, and its amount is read live from
 /// `state.last_effect_count` (stamped at `game/combat_damage.rs`). Freezing a parent-dependent
 /// quantity at install would pre-empt that.
-/// MEASURED, so the omission is not load-bearing for today's corpus either:
 /// `snapshot_parent_dependent_quantities` walks only EFFECT quantity fields (Mana count,
 /// DealDamage/DamageAll/DamageEachPlayer/GainLife/LoseLife amount, Draw/Mill/PutCounter count,
-/// Pump/PumpAll P/T, ChangeZone.enter_with_counters) — it never walks `ability.repeat_for` —
-/// and `snapshot_quantity_ref` has no `EventContextAmount` arm (it falls to `_ => None`). So
-/// calling it would change nothing for the current riders; it is omitted for the rule, not for
-/// the symptom. `delayed_trigger::resolve` also runs
-/// `stamp_triggering_source_origins_in_ability_chain`, `rebind_last_created_to_parent_target` and
-/// stamps `scoped_player` — all correctly irrelevant at this seam (none of them touch the
-/// referent or its pin).
+/// Pump/PumpAll P/T, ChangeZone.enter_with_counters, RevealUntil.count) — it never walks
+/// `ability.repeat_for` — and its `snapshot_quantity_ref` freezes `EventContextAmount` only at
+/// the first payload instruction of a creation-time-provenance, non-departure delayed trigger
+/// (CR 603.7a). A rider's "for each 1 damage prevented this way" is exactly such an
+/// `EventContextAmount`, so calling the walker here would freeze it before the prevention it
+/// counts — that is why a CR 615.5 prevention rider must not call it.
+/// `delayed_trigger::resolve` also runs `stamp_triggering_source_origins_in_ability_chain`,
+/// `rebind_last_created_to_parent_target` and stamps `scoped_player` — all correctly irrelevant
+/// at this seam (none of them touch the referent or its pin).
 /// **DO NOT unify this function with `delayed_trigger::resolve`'s inline binding.** They share
 /// the referent authority (`targeting::parent_chain_referents`) and the pin preference below;
 /// merging the call sites would silently give a prevention rider the CR 603.7c `TriggeringSource`
