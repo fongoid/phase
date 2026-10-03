@@ -558,29 +558,25 @@ pub fn resolve(
     // After this call, the delayed ability chain holds no parent context refs.
     //
     // CR 603.7a + CR 608.2c + CR 608.2h: a phase-delayed ability fires on a phase event that
-    // carries no amount, after the per-action resolution state (`last_effect_count`) has been
-    // reset (engine.rs). When the CREATING resolution's EventContextAmount cascade yields a
-    // positive amount — a preceding instruction's count (Synthetic Destiny's exiled creatures) or
-    // the creating trigger's event amount — the payload's FIRST instruction's "that many"/"that
-    // much" names it, so it is frozen now. A zero/undetermined amount is no determined amount
-    // (mirrors `effects::freeze_reflexive_event_count`, CR 603.12) and stays live (None), so an
-    // amount determined AFTER creation is read when the delayed ability resolves (Sacred Boon /
-    // Scars of the Veteran: "for each 1 damage prevented this way", CR 615.5); a zero count read
-    // live also yields zero for Synthetic Destiny. The freeze reaches only the effect variants
+    // carries no amount, when `last_effect_count` no longer holds the creating resolution's
+    // count (reset per player action in engine.rs, or overwritten by a resolution earlier in the
+    // same action). When the CREATING resolution's EventContextAmount cascade determined an
+    // amount (`quantity::determined_event_context_amount` is `Some`, zero included) — a preceding
+    // instruction's count (Synthetic Destiny's exiled creatures) or the creating trigger's event
+    // amount — the payload's FIRST instruction's "that many"/"that much" names it, so it is
+    // frozen now. An amount the creating resolution did not determine stays live (pre-existing
+    // behavior; Sacred Boon's 'damage prevented this way' currently has no resolution-time source
+    // and needs its own referent). The freeze reaches only the effect variants
     // `snapshot_parent_dependent_quantities` walks. Event-delayed triggers read their firing
-    // event, and departure-created phase-delayed triggers answer from the creation lookback
-    // event — both stay live (None).
-    let first_instruction_amount = (creation_time_provenance && creation_departure_event.is_none())
-        .then(|| {
-            crate::game::quantity::resolve_quantity_with_targets(
-                state,
-                &QuantityExpr::Ref {
-                    qty: QuantityRef::EventContextAmount,
-                },
-                ability,
-            )
-        })
-        .filter(|&amount| amount > 0);
+    // event and stay live (None); departure-created phase-delayed triggers stay live: a
+    // counter-placing 'that many' answers from the creation lookback event (CR 603.10a); other
+    // forms are not yet supported.
+    let first_instruction_amount = if creation_time_provenance && creation_departure_event.is_none()
+    {
+        crate::game::quantity::determined_event_context_amount(state, ability)
+    } else {
+        None
+    };
     snapshot_parent_dependent_quantities_in_ability_chain(
         &mut delayed_ability,
         state,
@@ -5850,16 +5846,17 @@ mod tests {
 
     /// CR 603.7a + CR 608.2c + CR 608.2h (T-U1): a phase-delayed payload's FIRST
     /// instruction reading "that many" (Synthetic Destiny's reveal count) is the
-    /// positive amount the creating resolution determined — frozen at creation,
-    /// because the end-step resolution has lost `last_effect_count`. The parent
-    /// has no targets, so the freeze must not depend on `ability.targets`.
-    /// (T-U1b) A zero count is no determined amount and stays live; read live at
-    /// the end step it is still zero.
+    /// amount the creating resolution determined — frozen at creation, because
+    /// the end-step resolution has lost `last_effect_count`. The parent has no
+    /// targets, so the freeze must not depend on `ability.targets`.
+    /// (T-U1b) A determined zero (Synthetic Destiny exiling no creatures) is frozen
+    /// too: read live at the end step, a count another resolution stamped earlier
+    /// in the same action would leak into it.
     #[test]
     fn phase_delayed_first_instruction_that_many_freezes_creation_count() {
         for (last, expected) in [
             (Some(3), QuantityExpr::Fixed { value: 3 }),
-            (Some(0), event_context_amount()),
+            (Some(0), QuantityExpr::Fixed { value: 0 }),
         ] {
             let mut state = GameState::new_two_player(42);
             create_delayed_with_last_count(
@@ -5875,8 +5872,8 @@ mod tests {
             assert_eq!(
                 *reveal_until_count(&state.delayed_triggers[0].ability.effect),
                 expected,
-                "creation-time count {last:?}: a positive count is frozen into \
-                 RevealUntil.count, a zero count stays live"
+                "creation-time count {last:?}: a determined count, zero included, is \
+                 frozen into RevealUntil.count"
             );
         }
     }

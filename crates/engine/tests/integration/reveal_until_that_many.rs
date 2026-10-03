@@ -19,7 +19,7 @@ use engine::parser::parse_oracle_text;
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{AutoPassRequest, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -511,6 +511,101 @@ fn synthetic_destiny_with_no_creatures_reveals_nothing_at_end_step() {
         "every library card",
     );
     assert_eq!(library_len(&runner), initial_library);
+}
+
+/// The Arkenstone — its end-step draw stamps a count (`last_effect_count`) when
+/// it resolves.
+const THE_ARKENSTONE: &str =
+    "Creatures you control get +1/+1.\nAt the beginning of your end step, draw a card.";
+
+/// CR 603.7a + CR 608.2h: Synthetic Destiny exiling no creatures fixes "that
+/// many" at 0 when the spell resolves. At the end step The Arkenstone's draw
+/// trigger resolves first, in the SAME player action (one stack-resolution
+/// session), and stamps its own count; the delayed reveal must still reveal for
+/// 0 creature cards, not for the draw's count.
+#[test]
+fn synthetic_destiny_zero_count_is_not_replaced_by_a_count_stamped_earlier_in_the_action() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arkenstone = scenario
+        .add_artifact_from_oracle(P0, "The Arkenstone", THE_ARKENSTONE)
+        .id();
+    let (miss1, creature_a, miss2, creature_b, creature_c, bottom_marker) =
+        stage_library(&mut scenario, None);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Synthetic Destiny", true, SYNTHETIC_DESTINY)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    set_library_creature_pt(&mut runner, &[creature_a, creature_b, creature_c]);
+
+    runner.cast(spell).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: the delayed trigger is installed"
+    );
+
+    runner.advance_to_end_step();
+    let WaitingFor::OrderTriggers { triggers, .. } = runner.state().waiting_for.clone() else {
+        panic!(
+            "both end-step triggers must ask P0 for an order; waiting_for={}",
+            runner.waiting_for_kind()
+        );
+    };
+    assert_eq!(triggers.len(), 2, "the delayed reveal and The Arkenstone");
+    // Index 0 is placed first (bottom): put the delayed reveal under The
+    // Arkenstone's draw so the draw resolves first.
+    let arkenstone_index = triggers
+        .iter()
+        .position(|trigger| trigger.source_id == arkenstone)
+        .expect("The Arkenstone's end-step trigger is pending");
+    let mut order: Vec<usize> = (0..triggers.len())
+        .filter(|&index| index != arkenstone_index)
+        .collect();
+    order.push(arkenstone_index);
+    runner
+        .act(GameAction::OrderTriggers { order })
+        .expect("order the end-step triggers");
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "both triggers are on the stack"
+    );
+    let hand_before = runner.state().players[P0.0 as usize].hand.len();
+    let library_before = library_len(&runner);
+
+    // One player action resolves both triggers.
+    runner
+        .act(GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        })
+        .expect("resolve the stack in one stack-resolution session");
+    assert_stack_empty_priority(&runner);
+    assert_eq!(runner.state().phase, Phase::End);
+
+    // Reach guards: The Arkenstone's draw resolved (one card from the top) and
+    // the delayed trigger fired.
+    assert_eq!(
+        runner.state().players[P0.0 as usize].hand.len(),
+        hand_before + 1,
+        "The Arkenstone's trigger drew a card"
+    );
+    assert_zone(&runner, &[miss1], Zone::Hand, "the drawn top card");
+    assert!(
+        runner.state().delayed_triggers.is_empty(),
+        "the one-shot delayed trigger must have fired"
+    );
+
+    // "that many" is 0: no creature card enters.
+    assert_zone(
+        &runner,
+        &[creature_a, creature_b, creature_c, miss2, bottom_marker],
+        Zone::Library,
+        "every card left in the library",
+    );
+    assert_eq!(library_len(&runner), library_before - 1);
 }
 
 fn add_mana(runner: &mut GameRunner, color: ManaType, count: usize) {
