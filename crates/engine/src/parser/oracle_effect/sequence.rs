@@ -495,7 +495,9 @@ fn parse_reveal_until_conditional_kept(input: &str) -> OracleResult<'_, Continua
 /// RevealUntil whose until-filter is that same <filter> names exactly the matched set (the
 /// loop stops at the Nth match, so every <filter> card revealed is a hit) — the KeepEach
 /// disposition to <zone> (Mass Polymorph, Synthetic Destiny, Old Stickfingers). A different
-/// filter is a different set and is refused (falls through to the existing arms);
+/// filter is a different set and is refused (falls through to the existing arms). A phrase
+/// whose built filter is `TargetFilter::Any` is unparsed and cannot establish set identity
+/// (it would alias any other degenerate until-filter), so it is refused too;
 /// "all cards revealed this way" (empty filter) is the whole pile, owned by
 /// `parse_reveal_until_all_to_zone_continuation`; "all other cards revealed this way" is the
 /// rest pile (Dance, Pathetic Marionette; Sharp Eraser), owned by the PutRest arm, and is
@@ -508,10 +510,17 @@ fn parse_reveal_until_matched_set_to_zone<'a>(
     let (i, _) = alt((tag("puts "), tag("put "))).parse(i)?;
     let (i, _) = tag("all ").parse(i)?;
     // CR 608.2c: "all other cards revealed this way" names the non-matched rest, not the
-    // matched set — refuse the rest-subject head so it can never alias an until-filter.
+    // matched set — refuse the rest-subject head by grammar. Defence in depth: the
+    // `TargetFilter::Any` refusal below also stops it aliasing a degenerate until-filter.
     let (i, _) = not(tag("other ")).parse(i)?;
+    // CR 701.20a: the phrase must build to a typed filter equal to the until-filter. An
+    // unparsed phrase degrades to `Any` and cannot establish set identity.
     let (i, _) = verify(take_until(" cards revealed this way"), |text: &str| {
-        !text.is_empty() && super::build_reveal_until_filter(text) == *reveal_filter
+        if text.is_empty() {
+            return false;
+        }
+        let filter = super::build_reveal_until_filter(text);
+        filter != TargetFilter::Any && filter == *reveal_filter
     })
     .parse(i)?;
     let (i, _) = tag(" cards revealed this way ").parse(i)?;
@@ -9951,6 +9960,31 @@ mod tests {
         assert!(
             parse_reveal_until_all_to_zone_continuation(text).is_ok(),
             "reach guard: the whole-pile continuation owns this text"
+        );
+    }
+
+    /// CR 701.20a: a phrase that builds to `TargetFilter::Any` is unparsed and
+    /// cannot establish set identity — refused even against an until-filter that
+    /// is itself `Any`. Paired positive: the same call shape with a typed phrase.
+    #[test]
+    fn matched_set_to_zone_refuses_a_phrase_building_to_any() {
+        assert_eq!(
+            super::super::build_reveal_until_filter("green"),
+            TargetFilter::Any,
+            "fixture precondition: the phrase builds to Any"
+        );
+        assert!(parse_reveal_until_matched_set_to_zone(
+            "put all green cards revealed this way onto the battlefield",
+            &TargetFilter::Any,
+        )
+        .is_err());
+        assert!(
+            parse_reveal_until_matched_set_to_zone(
+                "put all creature cards revealed this way onto the battlefield",
+                &creature_until_filter(),
+            )
+            .is_ok(),
+            "reach guard: the same call shape accepts a typed matched-set phrase"
         );
     }
 

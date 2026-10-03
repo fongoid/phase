@@ -42246,6 +42246,50 @@ fn reveal_until_matched_set_requires_the_until_filter() {
     assert_eq!(*kept_destination, Zone::Battlefield);
 }
 
+/// CR 701.20a: an until-filter phrase the parser cannot type ("a white card")
+/// degrades to `TargetFilter::Any`, and so does an unparsed "all green cards"
+/// phrase — equal filters that do not establish that both name the same set.
+/// The green-card sentence must not be absorbed as the matched set's
+/// disposition. Paired positive: the same call shape with the typed until-filter
+/// is absorbed.
+#[test]
+fn reveal_until_matched_set_refuses_an_untyped_filter_phrase() {
+    let untyped = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a white card. Put all green cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        filter,
+        kept_destination,
+        ..
+    } = &*untyped.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", untyped.effect);
+    };
+    assert_eq!(
+        *filter,
+        TargetFilter::Any,
+        "fixture precondition: the until-filter phrase degrades to Any"
+    );
+    assert_ne!(
+        *kept_destination,
+        Zone::Battlefield,
+        "an untyped green-card phrase must not become the white hit's disposition"
+    );
+
+    let matched = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a creature card. Put all creature cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        kept_destination, ..
+    } = &*matched.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", matched.effect);
+    };
+    assert_eq!(*kept_destination, Zone::Battlefield);
+}
+
 /// CR 608.2c: "Put all other cards revealed this way into your graveyard" names
 /// the REST of the revealed pile (Dance, Pathetic Marionette; Sharp Eraser), never
 /// the matched set — even when the until-filter is one the bare word "other"

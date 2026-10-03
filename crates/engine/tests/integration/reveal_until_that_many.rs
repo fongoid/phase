@@ -237,7 +237,8 @@ fn pass_to_delayed_trigger(runner: &mut GameRunner) {
 }
 
 /// CR 608.2c + CR 608.2h + CR 701.20a: Mass Polymorph exiles both of P0's
-/// creatures (the token counts, CR 111.7), so "that many" is 2: the first two
+/// creatures (the token is exiled and counts; CR 111.7 / CR 704.5d it then
+/// ceases to exist), so "that many" is 2: the first two
 /// creature cards revealed enter, the third creature card stays in the library
 /// with the misses (CR 701.24a shuffle). CR 603.6a + CR 603.2c: the two creature
 /// cards enter in ONE event, so each batched "one or more other creatures you
