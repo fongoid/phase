@@ -513,7 +513,7 @@ fn parse_reveal_until_matched_set_to_zone<'a>(
     // matched set — refuse the rest-subject head by grammar. Defence in depth: the
     // `TargetFilter::Any` refusal below also stops it aliasing a degenerate until-filter.
     let (i, _) = not(tag("other ")).parse(i)?;
-    // CR 701.20a: the phrase must build to a typed filter equal to the until-filter. An
+    // CR 608.2c: the phrase must build to a typed filter equal to the until-filter. An
     // unparsed phrase degrades to `Any` and cannot establish set identity.
     let (i, _) = verify(take_until(" cards revealed this way"), |text: &str| {
         if text.is_empty() {

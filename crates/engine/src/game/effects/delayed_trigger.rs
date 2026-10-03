@@ -559,12 +559,17 @@ pub fn resolve(
     //
     // CR 603.7a + CR 608.2c + CR 608.2h: a phase-delayed ability fires on a phase event that
     // carries no amount, after the per-action resolution state (`last_effect_count`) has been
-    // reset (engine.rs). Its FIRST instruction's "that many"/"that much" therefore names an amount
-    // the CREATING resolution already determined — a preceding instruction's count (Synthetic
-    // Destiny's exiled creatures) or the creating trigger's event amount. Determine it once, now,
-    // via the single EventContextAmount cascade (mirrors `effects::freeze_reflexive_event_count`,
-    // CR 603.12). Event-delayed triggers read their firing event, and departure-created
-    // phase-delayed triggers answer from the creation lookback event — both stay live (None).
+    // reset (engine.rs). When the CREATING resolution's EventContextAmount cascade yields a
+    // positive amount — a preceding instruction's count (Synthetic Destiny's exiled creatures) or
+    // the creating trigger's event amount — the payload's FIRST instruction's "that many"/"that
+    // much" names it, so it is frozen now. A zero/undetermined amount is no determined amount
+    // (mirrors `effects::freeze_reflexive_event_count`, CR 603.12) and stays live (None), so an
+    // amount determined AFTER creation is read when the delayed ability resolves (Sacred Boon /
+    // Scars of the Veteran: "for each 1 damage prevented this way", CR 615.5); a zero count read
+    // live also yields zero for Synthetic Destiny. The freeze reaches only the effect variants
+    // `snapshot_parent_dependent_quantities` walks. Event-delayed triggers read their firing
+    // event, and departure-created phase-delayed triggers answer from the creation lookback
+    // event — both stay live (None).
     let first_instruction_amount = (creation_time_provenance && creation_departure_event.is_none())
         .then(|| {
             crate::game::quantity::resolve_quantity_with_targets(
@@ -574,7 +579,8 @@ pub fn resolve(
                 },
                 ability,
             )
-        });
+        })
+        .filter(|&amount| amount > 0);
     snapshot_parent_dependent_quantities_in_ability_chain(
         &mut delayed_ability,
         state,
@@ -5844,12 +5850,17 @@ mod tests {
 
     /// CR 603.7a + CR 608.2c + CR 608.2h (T-U1): a phase-delayed payload's FIRST
     /// instruction reading "that many" (Synthetic Destiny's reveal count) is the
-    /// amount the creating resolution determined — frozen at creation, because
-    /// the end-step resolution has lost `last_effect_count`. The parent has no
-    /// targets, so the freeze must not depend on `ability.targets`.
+    /// positive amount the creating resolution determined — frozen at creation,
+    /// because the end-step resolution has lost `last_effect_count`. The parent
+    /// has no targets, so the freeze must not depend on `ability.targets`.
+    /// (T-U1b) A zero count is no determined amount and stays live; read live at
+    /// the end step it is still zero.
     #[test]
     fn phase_delayed_first_instruction_that_many_freezes_creation_count() {
-        for (last, expected) in [(Some(3), 3), (Some(0), 0)] {
+        for (last, expected) in [
+            (Some(3), QuantityExpr::Fixed { value: 3 }),
+            (Some(0), event_context_amount()),
+        ] {
             let mut state = GameState::new_two_player(42);
             create_delayed_with_last_count(
                 &mut state,
@@ -5863,10 +5874,61 @@ mod tests {
             );
             assert_eq!(
                 *reveal_until_count(&state.delayed_triggers[0].ability.effect),
-                QuantityExpr::Fixed { value: expected },
-                "the creation-time count ({last:?}) must be frozen into RevealUntil.count"
+                expected,
+                "creation-time count {last:?}: a positive count is frozen into \
+                 RevealUntil.count, a zero count stays live"
             );
         }
+    }
+
+    /// CR 603.7a + CR 615.5 (T-U1c): Sacred Boon / Scars of the Veteran — "At the
+    /// beginning of the next end step, put a +0/+1 counter on that creature for each
+    /// 1 damage prevented this way." The phase-delayed root's `EventContextAmount`
+    /// names an amount determined AFTER creation (the prevention happens later), so
+    /// a creating resolution with no determined amount must leave it live rather
+    /// than bake `Fixed { 0 }`.
+    #[test]
+    fn phase_delayed_first_instruction_amount_undetermined_at_creation_stays_live() {
+        let mut state = GameState::new_two_player(42);
+        let creature = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sacred Boon target".to_string(),
+            Zone::Battlefield,
+        );
+        create_delayed_with_last_count(
+            &mut state,
+            DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::PutCounter {
+                    counter_type: CounterType::PowerToughness {
+                        power: 0,
+                        toughness: 1,
+                    },
+                    count: event_context_amount(),
+                    target: TargetFilter::ParentTarget,
+                },
+            ),
+            vec![TargetRef::Object(creature)],
+            None,
+        );
+
+        let delayed = &state.delayed_triggers[0].ability;
+        assert_eq!(
+            delayed.targets,
+            vec![TargetRef::Object(creature)],
+            "reach guard: the creation-time parent target is snapshotted"
+        );
+        let Effect::PutCounter { count, .. } = &delayed.effect else {
+            panic!("expected PutCounter, got {:?}", delayed.effect);
+        };
+        assert_eq!(
+            *count,
+            event_context_amount(),
+            "an amount determined after creation (damage prevented this way) is read live"
+        );
     }
 
     /// CR 603.7a (T-U2): an event-delayed trigger reads "that many" from the

@@ -10772,7 +10772,7 @@ pub(crate) fn ability_pins_object_anaphor(ability: &ResolvedAbility) -> bool {
 /// Pump/PumpAll P/T, ChangeZone.enter_with_counters, RevealUntil.count) — it never walks
 /// `ability.repeat_for` — and its `snapshot_quantity_ref` freezes `EventContextAmount` only at
 /// the first payload instruction of a creation-time-provenance, non-departure delayed trigger
-/// (CR 603.7a) — and only because `delayed_trigger::resolve` passes it that creation-time
+/// (CR 603.7a) — and only because `delayed_trigger::resolve` passes it a positive creation-time
 /// amount; the walker itself decides nothing about provenance. A rider's "for each 1 damage
 /// prevented this way" is an `EventContextAmount` read live per prevented event (CR 615.5), so
 /// this seam must not freeze it, nor freeze any other parent-dependent leaf at install.
